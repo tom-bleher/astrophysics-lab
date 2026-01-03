@@ -306,20 +306,35 @@ We can finally use the calculated angle and plot the static and lambda-CDM model
 ```
 
 ```{python}
-bins = np.linspace(sed_catalog.redshift.min(), sed_catalog.redshift.max(), 6)
-sed_catalog["z_bin"] = pd.cut(sed_catalog.redshift, bins)
+sed_catalog = sed_catalog.dropna(subset=["redshift", "r_half_arcsec", "r_half_arcsec_error"])
 
-binned = (sed_catalog.groupby("z_bin", observed=False).agg(
-    z_mid=("redshift", "median"),
-    theta_med=("r_half_arcsec", "median"),
-    theta_err=("r_half_arcsec_error", lambda x: np.sqrt(np.mean(np.square(x)))),
-    theta_lo=("r_half_arcsec", lambda x: np.percentile(x, 25)),
-    theta_hi=("r_half_arcsec", lambda x: np.percentile(x, 75)),)
-    .reset_index(drop=True))
+# Guard against degenerate redshift range
+z_min_raw, z_max_raw = sed_catalog.redshift.min(), sed_catalog.redshift.max()
+if not np.isfinite(z_min_raw) or not np.isfinite(z_max_raw) or z_min_raw == z_max_raw:
+    raise ValueError("Cannot bin redshifts: invalid or zero range")
+
+bins = np.linspace(z_min_raw, z_max_raw, 6)
+sed_catalog["z_bin"] = pd.cut(sed_catalog.redshift, bins, include_lowest=True)
+
+binned = (
+    sed_catalog.groupby("z_bin", observed=False)
+    .agg(
+        z_mid=("redshift", "median"),
+        theta_med=("r_half_arcsec", "median"),
+        theta_err=("r_half_arcsec_error", lambda x: np.sqrt(np.mean(np.square(x)))),
+        theta_lo=("r_half_arcsec", lambda x: np.percentile(x, 25) if len(x) else np.nan),
+        theta_hi=("r_half_arcsec", lambda x: np.percentile(x, 75) if len(x) else np.nan),
+        n=("redshift", "count"),
+    )
+    .reset_index(drop=True)
+)
 
 # Drop bins with insufficient data and enforce positive z for models
 binned = binned.dropna(subset=["z_mid", "theta_med", "theta_err"])
-binned = binned[binned.z_mid > 0]
+binned = binned[(binned.n > 0) & (binned.z_mid > 0)]
+
+if len(binned) < 2:
+    raise ValueError("Not enough binned data to fit models")
 
 z_min = max(1e-4, binned.z_mid.min())
 z_model = np.linspace(z_min, binned.z_mid.max(), 300)
