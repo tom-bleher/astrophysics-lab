@@ -1,6 +1,5 @@
 .vscode/
 files/
-data/
 __pycache__/
 *.pyc
 snippets.py
