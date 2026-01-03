@@ -17,6 +17,8 @@ from dataclasses import dataclass
 from photutils.segmentation import detect_sources, deblend_sources, SegmentationImage, SourceCatalog
 from photutils.background import Background2D, MedianBackground
 
+from classify import classify_galaxy
+
 
 PIXEL_SCALE = 0.04  # arcsec/pixel
 
@@ -27,6 +29,7 @@ class AstroImage:
     band: str = ""
     segm: SegmentationImage = None
     catalog: SourceCatalog = None
+    bkg: Background2D = None  # Background object from photutils
 
 ```
 
@@ -86,6 +89,9 @@ for image in images:
     bkg_estimator = MedianBackground()
     bkg = Background2D(image.data, (50, 50), filter_size=(3, 3), bkg_estimator=bkg_estimator)
     data_sub = image.data - bkg.background
+    
+    # Store background object for error estimation
+    image.bkg = bkg
     
     # Detect sources with proper threshold
     mean, median, std = sigma_clipped_stats(data_sub, sigma=3.0)
@@ -164,7 +170,12 @@ for image in images:
     cat['r_half_pix'] = image.catalog.fluxfrac_radius(0.5)
     # segment_flux on background-subtracted data = source-sky (like AstroImageJ)
     cat['source_sky'] = cat['segment_flux']  # Already background-subtracted from data_sub
-    band_catalogs[image.band] = cat[['xcentroid', 'ycentroid', 'source_sky', 'r_half_pix']].copy()
+    
+    # Calculate source error like AstroImageJ: sqrt(source_counts + n_pixels * sigma_background^2)
+    # Assuming gain ~ 1 for simplicity (typical for modern CCDs in ADU units)
+    cat['source_error'] = np.sqrt(np.abs(cat['segment_flux']) + cat['area'] * image.bkg.background_rms_median**2)
+    
+    band_catalogs[image.band] = cat[['xcentroid', 'ycentroid', 'source_sky', 'source_error', 'r_half_pix']].copy()
 
 # Cross-match sources across all bands using position matching
 # Start with first band as reference
@@ -180,6 +191,7 @@ for idx, ref_source in band_catalogs[reference_band].iterrows():
     r_half_values = [ref_source['r_half_pix']]
     
     matches[f'source_sky_{reference_band}'] = ref_source['source_sky']
+    matches[f'source_error_{reference_band}'] = ref_source['source_error']
     
     found_in_all_bands = True
     for band in ['i', 'u', 'v']:  # Other bands
@@ -191,6 +203,7 @@ for idx, ref_source in band_catalogs[reference_band].iterrows():
         if distances.min() < match_radius:
             closest_idx = distances.idxmin()
             matches[f'source_sky_{band}'] = cat.loc[closest_idx, 'source_sky']
+            matches[f'source_error_{band}'] = cat.loc[closest_idx, 'source_error']
             r_half_values.append(cat.loc[closest_idx, 'r_half_pix'])
         else:
             found_in_all_bands = False
@@ -207,7 +220,49 @@ cross_matched_catalog = pd.DataFrame(matched_sources)
 print(f"Cross-matched catalog has {len(cross_matched_catalog)} sources (present in all 4 bands)")
 print(f"Original catalogs had: b={len(band_catalogs['b'])}, i={len(band_catalogs['i'])}, "
       f"u={len(band_catalogs['u'])}, v={len(band_catalogs['v'])} sources")
-display(cross_matched_catalog)
-print(cross_matched_catalog.columns)
+display(cross_matched_catalog.head())
+# print(cross_matched_catalog.columns)
 
+```
+
+
+Now we create another dataframe with the relevant converted SEDs and errors
+```{python}
+# Conversion factors from source_sky (ADU) to microJy
+conversion_factors = {
+    'b': 8.8e-18,
+    'i': 2.45e-18,
+    'u': 5.99e-17,
+    'v': 1.89e-18,
+}
+sed_data = []
+for idx, row in cross_matched_catalog.iterrows():
+    sed_entry = {'r_half_pix': row['r_half_pix'],
+                 "xcentroid": row['xcentroid'], "ycentroid": row['ycentroid']}
+    for band in ['b', 'i', 'u', 'v']:
+        flux_adu = row[f'source_sky_{band}']
+        error_adu = row[f'source_error_{band}']
+        # Convert to microJy
+        sed_entry[f'flux_{band}'] = flux_adu * conversion_factors[band]
+        sed_entry[f'error_{band}'] = error_adu * conversion_factors[band]
+    sed_data.append(sed_entry)
+sed_catalog = pd.DataFrame(sed_data)
+print(f"SED catalog has {len(sed_catalog)} sources")
+display(sed_catalog.head())
+```
+
+
+Finally, we use this catalog to identify the redshift of each source
+```{python}
+for idx, row in sed_catalog.iterrows():
+    # The order of the bands is important here
+    fluxes = [row[f'flux_{band}'] for band in ['b', 'i', 'u', 'v']]
+    errors = [row[f'error_{band}'] for band in ['b', 'i', 'u', 'v']]
+
+    galaxy_type, redshift = classify_galaxy(fluxes, errors, spectra_path=R".\spectra\Spectra")
+
+    sed_catalog.at[idx, 'redshift'] = redshift
+    sed_catalog.at[idx, 'galaxy_type'] = galaxy_type
+
+display(sed_catalog.head())
 ```
