@@ -309,14 +309,30 @@ We can finally use the calculated angle and plot the static and lambda-CDM model
 bins = np.linspace(sed_catalog.redshift.min(), sed_catalog.redshift.max(), 6)
 sed_catalog["z_bin"] = pd.cut(sed_catalog.redshift, bins)
 
-binned = (sed_catalog.groupby("z_bin").agg(
+binned = (sed_catalog.groupby("z_bin", observed=False).agg(
     z_mid=("redshift", "median"),
     theta_med=("r_half_arcsec", "median"),
     theta_err=("r_half_arcsec_error", lambda x: np.sqrt(np.mean(np.square(x)))),
     theta_lo=("r_half_arcsec", lambda x: np.percentile(x, 25)),
     theta_hi=("r_half_arcsec", lambda x: np.percentile(x, 75)),)
     .reset_index(drop=True))
-z_model = np.linspace(binned.z_mid.min(), binned.z_mid.max(), 300)
+
+# Drop bins with insufficient data and enforce positive z for models
+binned = binned.dropna(subset=["z_mid", "theta_med", "theta_err"])
+binned = binned[binned.z_mid > 0]
+
+z_min = max(1e-4, binned.z_mid.min())
+z_model = np.linspace(z_min, binned.z_mid.max(), 300)
+
+# Fit characteristic size for each cosmology using binned medians
+R_static = get_radius(binned.z_mid.values, binned.theta_med.values,
+                      binned.theta_err.values, model='static')
+R_lcdm = get_radius(binned.z_mid.values, binned.theta_med.values,
+                    binned.theta_err.values, model='lcdm')
+
+# Model curves (convert radians -> arcsec)
+theta_static_model = theta_static(z_model, R_static)
+theta_lcdm_model = theta_lcdm(z_model, R_lcdm)
 
 fig = go.Figure()
 
@@ -331,6 +347,25 @@ fig.add_trace(go.Scatter(
         array=binned["theta_err"],
         arrayminus=binned["theta_err"]
     )
+))
+
+# Add model predictions
+fig.add_trace(go.Scatter(
+    x=z_model,
+    y=theta_static_model,
+    mode="lines",
+    # name=f"Static model (R={R_static:.3f} Mpc)",
+    name=f"Static model",
+    line=dict(color="gray", dash="dash")
+))
+
+fig.add_trace(go.Scatter(
+    x=z_model,
+    y=theta_lcdm_model,
+    mode="lines",
+    # name=f"ΛCDM model (R={R_lcdm:.3f} Mpc)",
+    name=f"ΛCDM model",
+    line=dict(color="blue")
 ))
 
 fig.update_layout(
