@@ -175,7 +175,10 @@ for image in images:
     # Assuming gain ~ 1 for simplicity (typical for modern CCDs in ADU units)
     cat['source_error'] = np.sqrt(np.abs(cat['segment_flux']) + cat['area'] * image.bkg.background_rms_median**2)
     
-    band_catalogs[image.band] = cat[['xcentroid', 'ycentroid', 'source_sky', 'source_error', 'r_half_pix']].copy()
+    # Estimate r_half error as fraction of flux error (r_half scales with sqrt(flux))
+    cat['r_half_error'] = cat['r_half_pix'] * cat['source_error'] / (2 * np.abs(cat['segment_flux']) + 1e-10)
+    
+    band_catalogs[image.band] = cat[['xcentroid', 'ycentroid', 'source_sky', 'source_error', 'r_half_pix', 'r_half_error']].copy()
 
 # Cross-match sources across all bands using position matching
 # Start with first band as reference
@@ -189,6 +192,7 @@ for idx, ref_source in band_catalogs[reference_band].iterrows():
     match_radius = 3.0  # pixels
     matches = {'xcentroid': ref_x, 'ycentroid': ref_y}
     r_half_values = [ref_source['r_half_pix']]
+    r_half_errors = [ref_source['r_half_error']]
     
     matches[f'source_sky_{reference_band}'] = ref_source['source_sky']
     matches[f'source_error_{reference_band}'] = ref_source['source_error']
@@ -205,13 +209,19 @@ for idx, ref_source in band_catalogs[reference_band].iterrows():
             matches[f'source_sky_{band}'] = cat.loc[closest_idx, 'source_sky']
             matches[f'source_error_{band}'] = cat.loc[closest_idx, 'source_error']
             r_half_values.append(cat.loc[closest_idx, 'r_half_pix'])
+            r_half_errors.append(cat.loc[closest_idx, 'r_half_error'])
         else:
             found_in_all_bands = False
             break
     
     # Only keep sources found in all 4 bands
     if found_in_all_bands:
-        matches['r_half_pix'] = np.median(r_half_values)  # Use median across bands
+        # Use weighted mean for r_half (inverse variance weighting)
+        r_half_arr = np.array(r_half_values)
+        r_half_err_arr = np.array(r_half_errors)
+        weights = 1.0 / (r_half_err_arr**2 + 1e-10)  # Avoid division by zero
+        matches['r_half_pix'] = np.sum(r_half_arr * weights) / np.sum(weights)
+        matches['r_half_error'] = 1.0 / np.sqrt(np.sum(weights))  # Weighted error
         matched_sources.append(matches)
 
 # Create clean dataframe with cross-matched sources
@@ -221,7 +231,6 @@ print(f"Cross-matched catalog has {len(cross_matched_catalog)} sources (present 
 print(f"Original catalogs had: b={len(band_catalogs['b'])}, i={len(band_catalogs['i'])}, "
       f"u={len(band_catalogs['u'])}, v={len(band_catalogs['v'])} sources")
 display(cross_matched_catalog.head())
-# print(cross_matched_catalog.columns)
 
 ```
 
@@ -238,6 +247,7 @@ conversion_factors = {
 sed_data = []
 for idx, row in cross_matched_catalog.iterrows():
     sed_entry = {'r_half_pix': row['r_half_pix'],
+                 'r_half_error': row['r_half_error'],
                  "xcentroid": row['xcentroid'], "ycentroid": row['ycentroid']}
     for band in ['b', 'i', 'u', 'v']:
         flux_adu = row[f'source_sky_{band}']
