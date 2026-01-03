@@ -157,36 +157,57 @@ fig.show()
 
 Create a combined catalog across all bands
 ```{python}
-combined_catalog = pd.DataFrame()
+# First, create individual band catalogs with positions and fluxes
+band_catalogs = {}
 for image in images:
     cat = image.catalog.to_table().to_pandas()
     cat['r_half_pix'] = image.catalog.fluxfrac_radius(0.5)
-    cat['band'] = image.band
-    combined_catalog = pd.concat([combined_catalog, cat], ignore_index=True)
+    # segment_flux on background-subtracted data = source-sky (like AstroImageJ)
+    cat['source_sky'] = cat['segment_flux']  # Already background-subtracted from data_sub
+    band_catalogs[image.band] = cat[['xcentroid', 'ycentroid', 'source_sky', 'r_half_pix']].copy()
 
-combined_catalog.drop(columns=['label'], inplace=True)
-# TODO I probably want to replace this catalog with cross matched sources
-print(f"Combined catalog has {len(combined_catalog)} entries across all bands")
-display(combined_catalog.head())
-print(combined_catalog.columns)
+# Cross-match sources across all bands using position matching
+# Start with first band as reference
+reference_band = 'b'
+matched_sources = []
 
-```
+for idx, ref_source in band_catalogs[reference_band].iterrows():
+    ref_x, ref_y = ref_source['xcentroid'], ref_source['ycentroid']
+    
+    # Try to find matching sources in all other bands (within 3 pixels)
+    match_radius = 3.0  # pixels
+    matches = {'xcentroid': ref_x, 'ycentroid': ref_y}
+    r_half_values = [ref_source['r_half_pix']]
+    
+    matches[f'source_sky_{reference_band}'] = ref_source['source_sky']
+    
+    found_in_all_bands = True
+    for band in ['i', 'u', 'v']:  # Other bands
+        cat = band_catalogs[band]
+        # Calculate distance to all sources in this band
+        distances = np.sqrt((cat['xcentroid'] - ref_x)**2 + (cat['ycentroid'] - ref_y)**2)
+        
+        # Find closest match within radius
+        if distances.min() < match_radius:
+            closest_idx = distances.idxmin()
+            matches[f'source_sky_{band}'] = cat.loc[closest_idx, 'source_sky']
+            r_half_values.append(cat.loc[closest_idx, 'r_half_pix'])
+        else:
+            found_in_all_bands = False
+            break
+    
+    # Only keep sources found in all 4 bands
+    if found_in_all_bands:
+        matches['r_half_pix'] = np.median(r_half_values)  # Use median across bands
+        matched_sources.append(matches)
 
-Let's calculate redshift
-```{python}
-# TODO essentially steal code from the lab's notebook here
-```
+# Create clean dataframe with cross-matched sources
+cross_matched_catalog = pd.DataFrame(matched_sources)
 
+print(f"Cross-matched catalog has {len(cross_matched_catalog)} sources (present in all 4 bands)")
+print(f"Original catalogs had: b={len(band_catalogs['b'])}, i={len(band_catalogs['i'])}, "
+      f"u={len(band_catalogs['u'])}, v={len(band_catalogs['v'])} sources")
+display(cross_matched_catalog)
+print(cross_matched_catalog.columns)
 
-Now we can calculate the angle and cross match across bands
-```{python}
-  # TODO what the heck are df1 and df2
-combined_catalog['theta_arcsec'] = combined_catalog['r_half_pix'] * PIXEL_SCALE
-# coords1 = SkyCoord(ra=df1.ra*u.deg, dec=df1.dec*u.deg)
-# coords2 = SkyCoord(ra=df2.ra*u.deg, dec=df2.dec*u.deg)
-
-# idx, sep, _ = coords1.match_to_catalog_sky(coords2)
-# matched = sep < 0.3 * u.arcsec
-
-# now want to plot histograms and the relationships over each other and see that 1/z doesn't behave like the data
 ```
