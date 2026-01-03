@@ -69,13 +69,14 @@ for band, file in files.items():
     print(f"Loaded {band} band - shape: {data.shape}")
 
 # Read planet mask
-data, header = read_fits("./fits/planet_mask.fits")
+data, header = read_fits("./data/planet_mask2.fits")
 planet_mask = AstroImage(data=data, header=header)
 
 ```
 
 
 Now we want source detection and cataloging
+
 ```{python}
 # Prepare the mask once (True = mask out, False = keep)
 mask = planet_mask.data.astype(bool)
