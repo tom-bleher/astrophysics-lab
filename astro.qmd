@@ -1,0 +1,191 @@
+---
+title: "Asto sandbox"
+author: "Itay Feldman"
+---
+```{python}
+# Imports & setup
+import numpy as np
+import pandas as pd
+import astropy.units as u
+import plotly.express as px
+import plotly.graph_objects as go
+
+from astropy.coordinates import SkyCoord
+from astropy.io import fits
+from astropy.stats import sigma_clipped_stats, mad_std
+from dataclasses import dataclass
+from photutils.segmentation import detect_sources, deblend_sources, SegmentationImage, SourceCatalog
+from photutils.background import Background2D, MedianBackground
+
+
+PIXEL_SCALE = 0.04  # arcsec/pixel
+
+@dataclass
+class AstroImage:
+    data: np.ndarray
+    header: fits.Header
+    band: str = ""
+    segm: SegmentationImage = None
+    catalog: SourceCatalog = None
+
+```
+
+# Data Prep
+Start by reading the 4 fits files for the 4 filters
+```{python}
+# Load the FITS file
+files = {
+    "b": "./fits/b.fits",
+    "i": "./fits/i.fits",
+    "u": "./fits/u.fits",
+    "v": "./fits/v.fits",
+}
+
+def adjust_data(data, threshold_percentile=99):
+    """Remove black/low-value edges from image"""
+    # Just trust me bro
+    data = data[120:, 90:]
+    data = data[:, ::-1]  # flip x&y (this is how the image is)
+    return data
+
+def read_fits(file_path):
+    hdul = fits.open(file_path)
+    data = hdul[0].data
+    header = hdul[0].header
+    hdul.close()
+    # FIX ENDIANNESS FIRST before any processing!
+    if data.dtype.byteorder == '>':
+        data = data.view(data.dtype.newbyteorder()).byteswap()
+    # Crop black edges & rotate
+    data = adjust_data(data)
+    hdul.close()
+    return data, header
+
+images: list[AstroImage] = []
+for band, file in files.items():
+    data, header = read_fits(file)
+
+    images.append(AstroImage(data=data, header=header, band=band))
+    print(f"Loaded {band} band - shape: {data.shape}")
+
+# Read planet mask
+data, header = read_fits("./fits/planet_mask.fits")
+planet_mask = AstroImage(data=data, header=header)
+
+```
+
+
+Now we want source detection and cataloging
+```{python}
+# Prepare the mask once (True = mask out, False = keep)
+mask = planet_mask.data.astype(bool)
+
+for image in images:
+    # Subtract background for better detection
+    bkg_estimator = MedianBackground()
+    bkg = Background2D(image.data, (50, 50), filter_size=(3, 3), bkg_estimator=bkg_estimator)
+    data_sub = image.data - bkg.background
+    
+    # Detect sources with proper threshold
+    mean, median, std = sigma_clipped_stats(data_sub, sigma=3.0)
+    threshold = median + (3 * std)
+    
+    image.segm = detect_sources(
+        data_sub,
+        threshold,
+        npixels=50,
+        mask=mask  # Apply mask DURING detection
+    )
+    
+    # Also remove any segments that overlap with masked regions
+    if image.segm is not None:
+        # Get unique segment labels that overlap with the mask
+        masked_labels = np.unique(image.segm.data[mask])
+        masked_labels = masked_labels[masked_labels != 0]  # Exclude background
+        
+        # Remove those segments
+        image.segm.remove_labels(masked_labels)
+    
+    image.catalog = SourceCatalog(data_sub, image.segm)
+    print(f"Band {image.band}: detected {len(image.catalog)} sources (after masking)")
+```
+
+Display sources
+```{python}
+i = 3  # Change this to view different bands (0=b, 1=i, 2=u, 3=v)
+sources = images[i].catalog.to_table()
+img_data = images[i].data
+
+print(f"Detected {len(sources)} sources in band {images[i].band}")
+print(f"Source detection threshold: {threshold:.2f}")
+
+# Use percentile-based contrast stretching (20% to 99%)
+vmin, vmax = np.percentile(img_data, [20, 99])
+
+fig = px.imshow(
+    img_data, 
+    color_continuous_scale='Greys_r',
+    zmin=vmin,
+    zmax=vmax,
+    aspect='equal'
+)
+
+# Add detected source markers
+fig.add_trace(
+    go.Scatter(
+        x=sources['xcentroid'],
+        y=sources['ycentroid'],
+        mode='markers',
+        marker=dict(color='red', size=3, symbol='circle-open', line=dict(width=1)),
+        name=f'Sources ({len(sources)})'
+    )
+)
+
+fig.update_layout(
+    title=f"Band {images[i].band} - {len(sources)} sources detected",
+    width=900,
+    height=900,
+    coloraxis_colorbar=dict(title="Pixel Value")
+)
+
+print(f"Image stats: min={img_data.min():.1f}, max={img_data.max():.1f}, "
+      f"median={np.median(img_data):.1f}, std={img_data.std():.1f}")
+print(f"Display range: {vmin:.1f} to {vmax:.1f}")
+fig.show()
+```
+
+Create a combined catalog across all bands
+```{python}
+combined_catalog = pd.DataFrame()
+for image in images:
+    cat = image.catalog.to_table().to_pandas()
+    cat['r_half_pix'] = image.catalog.fluxfrac_radius(0.5)
+    cat['band'] = image.band
+    combined_catalog = pd.concat([combined_catalog, cat], ignore_index=True)
+
+combined_catalog.drop(columns=['label'], inplace=True)
+# TODO I probably want to replace this catalog with cross matched sources
+print(f"Combined catalog has {len(combined_catalog)} entries across all bands")
+display(combined_catalog.head())
+print(combined_catalog.columns)
+
+```
+
+Let's calculate redshift
+```{python}
+# TODO essentially steal code from the lab's notebook here
+```
+
+
+Now we can calculate the angle and cross match across bands
+```{python}
+  # TODO what the heck are df1 and df2
+combined_catalog['theta_arcsec'] = combined_catalog['r_half_pix'] * PIXEL_SCALE
+# coords1 = SkyCoord(ra=df1.ra*u.deg, dec=df1.dec*u.deg)
+# coords2 = SkyCoord(ra=df2.ra*u.deg, dec=df2.dec*u.deg)
+
+# idx, sep, _ = coords1.match_to_catalog_sky(coords2)
+# matched = sep < 0.3 * u.arcsec
+
+# now want to plot histograms and the relationships over each other and see that 1/z doesn't behave like the data
+```

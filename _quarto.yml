@@ -1,0 +1,15 @@
+execute: 
+  echo: false
+
+
+format:
+  html:
+    theme: cosmo
+    toc: true
+    toc-depth: 2
+    number-sections: true
+  pdf:
+    documentclass: article
+    toc: true
+    toc-depth: 2
+    number-sections: true
