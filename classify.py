@@ -81,10 +81,18 @@ def classify_galaxy(fluxes, errors, spectra_path=R".\spectra"):
     chimins = []
     zmins = []
 
+    # Estimate rough redshift upper bound from color
+    # Bluer objects (low Ir/U ratio) suggest lower z; redder suggest higher z
+    # color_ratio = meas_photo[1] / (meas_photo[0] + 1e-10)  # Ir/U ratio
+    # z_max = min(3.0, max(1.0, 0.5 + 2.0 * np.log10(color_ratio + 1)))  # Rough heuristic
+    z_max = 3.0
+
     for galaxy_type in galaxies:
         # Use continuous optimization to find best redshift (0 to 1)
         result = minimize_scalar(
-            lambda z: compute_chi_square(z, galaxy_type), bounds=(0, 1), method="bounded"
+            lambda z: compute_chi_square(z, galaxy_type),
+            bounds=(0, z_max),
+            method="bounded",
         )
         zmins.append(result.x)
         chimins.append(result.fun)  # type: ignore

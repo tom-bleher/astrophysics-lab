@@ -18,6 +18,7 @@ from photutils.segmentation import detect_sources, deblend_sources, Segmentation
 from photutils.background import Background2D, MedianBackground
 
 from classify import classify_galaxy
+from scientific import theta_static, theta_lcdm, get_radius
 
 
 PIXEL_SCALE = 0.04  # arcsec/pixel
@@ -176,9 +177,9 @@ for image in images:
     cat['source_error'] = np.sqrt(np.abs(cat['segment_flux']) + cat['area'] * image.bkg.background_rms_median**2)
     
     # Estimate r_half error as fraction of flux error (r_half scales with sqrt(flux))
-    cat['r_half_error'] = cat['r_half_pix'] * cat['source_error'] / (2 * np.abs(cat['segment_flux']) + 1e-10)
+    cat['r_half_pix_error'] = cat['r_half_pix'] * cat['source_error'] / (2 * np.abs(cat['segment_flux']) + 1e-10)
     
-    band_catalogs[image.band] = cat[['xcentroid', 'ycentroid', 'source_sky', 'source_error', 'r_half_pix', 'r_half_error']].copy()
+    band_catalogs[image.band] = cat[['xcentroid', 'ycentroid', 'source_sky', 'source_error', 'r_half_pix', 'r_half_pix_error']].copy()
 
 # Cross-match sources across all bands using position matching
 # Start with first band as reference
@@ -192,7 +193,7 @@ for idx, ref_source in band_catalogs[reference_band].iterrows():
     match_radius = 3.0  # pixels
     matches = {'xcentroid': ref_x, 'ycentroid': ref_y}
     r_half_values = [ref_source['r_half_pix']]
-    r_half_errors = [ref_source['r_half_error']]
+    r_half_pix_errors = [ref_source['r_half_pix_error']]
     
     matches[f'source_sky_{reference_band}'] = ref_source['source_sky']
     matches[f'source_error_{reference_band}'] = ref_source['source_error']
@@ -209,19 +210,22 @@ for idx, ref_source in band_catalogs[reference_band].iterrows():
             matches[f'source_sky_{band}'] = cat.loc[closest_idx, 'source_sky']
             matches[f'source_error_{band}'] = cat.loc[closest_idx, 'source_error']
             r_half_values.append(cat.loc[closest_idx, 'r_half_pix'])
-            r_half_errors.append(cat.loc[closest_idx, 'r_half_error'])
+            r_half_pix_errors.append(cat.loc[closest_idx, 'r_half_pix_error'])
         else:
             found_in_all_bands = False
             break
     
     # Only keep sources found in all 4 bands
     if found_in_all_bands:
-        # Use weighted mean for r_half (inverse variance weighting)
+        # Use median for r_half (robust to outliers)
         r_half_arr = np.array(r_half_values)
-        r_half_err_arr = np.array(r_half_errors)
-        weights = 1.0 / (r_half_err_arr**2 + 1e-10)  # Avoid division by zero
-        matches['r_half_pix'] = np.sum(r_half_arr * weights) / np.sum(weights)
-        matches['r_half_error'] = 1.0 / np.sqrt(np.sum(weights))  # Weighted error
+        r_half_err_arr = np.array(r_half_pix_errors)
+        matches['r_half_pix'] = np.median(r_half_arr)
+        
+        # Combine measurement errors and scatter for total uncertainty
+        measurement_error = np.sqrt(np.sum(r_half_err_arr**2)) / len(r_half_err_arr)  # Propagated errors
+        scatter_error = np.std(r_half_arr)  # Scatter between bands
+        matches['r_half_pix_error'] = np.sqrt(measurement_error**2 + scatter_error**2)
         matched_sources.append(matches)
 
 # Create clean dataframe with cross-matched sources
@@ -230,7 +234,7 @@ cross_matched_catalog = pd.DataFrame(matched_sources)
 print(f"Cross-matched catalog has {len(cross_matched_catalog)} sources (present in all 4 bands)")
 print(f"Original catalogs had: b={len(band_catalogs['b'])}, i={len(band_catalogs['i'])}, "
       f"u={len(band_catalogs['u'])}, v={len(band_catalogs['v'])} sources")
-display(cross_matched_catalog.head())
+# display(cross_matched_catalog.head())
 
 ```
 
@@ -247,7 +251,7 @@ conversion_factors = {
 sed_data = []
 for idx, row in cross_matched_catalog.iterrows():
     sed_entry = {'r_half_pix': row['r_half_pix'],
-                 'r_half_error': row['r_half_error'],
+                 'r_half_pix_error': row['r_half_pix_error'],
                  "xcentroid": row['xcentroid'], "ycentroid": row['ycentroid']}
     for band in ['b', 'i', 'u', 'v']:
         flux_adu = row[f'source_sky_{band}']
@@ -258,11 +262,12 @@ for idx, row in cross_matched_catalog.iterrows():
     sed_data.append(sed_entry)
 sed_catalog = pd.DataFrame(sed_data)
 print(f"SED catalog has {len(sed_catalog)} sources")
-display(sed_catalog.head())
+# display(sed_catalog.head())
+
 ```
 
 
-Finally, we use this catalog to identify the redshift of each source
+Finally, we use this catalog to identify the redshift of each source, and calculate the radius' angle
 ```{python}
 for idx, row in sed_catalog.iterrows():
     # The order of the bands is important here
@@ -274,5 +279,65 @@ for idx, row in sed_catalog.iterrows():
     sed_catalog.at[idx, 'redshift'] = redshift
     sed_catalog.at[idx, 'galaxy_type'] = galaxy_type
 
+    # Calculate angular size in arcseconds
+    r_half_pix, r_half_pix_error = row['r_half_pix'], row['r_half_pix_error']
+    r_half_arcsec = r_half_pix * PIXEL_SCALE
+    r_half_arcsec_error = r_half_pix_error * PIXEL_SCALE
+    sed_catalog.at[idx, 'r_half_arcsec'] = r_half_arcsec
+    sed_catalog.at[idx, 'r_half_arcsec_error'] = r_half_arcsec_error
+
 display(sed_catalog.head())
+```
+
+# Finally!
+We can finally use the calculated angle and plot the static and lambda-CDM models to show overall behavior
+
+```{python}
+# fig = px.scatter(
+#     sed_catalog,
+#     x='redshift',
+#     y='r_half_arcsec',
+#     error_y='r_half_arcsec_error',
+#     title='Galaxy Half-Light Radius vs Redshift',
+#     labels={'redshift': 'Redshift (z)', 'r_half_arcsec': 'Half-Light Radius (arcsec)'},
+#     log_y=True
+# )
+# fig.show()
+```
+
+```{python}
+bins = np.linspace(sed_catalog.redshift.min(), sed_catalog.redshift.max(), 6)
+sed_catalog["z_bin"] = pd.cut(sed_catalog.redshift, bins)
+
+binned = (sed_catalog.groupby("z_bin").agg(
+    z_mid=("redshift", "median"),
+    theta_med=("r_half_arcsec", "median"),
+    theta_err=("r_half_arcsec_error", lambda x: np.sqrt(np.mean(np.square(x)))),
+    theta_lo=("r_half_arcsec", lambda x: np.percentile(x, 25)),
+    theta_hi=("r_half_arcsec", lambda x: np.percentile(x, 75)),)
+    .reset_index(drop=True))
+z_model = np.linspace(binned.z_mid.min(), binned.z_mid.max(), 300)
+
+fig = go.Figure()
+
+fig.add_trace(go.Scatter(
+    x=binned["z_mid"],
+    y=binned["theta_med"],
+    mode="markers+lines",
+    name="Median angular size",
+    error_y=dict(
+        type="data",
+        symmetric=True,
+        array=binned["theta_err"],
+        arrayminus=binned["theta_err"]
+    )
+))
+
+fig.update_layout(
+    title="Median galaxy angular size vs redshift",
+    xaxis_title="Redshift z",
+    yaxis_title="Angular size θ (arcsec)"
+)
+
+fig.show()
 ```
