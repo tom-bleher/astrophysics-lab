@@ -81,17 +81,33 @@ def classify_galaxy(fluxes, errors, spectra_path=R".\spectra"):
     chimins = []
     zmins = []
 
-    # Estimate rough redshift upper bound from color
-    # Bluer objects (low Ir/U ratio) suggest lower z; redder suggest higher z
-    # color_ratio = meas_photo[1] / (meas_photo[0] + 1e-10)  # Ir/U ratio
-    # z_max = min(3.0, max(1.0, 0.5 + 2.0 * np.log10(color_ratio + 1)))  # Rough heuristic
-    z_max = 3.0
+    # Bracket the minimum with a coarse grid, then refine locally.
+    # This avoids relying on a brittle color-based heuristic and keeps the solver bounded.
+    z_grid = np.linspace(0.0, 3.5, 29)  # coarse grid up to 3.5
+    chi_grid = []
+    for zg in z_grid:
+        # Evaluate all templates at this redshift; keep the best chi for the bracket
+        chi_min_at_z = np.inf
+        for g in galaxies:
+            chi = compute_chi_square(zg, g)
+            if chi < chi_min_at_z:
+                chi_min_at_z = chi
+        chi_grid.append(chi_min_at_z)
+
+    z_coarse_best = float(z_grid[int(np.argmin(chi_grid))])
+    span = 0.6  # search window around coarse best
+    z_lower = max(0.0, z_coarse_best - span)
+    z_upper = min(3.0, z_coarse_best + span)
+
+    # Safety: ensure non-zero width
+    if z_upper <= z_lower:
+        z_upper = min(3.0, z_lower + 0.5)
 
     for galaxy_type in galaxies:
-        # Use continuous optimization to find best redshift (0 to 1)
+        # Use continuous optimization within a locally bracketed window
         result = minimize_scalar(
             lambda z: compute_chi_square(z, galaxy_type),
-            bounds=(0, z_max),
+            bounds=(z_lower, z_upper),
             method="bounded",
         )
         zmins.append(result.x)
