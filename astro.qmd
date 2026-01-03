@@ -274,7 +274,7 @@ for idx, row in sed_catalog.iterrows():
     fluxes = [row[f'flux_{band}'] for band in ['b', 'i', 'u', 'v']]
     errors = [row[f'error_{band}'] for band in ['b', 'i', 'u', 'v']]
 
-    galaxy_type, redshift = classify_galaxy(fluxes, errors, spectra_path=R".\spectra\Spectra")
+    galaxy_type, redshift = classify_galaxy(fluxes, errors, spectra_path=R".\spectra")
 
     sed_catalog.at[idx, 'redshift'] = redshift
     sed_catalog.at[idx, 'galaxy_type'] = galaxy_type
