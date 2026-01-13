@@ -11,9 +11,9 @@ files = {
 }
 
 for band, filepath in files.items():
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"Band: {band}")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
 
     try:
         hdul = fits.open(filepath)
@@ -26,9 +26,7 @@ for band, filepath in files.items():
         for i, hdu in enumerate(hdul):
             print(f"\n--- HDU {i} ---")
             print(f"Type: {type(hdu).__name__}")
-            print(
-                f"Header shape: {hdu.data.shape if hdu.data is not None else 'No data'}"
-            )
+            print(f"Header shape: {hdu.data.shape if hdu.data is not None else 'No data'}")
 
             if hdu.data is not None:
                 print(f"Data dtype: {hdu.data.dtype}")
@@ -44,5 +42,5 @@ for band, filepath in files.items():
     except Exception as e:
         print(f"Error reading {filepath}: {e}")
 
-print(f"\n{'='*60}")
+print(f"\n{'=' * 60}")
 print("Diagnosis complete")

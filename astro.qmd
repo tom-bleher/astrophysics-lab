@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from photutils.segmentation import detect_sources, deblend_sources, SegmentationImage, SourceCatalog
 from photutils.background import Background2D, MedianBackground
 
-from classify import classify_galaxy
+from classify import classify_galaxy_with_pdf
 from scientific import theta_static, theta_lcdm, get_radius
 
 
@@ -76,6 +76,10 @@ for band, file in files.items():
 data, header = read_fits("./data/planet_mask2.fits")
 planet_mask = AstroImage(data=data, header=header)
 
+# Read star mask (provided by course staff - objects here are known stars)
+data, header = read_fits("./data/star_mask.fits")
+star_mask = AstroImage(data=data, header=header)
+
 ```
 
 
@@ -101,7 +105,7 @@ for image in images:
     image.segm = detect_sources(
         data_sub,
         threshold,
-        npixels=50,
+        npixels=20,
         mask=mask  # Apply mask DURING detection
     )
     
@@ -234,10 +238,79 @@ cross_matched_catalog = pd.DataFrame(matched_sources)
 print(f"Cross-matched catalog has {len(cross_matched_catalog)} sources (present in all 4 bands)")
 print(f"Original catalogs had: b={len(band_catalogs['b'])}, i={len(band_catalogs['i'])}, "
       f"u={len(band_catalogs['u'])}, v={len(band_catalogs['v'])} sources")
-# display(cross_matched_catalog.head())
 
 ```
 
+## Star/Galaxy Separation
+Use concentration index to filter out stars. Stars are compact (high concentration), galaxies are extended.
+```{python}
+from photutils.aperture import CircularAperture, aperture_photometry
+
+def calculate_concentration(image_data, x, y, r_inner=2.0, r_outer=6.0):
+    """
+    Calculate concentration index C = flux(r_outer) / flux(r_inner).
+    Stars have high concentration (C ~ 1), galaxies have lower (C > 2-3).
+    """
+    if not (r_inner < x < image_data.shape[1] - r_outer and
+            r_inner < y < image_data.shape[0] - r_outer):
+        return np.nan
+
+    aper_inner = CircularAperture((x, y), r=r_inner)
+    aper_outer = CircularAperture((x, y), r=r_outer)
+
+    phot_inner = aperture_photometry(image_data, aper_inner)
+    phot_outer = aperture_photometry(image_data, aper_outer)
+
+    flux_inner = phot_inner['aperture_sum'][0]
+    flux_outer = phot_outer['aperture_sum'][0]
+
+    if flux_inner > 0:
+        return flux_outer / flux_inner
+    return np.nan
+
+# Calculate concentration for each source using I-band (best S/N typically)
+i_band_data = images[1].data  # i-band
+concentrations = []
+
+for _, row in cross_matched_catalog.iterrows():
+    c = calculate_concentration(i_band_data, row['xcentroid'], row['ycentroid'])
+    concentrations.append(c)
+
+cross_matched_catalog['concentration'] = concentrations
+
+# Stars typically have concentration < 1.5-2.0, galaxies > 2.0
+# Threshold depends on seeing/PSF - adjust based on your data
+CONCENTRATION_THRESHOLD = 1.8
+
+cross_matched_catalog['is_galaxy'] = cross_matched_catalog['concentration'] > CONCENTRATION_THRESHOLD
+
+# Force objects in the star mask (from course staff) to be classified as stars
+star_mask_data = star_mask.data.astype(bool)
+n_forced_stars = 0
+for idx in cross_matched_catalog.index:
+    x = int(round(cross_matched_catalog.loc[idx, 'xcentroid']))
+    y = int(round(cross_matched_catalog.loc[idx, 'ycentroid']))
+    # Check bounds and if position is in star mask
+    if 0 <= y < star_mask_data.shape[0] and 0 <= x < star_mask_data.shape[1]:
+        if star_mask_data[y, x]:
+            if cross_matched_catalog.loc[idx, 'is_galaxy']:  # Only count if it was classified as galaxy
+                n_forced_stars += 1
+            cross_matched_catalog.loc[idx, 'is_galaxy'] = False
+
+n_stars = (~cross_matched_catalog['is_galaxy']).sum()
+n_galaxies = cross_matched_catalog['is_galaxy'].sum()
+n_unknown = cross_matched_catalog['concentration'].isna().sum()
+
+print(f"Star/Galaxy classification:")
+print(f"  Stars (C < {CONCENTRATION_THRESHOLD}): {n_stars - n_forced_stars}")
+print(f"  Stars (forced by mask): {n_forced_stars}")
+print(f"  Galaxies (C >= {CONCENTRATION_THRESHOLD}): {n_galaxies}")
+print(f"  Unknown (edge/masked): {n_unknown}")
+
+# Filter to keep only galaxies
+cross_matched_catalog = cross_matched_catalog[cross_matched_catalog['is_galaxy'] == True].copy()
+print(f"\nFiltered catalog: {len(cross_matched_catalog)} galaxies")
+```
 
 Now we create another dataframe with the relevant converted SEDs and errors
 ```{python}
@@ -267,17 +340,49 @@ print(f"SED catalog has {len(sed_catalog)} sources")
 ```
 
 
-Finally, we use this catalog to identify the redshift of each source, and calculate the radius' angle
+Finally, we use this catalog to identify the redshift of each source, and calculate the radius' angle.
+We use `classify_galaxy_with_pdf` with enhanced features:
+- **IGM absorption** (Madau 1995): Accounts for Lyman-alpha forest absorption at high-z
+- **Template interpolation**: Creates intermediate templates for better SED coverage
+- **Secondary peak detection**: Identifies bimodal redshift solutions
+
 ```{python}
+# Classification settings - enable enhanced features based on HDF research
+APPLY_IGM = True           # Apply IGM absorption (important for z > 2)
+N_TEMPLATE_INTERP = 1      # Interpolated templates between each pair (0 = none)
+
+print("=== Enhanced Photo-z Classification ===")
+print(f"IGM absorption: {'enabled' if APPLY_IGM else 'disabled'}")
+print(f"Template interpolation: {N_TEMPLATE_INTERP} per pair")
+print()
+
+n_bimodal = 0  # Count sources with secondary peaks
+
 for idx, row in sed_catalog.iterrows():
     # The order of the bands is important here
     fluxes = [row[f'flux_{band}'] for band in ['b', 'i', 'u', 'v']]
     errors = [row[f'error_{band}'] for band in ['b', 'i', 'u', 'v']]
 
-    galaxy_type, redshift = classify_galaxy(fluxes, errors, spectra_path=R".\spectra")
+    result = classify_galaxy_with_pdf(
+        fluxes, errors,
+        spectra_path=R".\spectra",
+        apply_igm=APPLY_IGM,
+        n_template_interp=N_TEMPLATE_INTERP,
+    )
 
-    sed_catalog.at[idx, 'redshift'] = redshift
-    sed_catalog.at[idx, 'galaxy_type'] = galaxy_type
+    # Store all photo-z results with uncertainties
+    sed_catalog.at[idx, 'redshift'] = result.redshift
+    sed_catalog.at[idx, 'z_lo'] = result.z_lo          # 16th percentile
+    sed_catalog.at[idx, 'z_hi'] = result.z_hi          # 84th percentile
+    sed_catalog.at[idx, 'galaxy_type'] = result.galaxy_type
+    sed_catalog.at[idx, 'odds'] = result.odds          # Quality metric (0-1)
+    sed_catalog.at[idx, 'chi2'] = result.chi_sq_min    # Fit quality
+
+    # Secondary peak (bimodal solutions)
+    sed_catalog.at[idx, 'z_secondary'] = result.z_secondary
+    sed_catalog.at[idx, 'odds_secondary'] = result.odds_secondary
+    if result.z_secondary is not None:
+        n_bimodal += 1
 
     # Calculate angular size in arcseconds
     r_half_pix, r_half_pix_error = row['r_half_pix'], row['r_half_pix_error']
@@ -286,7 +391,105 @@ for idx, row in sed_catalog.iterrows():
     sed_catalog.at[idx, 'r_half_arcsec'] = r_half_arcsec
     sed_catalog.at[idx, 'r_half_arcsec_error'] = r_half_arcsec_error
 
+print(f"Classification complete for {len(sed_catalog)} sources")
+print(f"Sources with bimodal PDF (secondary peak): {n_bimodal}")
 display(sed_catalog.head())
+```
+
+## Quality Filtering & Diagnostics
+Filter sources by photo-z quality (ODDS parameter) and show diagnostic statistics.
+```{python}
+# ODDS threshold: > 0.9 means 90% of PDF is within ±0.1(1+z) of peak
+# This is a standard quality cut used in photo-z surveys
+ODDS_THRESHOLD = 0.7  # Can increase to 0.9 for stricter filtering
+
+# Quality statistics before filtering
+print("=== Photo-z Quality Statistics ===")
+print(f"Total sources: {len(sed_catalog)}")
+print(f"ODDS distribution:")
+print(f"  ODDS > 0.9 (excellent): {(sed_catalog['odds'] > 0.9).sum()}")
+print(f"  ODDS > 0.7 (good):      {(sed_catalog['odds'] > 0.7).sum()}")
+print(f"  ODDS > 0.5 (marginal):  {(sed_catalog['odds'] > 0.5).sum()}")
+print(f"  ODDS < 0.5 (poor):      {(sed_catalog['odds'] <= 0.5).sum()}")
+
+print(f"\nGalaxy type distribution:")
+for gtype in sed_catalog['galaxy_type'].unique():
+    count = (sed_catalog['galaxy_type'] == gtype).sum()
+    print(f"  {gtype}: {count}")
+
+print(f"\nRedshift distribution:")
+print(f"  min: {sed_catalog['redshift'].min():.3f}")
+print(f"  max: {sed_catalog['redshift'].max():.3f}")
+print(f"  median: {sed_catalog['redshift'].median():.3f}")
+
+# Report on bimodal solutions
+bimodal_mask = sed_catalog['z_secondary'].notna()
+if bimodal_mask.any():
+    print(f"\nBimodal (secondary peak) statistics:")
+    print(f"  Sources with secondary peak: {bimodal_mask.sum()}")
+    bimodal_sources = sed_catalog[bimodal_mask]
+    z_diff = np.abs(bimodal_sources['redshift'] - bimodal_sources['z_secondary'])
+    print(f"  Mean |z1 - z2|: {z_diff.mean():.2f}")
+    print(f"  Median secondary ODDS: {bimodal_sources['odds_secondary'].median():.2f}")
+
+# Apply quality filter
+sed_catalog_filtered = sed_catalog[sed_catalog['odds'] >= ODDS_THRESHOLD].copy()
+print(f"\n=== After quality filtering (ODDS >= {ODDS_THRESHOLD}) ===")
+print(f"Retained: {len(sed_catalog_filtered)} / {len(sed_catalog)} sources ({100*len(sed_catalog_filtered)/len(sed_catalog):.1f}%)")
+
+# Use filtered catalog for analysis
+sed_catalog = sed_catalog_filtered
+```
+
+Show photo-z quality diagnostics
+```{python}
+fig = go.Figure()
+
+# Scatter plot: redshift vs ODDS colored by galaxy type
+fig.add_trace(go.Scatter(
+    x=sed_catalog['redshift'],
+    y=sed_catalog['odds'],
+    mode='markers',
+    marker=dict(
+        size=6,
+        color=sed_catalog['chi2'],
+        colorscale='Viridis',
+        colorbar=dict(title='χ²'),
+        showscale=True
+    ),
+    text=sed_catalog['galaxy_type'],
+    hovertemplate='z=%{x:.2f}<br>ODDS=%{y:.2f}<br>Type: %{text}<extra></extra>',
+    name='Sources'
+))
+
+fig.add_hline(y=ODDS_THRESHOLD, line_dash="dash", line_color="red",
+              annotation_text=f"Quality threshold (ODDS={ODDS_THRESHOLD})")
+
+fig.update_layout(
+    title="Photo-z Quality: ODDS vs Redshift",
+    xaxis_title="Photometric Redshift",
+    yaxis_title="ODDS (photo-z quality)",
+    width=800, height=500
+)
+fig.show()
+
+# Show redshift uncertainty
+fig2 = go.Figure()
+fig2.add_trace(go.Scatter(
+    x=sed_catalog['redshift'],
+    y=sed_catalog['z_hi'] - sed_catalog['z_lo'],
+    mode='markers',
+    marker=dict(size=5, opacity=0.6),
+    name='z uncertainty (84th - 16th percentile)'
+))
+
+fig2.update_layout(
+    title="Photo-z Uncertainty vs Redshift",
+    xaxis_title="Photometric Redshift",
+    yaxis_title="Δz (1σ width)",
+    width=800, height=400
+)
+fig2.show()
 ```
 
 # Finally!
@@ -345,6 +548,12 @@ R_static = get_radius(binned.z_mid.values, binned.theta_med.values,
 R_lcdm = get_radius(binned.z_mid.values, binned.theta_med.values,
                     binned.theta_err.values, model='lcdm')
 
+print("=== Cosmological Model Fits ===")
+print(f"Static model: R = {R_static*1000:.2f} kpc")
+print(f"ΛCDM model:   R = {R_lcdm*1000:.2f} kpc")
+print(f"\nBinned data points: {len(binned)}")
+print(f"Sources per bin: {binned['n'].tolist()}")
+
 # Model curves (convert radians -> arcsec)
 theta_static_model = theta_static(z_model, R_static)
 theta_lcdm_model = theta_lcdm(z_model, R_lcdm)
@@ -390,4 +599,374 @@ fig.update_layout(
 )
 
 fig.show()
+```
+
+# Validation Against External Catalogs
+Compare our photo-z results against published HDF reference catalogs.
+
+## Setup: Add Sky Coordinates
+First, convert our pixel coordinates to RA/Dec using WCS from the FITS headers.
+```{python}
+from validation import (
+    add_sky_coordinates,
+    # HDF-specific catalog loaders
+    load_vizier_hdf_photoz,
+    load_vizier_hdf_surface_photometry,
+    get_hdf_specz_from_fernandez_soto,
+    # Validation functions
+    validate_photoz,
+    validate_with_specz,
+    validate_sizes,
+    # Reference coordinates
+    HDF_N_CENTER_RA,
+    HDF_N_CENTER_DEC,
+)
+
+# Use the I-band header (typically has good WCS)
+i_band_header = images[1].header  # i-band
+
+# Add RA/Dec to our catalog
+# Note: adjust crop_offset if your adjust_data() function changed
+sed_catalog_with_coords = add_sky_coordinates(
+    sed_catalog,
+    i_band_header,
+    x_col='xcentroid',
+    y_col='ycentroid',
+    crop_offset=(90, 120),  # From adjust_data(): data[120:, 90:]
+    flip_x=True             # From adjust_data(): data[:, ::-1]
+)
+
+print(f"\nCatalog now has {len(sed_catalog_with_coords)} sources with sky coordinates")
+print(f"HDF-N center: RA={HDF_N_CENTER_RA:.4f}°, Dec={HDF_N_CENTER_DEC:.4f}°")
+```
+
+## Load Fernández-Soto 1999 Catalog (HDF-N)
+This is the original HDF photometric redshift catalog with 1,067 galaxies, loaded via VizieR (J/ApJ/513/34).
+```{python}
+from pathlib import Path
+
+# Create cache directory for external catalogs
+cache_dir = Path("./data/external")
+cache_dir.mkdir(parents=True, exist_ok=True)
+
+# Load the reference catalog via VizieR
+try:
+    fs99_catalog = load_vizier_hdf_photoz(cache_path=cache_dir / "fs99_photoz.csv")
+    print(f"\nFernández-Soto 1999 catalog summary:")
+    print(f"  Total sources: {len(fs99_catalog)}")
+    if 'z_phot' in fs99_catalog.columns:
+        print(f"  Photo-z range: {fs99_catalog['z_phot'].min():.2f} - {fs99_catalog['z_phot'].max():.2f}")
+    if 'z_spec' in fs99_catalog.columns:
+        n_specz = fs99_catalog['z_spec'].notna().sum()
+        print(f"  Sources with spec-z: {n_specz}")
+except Exception as e:
+    print(f"Could not load Fernández-Soto catalog: {e}")
+    print("Install astroquery: pip install astroquery")
+    fs99_catalog = None
+```
+
+## Validate Against Photo-z Reference
+Cross-match our detections with the reference catalog and compute photo-z accuracy metrics.
+```{python}
+validation_report = None
+
+if fs99_catalog is not None and 'ra' in sed_catalog_with_coords.columns:
+    # Check if coordinates overlap
+    our_ra_range = (sed_catalog_with_coords['ra'].min(), sed_catalog_with_coords['ra'].max())
+    our_dec_range = (sed_catalog_with_coords['dec'].min(), sed_catalog_with_coords['dec'].max())
+    ref_ra_range = (fs99_catalog['ra'].min(), fs99_catalog['ra'].max())
+    ref_dec_range = (fs99_catalog['dec'].min(), fs99_catalog['dec'].max())
+
+    print(f"Our field:       RA [{our_ra_range[0]:.3f}, {our_ra_range[1]:.3f}]  Dec [{our_dec_range[0]:.3f}, {our_dec_range[1]:.3f}]")
+    print(f"Reference field: RA [{ref_ra_range[0]:.3f}, {ref_ra_range[1]:.3f}]  Dec [{ref_dec_range[0]:.3f}, {ref_dec_range[1]:.3f}]")
+
+    # Check for overlap
+    ra_overlap = (our_ra_range[0] < ref_ra_range[1]) and (our_ra_range[1] > ref_ra_range[0])
+    dec_overlap = (our_dec_range[0] < ref_dec_range[1]) and (our_dec_range[1] > ref_dec_range[0])
+
+    if ra_overlap and dec_overlap:
+        print("\nFields overlap - proceeding with photo-z validation...")
+
+        validation_report = validate_photoz(
+            sed_catalog_with_coords,
+            fs99_catalog,
+            z_col_ours='redshift',
+            z_col_ref='z_phot',
+            max_separation_arcsec=1.5
+        )
+
+        if validation_report:
+            print(validation_report)
+    else:
+        print("\nWarning: Fields do not overlap!")
+        print("Your data may be from a different HDF region (e.g., HDF-S vs HDF-N)")
+else:
+    print("Cannot validate: missing coordinates or reference catalog")
+```
+
+## Validate Against Spectroscopic Redshifts
+Ground-truth validation using sources with confirmed spectroscopic redshifts from Keck observations.
+```{python}
+specz_report = None
+
+if fs99_catalog is not None and 'ra' in sed_catalog_with_coords.columns:
+    # Extract only sources with spectroscopic redshifts for ground-truth validation
+    specz_subset = fs99_catalog[fs99_catalog['z_spec'].notna()].copy()
+
+    if len(specz_subset) > 0:
+        print(f"\n=== Spectroscopic Validation (Ground Truth) ===")
+        print(f"Reference has {len(specz_subset)} sources with spec-z")
+        print(f"Spec-z range: {specz_subset['z_spec'].min():.2f} - {specz_subset['z_spec'].max():.2f}")
+
+        specz_report = validate_with_specz(
+            sed_catalog_with_coords,
+            specz_subset,
+            z_col_ours='redshift',
+            z_col_spec='z_spec',
+            max_separation_arcsec=1.5
+        )
+
+        if specz_report:
+            print(specz_report)
+            print("\nNote: Validation against spec-z is the gold standard for photo-z accuracy.")
+    else:
+        print("No spectroscopic redshifts available in reference catalog")
+```
+
+## Validation Diagnostic Plots
+```{python}
+import matplotlib.pyplot as plt
+
+# Determine how many plots we need
+has_photoz = validation_report is not None
+has_specz = specz_report is not None
+
+if has_photoz or has_specz:
+    n_rows = 1 + int(has_specz and has_photoz)  # 2 rows if we have both
+    fig, axes = plt.subplots(n_rows, 2, figsize=(12, 5 * n_rows))
+
+    if n_rows == 1:
+        axes = axes.reshape(1, -1)
+
+    row_idx = 0
+
+    # Photo-z validation plot
+    if has_photoz:
+        ax1, ax2 = axes[row_idx]
+
+        # Left: z_ours vs z_ref
+        ax1.scatter(validation_report.z_reference, validation_report.z_ours,
+                    alpha=0.5, s=20, c='steelblue')
+
+        z_max = max(validation_report.z_reference.max(), validation_report.z_ours.max()) * 1.1
+        ax1.plot([0, z_max], [0, z_max], 'k--', lw=1, label='1:1')
+
+        z_line = np.linspace(0, z_max, 100)
+        ax1.fill_between(z_line, z_line - 0.15*(1+z_line), z_line + 0.15*(1+z_line),
+                         alpha=0.2, color='gray', label='±0.15(1+z)')
+
+        ax1.set_xlabel('Reference Photo-z (FS99)')
+        ax1.set_ylabel('Our Photo-z')
+        ax1.set_title(f'Photo-z vs Photo-z (N={validation_report.n_matched})\nNMAD={validation_report.nmad:.3f}')
+        ax1.legend()
+        ax1.set_xlim(0, z_max)
+        ax1.set_ylim(0, z_max)
+
+        # Right: Δz/(1+z) histogram
+        dz = (validation_report.z_ours - validation_report.z_reference) / (1 + validation_report.z_reference)
+        ax2.hist(dz, bins=30, range=(-0.5, 0.5), alpha=0.7, color='steelblue', edgecolor='white')
+        ax2.axvline(0, color='k', linestyle='--')
+        ax2.axvline(validation_report.nmad, color='red', linestyle=':', label=f'NMAD={validation_report.nmad:.3f}')
+        ax2.axvline(-validation_report.nmad, color='red', linestyle=':')
+        ax2.set_xlabel('Δz / (1+z)')
+        ax2.set_ylabel('Count')
+        ax2.set_title(f'Photo-z Residuals (Outliers: {100*validation_report.outlier_fraction:.1f}%)')
+        ax2.legend()
+
+        row_idx += 1
+
+    # Spectroscopic validation plot (if we have spec-z data)
+    if has_specz:
+        ax3, ax4 = axes[row_idx] if n_rows > 1 else axes[0]
+
+        # Left: z_ours vs z_spec
+        ax3.scatter(specz_report.z_reference, specz_report.z_ours,
+                    alpha=0.6, s=30, c='darkgreen', marker='o')
+
+        z_max_spec = max(specz_report.z_reference.max(), specz_report.z_ours.max()) * 1.1
+        ax3.plot([0, z_max_spec], [0, z_max_spec], 'k--', lw=1, label='1:1')
+
+        z_line = np.linspace(0, z_max_spec, 100)
+        ax3.fill_between(z_line, z_line - 0.15*(1+z_line), z_line + 0.15*(1+z_line),
+                         alpha=0.2, color='green', label='±0.15(1+z)')
+
+        ax3.set_xlabel('Spectroscopic z (ground truth)')
+        ax3.set_ylabel('Our Photo-z')
+        ax3.set_title(f'Photo-z vs Spec-z (N={specz_report.n_matched})\nNMAD={specz_report.nmad:.3f}')
+        ax3.legend()
+        ax3.set_xlim(0, z_max_spec)
+        ax3.set_ylim(0, z_max_spec)
+
+        # Right: Δz/(1+z) histogram for spec-z
+        dz_spec = (specz_report.z_ours - specz_report.z_reference) / (1 + specz_report.z_reference)
+        ax4.hist(dz_spec, bins=20, range=(-0.5, 0.5), alpha=0.7, color='darkgreen', edgecolor='white')
+        ax4.axvline(0, color='k', linestyle='--')
+        ax4.axvline(specz_report.nmad, color='red', linestyle=':', label=f'NMAD={specz_report.nmad:.3f}')
+        ax4.axvline(-specz_report.nmad, color='red', linestyle=':')
+        ax4.set_xlabel('Δz / (1+z)')
+        ax4.set_ylabel('Count')
+        ax4.set_title(f'Spec-z Residuals (Outliers: {100*specz_report.outlier_fraction:.1f}%)')
+        ax4.legend()
+
+    plt.tight_layout()
+    plt.savefig('./output/photoz_validation.png', dpi=150, bbox_inches='tight')
+    plt.show()
+
+    print(f"\nValidation plot saved to ./output/photoz_validation.png")
+else:
+    print("No validation reports available - skipping plots")
+```
+
+## Optional: Surface Photometry Validation
+Load Fasano+ 1998 surface photometry catalog for validating half-light radius measurements.
+```{python}
+# Uncomment to validate size measurements against published surface photometry:
+#
+# try:
+#     fasano_catalog = load_vizier_hdf_surface_photometry(
+#         cache_path=cache_dir / "fasano98_surface_photometry.csv"
+#     )
+#     if len(fasano_catalog) > 0 and 'r_half_arcsec' in sed_catalog_with_coords.columns:
+#         size_report = validate_sizes(
+#             sed_catalog_with_coords,
+#             fasano_catalog,
+#             r_col_ours='r_half_arcsec',
+#             r_col_ref='r_eff',  # Effective radius from Fasano
+#             max_separation_arcsec=1.5
+#         )
+#         if size_report:
+#             print(size_report)
+# except Exception as e:
+#     print(f"Could not load surface photometry: {e}")
+```
+
+## Validation Summary
+```{python}
+print("=" * 50)
+print("VALIDATION SUMMARY")
+print("=" * 50)
+
+if validation_report:
+    print(f"\nPhoto-z vs Fernández-Soto 1999:")
+    print(f"  Matched: {validation_report.n_matched} sources")
+    print(f"  NMAD: {validation_report.nmad:.4f}")
+    print(f"  Outliers (|Δz/(1+z)|>0.15): {100*validation_report.outlier_fraction:.1f}%")
+
+if specz_report:
+    print(f"\nPhoto-z vs Spectroscopic (ground truth):")
+    print(f"  Matched: {specz_report.n_matched} sources")
+    print(f"  NMAD: {specz_report.nmad:.4f}")
+    print(f"  Outliers: {100*specz_report.outlier_fraction:.1f}%")
+    print(f"  Catastrophic (|Δz/(1+z)|>0.5): {100*specz_report.catastrophic_fraction:.1f}%")
+
+if not validation_report and not specz_report:
+    print("\nNo validation performed - check coordinate overlap with HDF-N")
+    print(f"Expected HDF-N center: RA~{HDF_N_CENTER_RA:.2f}°, Dec~{HDF_N_CENTER_DEC:.2f}°")
+
+print("=" * 50)
+```
+
+## Morphology Cross-Validation with Zoobot
+Cross-check our SED-based galaxy types against morphological classification.
+Zoobot uses deep learning trained on Galaxy Zoo volunteer classifications.
+
+```{python}
+from validation import (
+    cross_validate_sed_with_concentration,
+    HAS_ZOOBOT_MODULE,
+)
+
+# First: Simple cross-validation using concentration index
+# (works without installing Zoobot)
+if 'concentration' in cross_matched_catalog.columns:
+    print("=== Morphology Cross-Validation (Concentration-based) ===\n")
+
+    # Merge concentration back into sed_catalog
+    sed_with_conc = sed_catalog.copy()
+    # Map from cross_matched_catalog by position
+    conc_lookup = cross_matched_catalog.set_index(['xcentroid', 'ycentroid'])['concentration']
+
+    for idx, row in sed_with_conc.iterrows():
+        key = (row['xcentroid'], row['ycentroid'])
+        if key in conc_lookup.index:
+            sed_with_conc.at[idx, 'concentration'] = conc_lookup[key]
+
+    if 'concentration' in sed_with_conc.columns:
+        morph_validation = cross_validate_sed_with_concentration(
+            sed_with_conc,
+            type_col='galaxy_type',
+            concentration_col='concentration'
+        )
+
+        print(f"Sources analyzed: {morph_validation.get('n_sources', 0)}")
+
+        if 'elliptical_compact_fraction' in morph_validation:
+            e_frac = morph_validation['elliptical_compact_fraction']
+            if not np.isnan(e_frac):
+                print(f"Elliptical (SED) -> Compact (C): {100*e_frac:.1f}%")
+
+        if 'spiral_extended_fraction' in morph_validation:
+            s_frac = morph_validation['spiral_extended_fraction']
+            if not np.isnan(s_frac):
+                print(f"Spiral (SED) -> Extended (C): {100*s_frac:.1f}%")
+
+        print("\nMorphology distribution by SED type:")
+        for sed_type, morph_dist in morph_validation.get('by_type', {}).items():
+            print(f"  {sed_type}: {morph_dist}")
+else:
+    print("Concentration index not available - skipping morphology cross-validation")
+```
+
+```{python}
+# Full Zoobot deep learning classification
+# Zoobot is installed at /home/tom/Desktop/astro/zoobot
+
+from validation import (
+    extract_cutouts,
+    interpret_zoobot_predictions,
+    validate_morphology_with_zoobot,
+    HAS_ZOOBOT_MODULE,
+)
+
+if HAS_ZOOBOT_MODULE:
+    print("=== Zoobot Deep Learning Morphology ===\n")
+
+    # Use I-band (best S/N) for morphology
+    i_band_data = images[1].data
+
+    # Extract cutouts for Zoobot
+    cutout_dir = Path("./output/cutouts")
+    cutouts = extract_cutouts(
+        i_band_data,
+        sed_catalog,
+        size=128,
+        output_dir=cutout_dir,
+    )
+    print(f"Extracted {len(cutouts)} galaxy cutouts to {cutout_dir}")
+
+    # Get paths to cutout images
+    image_paths = [c[2] for c in cutouts if c[2] is not None]
+    print(f"Ready for Zoobot: {len(image_paths)} images")
+
+    # Run Zoobot predictions on CPU (~1-2 min for 100 galaxies)
+    from validation import run_zoobot_predictions
+    print(f"\nRunning Zoobot predictions on {len(image_paths)} images (CPU)...")
+    zoobot_raw = run_zoobot_predictions(image_paths, device='cpu')
+
+    # Interpret and validate against SED types
+    zoobot_morphology = interpret_zoobot_predictions(zoobot_raw)
+    zoobot_report = validate_morphology_with_zoobot(sed_catalog, zoobot_morphology)
+    print(zoobot_report)
+else:
+    print("Zoobot module not available")
 ```
