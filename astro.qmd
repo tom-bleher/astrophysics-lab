@@ -39,10 +39,10 @@ Start by reading the 4 fits files for the 4 filters
 ```{python}
 # Load the FITS file
 files = {
-    "b": "./fits/b.fits",
-    "i": "./fits/i.fits",
-    "u": "./fits/u.fits",
-    "v": "./fits/v.fits",
+    "b": "./data/full_HDF/b.fits",
+    "i": "./data/full_HDF/i.fits",
+    "u": "./data/full_HDF/u.fits",
+    "v": "./data/full_HDF/v.fits",
 }
 
 def adjust_data(data, threshold_percentile=99):

@@ -23,67 +23,101 @@ classifiers = [
 ]
 
 dependencies = [
-    "numpy>=1.24",
-    "pandas>=2.0",
-    "matplotlib>=3.8",
+    "numpy>=1.24,<2.0",
     "scipy>=1.11",
-    "astropy>=6.0",
-    "photutils>=1.10",
-    "astroquery>=0.4.7",
-    "requests>=2.31",
-    "tqdm>=4.66",
+    "pandas>=2.0",
+    "matplotlib>=3.7",
+    "astropy>=5.3",
 ]
 
 [project.optional-dependencies]
-# Optional dependencies for extended functionality
-performance = [
-    "numba>=0.59",     # JIT compilation for 50-100x faster IGM/chi-sq calculations
+# Photometry tools for source detection and aperture photometry
+photometry = [
+    "photutils>=1.8",
+    "sep>=1.2",
 ]
-mcmc = [
-    "emcee>=3.1",      # MCMC sampling for parameter estimation
-    "corner>=2.2",     # Corner plots for MCMC results
-]
+
+# Morphology analysis tools
 morphology = [
-    "petrofit>=0.5",   # Sérsic profile fitting
+    "statmorph>=0.5",
+    "petrofit>=0.4",
 ]
-benchmark = [
-    "eazy>=0.7",       # EAZY photo-z for benchmarking
+
+# Photometric redshift estimation
+photoz = [
+    "eazy>=1.0",
 ]
+
+# Machine learning classification
 ml = [
-    "scikit-learn>=1.3",  # ML star-galaxy classification
-    "joblib>=1.3",        # Model persistence
-    "zoobot>=0.0.4",      # ML morphology classification (optional)
-]
-# All optional scientific packages
-science = [
-    "numba>=0.59",
-    "emcee>=3.1",
-    "corner>=2.2",
-    "petrofit>=0.5",
     "scikit-learn>=1.3",
     "joblib>=1.3",
 ]
-# Development dependencies
+
+# MCMC sampling and analysis
+mcmc = [
+    "emcee>=3.1",
+    "corner>=2.2",
+    "arviz>=0.15",
+]
+
+# Deep learning models (heavy dependencies)
+deeplearning = [
+    "zoobot>=1.0",
+    "torch>=2.0",
+]
+
+# External catalog validation
+validation = [
+    "astroquery>=0.4",
+]
+
+# Development and testing tools
 dev = [
-    "pytest>=8.0",
+    "pytest>=7.0",
     "pytest-cov>=4.0",
-    "ruff>=0.4",
-    "mypy>=1.10",
-    "hypothesis>=6.100",
+    "ruff>=0.1",
+    "mypy>=1.0",
 ]
-# All dependencies (for full functionality)
-all = [
-    "numba>=0.59",
-    "emcee>=3.1",
-    "corner>=2.2",
-    "petrofit>=0.5",
-    "eazy>=0.7",
+
+# Full installation (everything except deeplearning which has heavy deps)
+full = [
+    "photutils>=1.8",
+    "sep>=1.2",
+    "statmorph>=0.5",
+    "petrofit>=0.4",
+    "eazy>=1.0",
     "scikit-learn>=1.3",
     "joblib>=1.3",
-    "pytest>=8.0",
+    "emcee>=3.1",
+    "corner>=2.2",
+    "arviz>=0.15",
+    "astroquery>=0.4",
+    "pytest>=7.0",
     "pytest-cov>=4.0",
-    "ruff>=0.4",
-    "mypy>=1.10",
+    "ruff>=0.1",
+    "mypy>=1.0",
+]
+
+# All dependencies (complete installation including deeplearning)
+all = [
+    "photutils>=1.8",
+    "sep>=1.2",
+    "statmorph>=0.5",
+    "petrofit>=0.4",
+    "eazy>=1.0",
+    "scikit-learn>=1.3",
+    "joblib>=1.3",
+    "emcee>=3.1",
+    "corner>=2.2",
+    "arviz>=0.15",
+    "zoobot>=1.0",
+    "torch>=2.0",
+    "astroquery>=0.4",
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "ruff>=0.1",
+    "mypy>=1.0",
 ]
 
 [project.scripts]
