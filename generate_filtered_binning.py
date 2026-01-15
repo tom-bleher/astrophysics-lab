@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-Generate binning comparison plots with filtered z range (z >= 0.1).
-Saves full z-range plots to full/ and filtered plots to filtered/ subdirectories.
+Generate binning comparison plots for angular size vs redshift analysis.
 """
 
 import matplotlib
@@ -14,10 +13,11 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
+# Configure matplotlib with robust font settings
+# LaTeX disabled for compatibility (requires system latex installation)
 plt.rcParams.update({
-    "text.usetex": True,
+    "text.usetex": False,
     "font.family": "serif",
-    "font.serif": ["Computer Modern Roman"],
     "axes.labelsize": 12,
     "font.size": 11,
     "legend.fontsize": 10,
@@ -25,23 +25,25 @@ plt.rcParams.update({
     "ytick.labelsize": 10,
 })
 
-import builtins  # noqa: E402
-import contextlib  # noqa: E402
+import builtins
+import contextlib
 
-from scipy.stats import chi2 as chi2_dist  # noqa: E402
+from astropy.stats import bayesian_blocks
+from scipy.stats import chi2 as chi2_dist
 
-from scientific import (  # noqa: E402
+from scientific import (
     get_radius,
     theta_lcdm,
     theta_static,
 )
+from validation.muse_specz import load_muse_catalog, print_validation_summary, validate_with_specz
 
 RAD_TO_ARCSEC = 180.0 * 3600.0 / np.pi
 ARCSEC_TO_RAD = np.pi / (180.0 * 3600.0)
 Z_MIN_CUT = 0.3  # Filter out low-z where selection effects dominate (PSF-limited sample)
 Z_MAX_CUT = 2.0  # Filter out sparse high-z (too few galaxies for statistics)
-Z_REL_ERR_MAX = 0.25  # Maximum relative redshift error (z_err/z) for reliable photo-z
-MIN_GALAXIES_PER_TYPE = 30  # Minimum galaxies needed for per-type statistics
+MIN_GALAXIES_PER_TYPE = 30  # Minimum galaxies needed for per-type statistics (combined types)
+MIN_GALAXIES_PER_TYPE_BINNING = 9  # Lower threshold for per-type binning comparison plots
 
 # Combined galaxy type groups for better statistics
 COMBINED_TYPE_GROUPS = {
@@ -154,7 +156,6 @@ def sigma_clip_by_redshift_bin(df, z_col='redshift', theta_col='r_half_arcsec',
         clipped = sigma_clip(theta_in_bin, sigma=sigma, maxiters=3, masked=True)
 
         # Update keep_mask for this bin
-        bin_indices = df.index[bin_mask]
         outlier_in_bin = clipped.mask
         keep_mask[bin_mask] = ~outlier_in_bin
 
@@ -257,7 +258,7 @@ def bin_equal_width(sed_catalog, n_bins=None):
     return aggregate_bins(sed_catalog)
 
 
-def bin_equal_count(sed_catalog, n_bins=None):
+def bin_percentile(sed_catalog, n_bins=None):
     if n_bins is None:
         n_bins = get_adaptive_n_bins(len(sed_catalog))
     sed_catalog = sed_catalog.copy()
@@ -265,23 +266,38 @@ def bin_equal_count(sed_catalog, n_bins=None):
     return aggregate_bins(sed_catalog)
 
 
-def bin_percentile(sed_catalog, n_bins=None):
-    from scientific import choose_redshift_bin_edges
-    if n_bins is None:
-        n_bins = get_adaptive_n_bins(len(sed_catalog))
+def bin_bayesian_blocks(sed_catalog, p0=0.05):
+    """Bayesian Blocks adaptive binning (Scargle et al. 2013).
+
+    Uses astropy's bayesian_blocks algorithm to find optimal bin edges
+    based on the data structure. This is data-driven binning that creates
+    more bins where data is dense/variable and fewer where sparse/uniform.
+    """
     sed_catalog = sed_catalog.copy()
-    bins = choose_redshift_bin_edges(
-        sed_catalog.redshift.values,
-        target_count_per_bin=len(sed_catalog) // n_bins,
-        min_bins=max(3, n_bins - 2),
-        max_bins=n_bins + 2,
-        method="quantile",
-    )
-    sed_catalog["z_bin"] = pd.cut(sed_catalog.redshift, bins, include_lowest=True)
+    z = sed_catalog.redshift.values
+    theta = sed_catalog.r_half_arcsec.values
+
+    # Use point measures fitness with angular sizes as values
+    sigma = np.median(np.abs(theta - np.median(theta))) * 1.4826
+    sigma = max(sigma, 0.01 * np.median(theta))
+
+    try:
+        edges = bayesian_blocks(z, theta, sigma=sigma, fitness='measures', p0=p0)
+        if len(edges) < 4:
+            edges = np.linspace(z.min(), z.max(), 4)
+        if len(edges) > 16:
+            edges = bayesian_blocks(z, theta, sigma=sigma, fitness='measures', p0=0.2)
+            if len(edges) > 16:
+                edges = np.linspace(z.min(), z.max(), 12)
+    except Exception:
+        n_bins = get_adaptive_n_bins(len(sed_catalog))
+        edges = np.linspace(z.min(), z.max(), n_bins + 1)
+
+    sed_catalog["z_bin"] = pd.cut(sed_catalog.redshift, edges, include_lowest=True)
     return aggregate_bins(sed_catalog)
 
 
-def generate_binning_plot(data_dir, output_path, dataset_name, apply_z_filter=True):
+def generate_binning_plot(data_dir, output_path, dataset_name):
     """Generate binning comparison plot for a dataset.
 
     Parameters
@@ -292,12 +308,9 @@ def generate_binning_plot(data_dir, output_path, dataset_name, apply_z_filter=Tr
         Path to save the output PDF
     dataset_name : str
         Name for plot title
-    apply_z_filter : bool
-        If True, apply z >= 0.1 filter. If False, use full z range.
     """
-    filter_label = "Filtered" if apply_z_filter else "Full z-range"
     print(f"\n{'='*60}")
-    print(f"Generating {filter_label} binning plot for: {dataset_name}")
+    print(f"Generating binning plot for: {dataset_name}")
     print(f"{'='*60}")
 
     # Load catalog
@@ -309,39 +322,17 @@ def generate_binning_plot(data_dir, output_path, dataset_name, apply_z_filter=Tr
     n_total = len(sed_catalog)
     print(f"  Loaded {n_total} galaxies")
 
-    # Optionally apply z range filter
-    if apply_z_filter:
-        z_mask = (sed_catalog.redshift >= Z_MIN_CUT) & (sed_catalog.redshift <= Z_MAX_CUT)
-        n_low_z = (sed_catalog.redshift < Z_MIN_CUT).sum()
-        n_high_z = (sed_catalog.redshift > Z_MAX_CUT).sum()
-        sed_catalog = sed_catalog[z_mask]
-        n_after_z = len(sed_catalog)
-        print(f"  After {Z_MIN_CUT} <= z <= {Z_MAX_CUT} cut: {n_after_z} galaxies")
-        print(f"    (removed {n_low_z} low-z, {n_high_z} high-z)")
-
-        # Additional quality cut: remove sources with unreliable photo-z (high relative error)
-        if 'redshift_err' in sed_catalog.columns:
-            z_rel_err = sed_catalog['redshift_err'] / sed_catalog['redshift']
-            reliable_z = z_rel_err <= Z_REL_ERR_MAX
-            n_unreliable = (~reliable_z).sum()
-            sed_catalog = sed_catalog[reliable_z]
-            print(f"  After z_err/z <= {Z_REL_ERR_MAX} cut: {len(sed_catalog)} galaxies")
-            print(f"    (removed {n_unreliable} with unreliable photo-z)")
-
-        n_used = len(sed_catalog)
-    else:
-        n_used = n_total
-        print("  Using full z range (no filter applied)")
+    n_used = n_total
 
     if n_used < 10:
         print(f"  ERROR: Too few galaxies ({n_used}). Skipping.")
         return
 
-    # Binning strategies (1x3 layout: Equal Width, Equal Count, Percentile)
+    # Binning strategies (1x3 layout: Equal Width, Percentile, Bayesian Blocks)
     binning_strategies = {
         "Equal Width": bin_equal_width,
-        "Equal Count": bin_equal_count,
         "Percentile": bin_percentile,
+        "Bayesian Blocks": bin_bayesian_blocks,
     }
 
     binned_results = {}
@@ -362,13 +353,13 @@ def generate_binning_plot(data_dir, output_path, dataset_name, apply_z_filter=Tr
 
     colors = {
         "Equal Width": "green",
-        "Equal Count": "blue",
-        "Percentile": "purple",
+        "Percentile": "blue",
+        "Bayesian Blocks": "purple",
     }
     markers = {
         "Equal Width": "o",
-        "Equal Count": "o",
         "Percentile": "o",
+        "Bayesian Blocks": "o",
     }
 
     # Create plot (1x3 grid with residuals)
@@ -415,9 +406,8 @@ def generate_binning_plot(data_dir, output_path, dataset_name, apply_z_filter=Tr
         ax_main.plot(z_model_i, theta_lcdm_i, "-", color="darkblue", linewidth=1.5, label=r"$\Lambda$CDM", zorder=2)
 
         ax_main.set_ylabel(r"Angular size $\theta$ (arcsec)", fontsize=11)
-        filter_str = f"${Z_MIN_CUT} \\leq z \\leq {Z_MAX_CUT}$" if apply_z_filter else "Full $z$ range"
         ax_main.set_title(
-            f"{name} ({len(binned_data)} bins) - {filter_str}\n"
+            f"{name} ({len(binned_data)} bins)\n"
             + r"$R_{\Lambda{\rm CDM}}$" + f"={R_lcdm_i*1000:.1f} kpc, "
             + r"$\chi^2/{\rm ndf}$" + f"={stats_lcdm_i['chi2_ndf']:.2f}, "
             + f"P={stats_lcdm_i['p_value']:.3f}",
@@ -440,7 +430,7 @@ def generate_binning_plot(data_dir, output_path, dataset_name, apply_z_filter=Tr
         ax_resid_lcdm.errorbar(binned_data["z_mid"], residuals_lcdm, yerr=binned_data["theta_err"],
                                fmt=markers[name], capsize=2, capthick=0.6, markersize=5,
                                markeredgewidth=0.6, elinewidth=0.6, color=colors[name], zorder=3)
-        ax_resid_lcdm.set_ylabel(r"$\theta_{\rm data} - \theta_{\Lambda{\rm CDM}}$", fontsize=9)
+        ax_resid_lcdm.set_ylabel(r"$\theta_{\rm bin} - \theta_{\rm fit,\Lambda CDM}$", fontsize=9)
         ax_resid_lcdm.grid(True, alpha=0.3)
         ax_resid_lcdm.set_xlim(z_lim)
         max_resid_lcdm = max(0.05, np.max(np.abs(residuals_lcdm) + binned_data["theta_err"].values) * 1.2)
@@ -453,43 +443,38 @@ def generate_binning_plot(data_dir, output_path, dataset_name, apply_z_filter=Tr
                                  fmt=markers[name], capsize=2, capthick=0.6, markersize=5,
                                  markeredgewidth=0.6, elinewidth=0.6, color=colors[name], zorder=3)
         ax_resid_static.set_xlabel(r"Redshift $z$", fontsize=11)
-        ax_resid_static.set_ylabel(r"$\theta_{\rm data} - \theta_{\rm Static}$", fontsize=9)
+        ax_resid_static.set_ylabel(r"$\theta_{\rm bin} - \theta_{\rm fit,stat}$", fontsize=9)
         ax_resid_static.grid(True, alpha=0.3)
         ax_resid_static.set_xlim(z_lim)
         max_resid_static = max(0.05, np.max(np.abs(residuals_static) + binned_data["theta_err"].values) * 1.2)
         ax_resid_static.set_ylim(-max_resid_static, max_resid_static)
 
-    filter_suptitle = f"${Z_MIN_CUT} \\leq z \\leq {Z_MAX_CUT}$" if apply_z_filter else "Full $z$ range"
-    fig.suptitle(f"Binning Strategies - {dataset_name} ({filter_suptitle})",
+    fig.suptitle(f"Binning Strategies - {dataset_name}",
                  fontsize=14, fontweight="bold")
     plt.savefig(output_path, dpi=300, bbox_inches="tight")
     print(f"\nSaved: {output_path}")
     plt.close()
 
 
-def generate_overlay_plot(data_dir, output_path, dataset_name, apply_z_filter=True):
+def generate_overlay_plot(data_dir, output_path, dataset_name):
     """Generate binning overlay plot (all strategies on one plot)."""
-    filter_label = "Filtered" if apply_z_filter else "Full z-range"
-    print(f"\n  Generating {filter_label} overlay plot for: {dataset_name}")
+    print(f"\n  Generating overlay plot for: {dataset_name}")
 
-    # Load and filter catalog
+    # Load catalog
     catalog_path = f"{data_dir}/galaxy_catalog.csv"
     sed_catalog = pd.read_csv(catalog_path)
     sed_catalog = sed_catalog.dropna(subset=["redshift", "r_half_arcsec", "r_half_arcsec_error"])
     sed_catalog = sed_catalog[np.isfinite(sed_catalog["r_half_arcsec_error"])]
 
-    if apply_z_filter:
-        sed_catalog = sed_catalog[(sed_catalog.redshift >= Z_MIN_CUT) & (sed_catalog.redshift <= Z_MAX_CUT)]
-
     if len(sed_catalog) < 10:
         print("    Too few galaxies. Skipping.")
         return
 
-    # Binning strategies (1x3 layout: Equal Width, Equal Count, Percentile)
+    # Binning strategies (1x3 layout: Equal Width, Percentile, Bayesian Blocks)
     binning_strategies = {
         "Equal Width": bin_equal_width,
-        "Equal Count": bin_equal_count,
         "Percentile": bin_percentile,
+        "Bayesian Blocks": bin_bayesian_blocks,
     }
 
     binned_results = {}
@@ -497,8 +482,8 @@ def generate_overlay_plot(data_dir, output_path, dataset_name, apply_z_filter=Tr
         with contextlib.suppress(builtins.BaseException):
             binned_results[name] = bin_func(sed_catalog)
 
-    # Use equal-count for model fitting
-    binned = binned_results.get("Equal Count", bin_equal_width(sed_catalog))
+    # Use percentile for model fitting
+    binned = binned_results.get("Percentile", bin_equal_width(sed_catalog))
     R_lcdm = get_radius(binned.z_mid.values, binned.theta_med.values, binned.theta_err.values, model="lcdm")
     R_static = get_radius(binned.z_mid.values, binned.theta_med.values, binned.theta_err.values, model="static")
 
@@ -510,8 +495,8 @@ def generate_overlay_plot(data_dir, output_path, dataset_name, apply_z_filter=Tr
     z_lim = (max(0, sed_catalog.redshift.min() * 0.9), sed_catalog.redshift.max() * 1.05)
     theta_lim = (max(0, sed_catalog.r_half_arcsec.min() * 0.9), sed_catalog.r_half_arcsec.max() * 1.1)
 
-    colors = {"Equal Width": "green", "Equal Count": "blue", "Percentile": "purple"}
-    markers = {"Equal Width": "o", "Equal Count": "o", "Percentile": "o"}
+    colors = {"Equal Width": "green", "Percentile": "blue", "Bayesian Blocks": "purple"}
+    markers = {"Equal Width": "o", "Percentile": "o", "Bayesian Blocks": "o"}
 
     # Create plot
     _fig, ax = plt.subplots(figsize=(12, 8))
@@ -525,14 +510,9 @@ def generate_overlay_plot(data_dir, output_path, dataset_name, apply_z_filter=Tr
     ax.plot(z_model, theta_lcdm_model, "-", color="black", linewidth=2, label=r"$\Lambda$CDM model", zorder=3)
     ax.plot(z_model, theta_static_model, "--", color="black", linewidth=2, label=r"Static model", zorder=3)
 
-    if apply_z_filter:
-        ax.axvline(x=Z_MIN_CUT, color='red', linestyle=':', linewidth=1.5, alpha=0.7)
-        ax.axvline(x=Z_MAX_CUT, color='red', linestyle=':', linewidth=1.5, alpha=0.7, label='$z$ cuts')
-
     ax.set_xlabel(r"Redshift $z$", fontsize=12)
     ax.set_ylabel(r"Angular size $\theta$ (arcsec)", fontsize=12)
-    filter_str = f"${Z_MIN_CUT} \\leq z \\leq {Z_MAX_CUT}$" if apply_z_filter else "Full $z$ range"
-    ax.set_title(f"All Dynamic Binning Strategies - {dataset_name} ({filter_str})", fontsize=14)
+    ax.set_title(f"All Dynamic Binning Strategies - {dataset_name}", fontsize=14)
     ax.legend(fontsize=9, loc="upper right")
     ax.grid(True, alpha=0.3)
     ax.set_xlim(z_lim)
@@ -552,12 +532,10 @@ def get_types_with_enough_statistics(sed_catalog, min_count=MIN_GALAXIES_PER_TYP
     return valid_types
 
 
-def generate_angular_size_plot(data_dir, output_path, dataset_name, apply_z_filter=True):
+def generate_angular_size_plot(data_dir, output_path, dataset_name):
     """Generate the main angular size vs redshift plot with binned medians.
 
     This is the key science plot showing θ(z) with ΛCDM and static model fits.
-    The z > 0.1 filter removes unreliable low-z sources where peculiar velocities
-    dominate over Hubble flow.
 
     Parameters
     ----------
@@ -567,48 +545,22 @@ def generate_angular_size_plot(data_dir, output_path, dataset_name, apply_z_filt
         Path to save the output PDF
     dataset_name : str
         Name for plot title (e.g., "Full Field", "Chip3")
-    apply_z_filter : bool
-        If True, apply 0.1 <= z <= 2.0 filter (recommended for science)
     """
-    filter_label = "Filtered" if apply_z_filter else "Full z-range"
-    print(f"\n  Generating angular size vs redshift plot ({filter_label})...")
+    print("\n  Generating angular size vs redshift plot...")
 
     # Load catalog
     catalog_path = f"{data_dir}/galaxy_catalog.csv"
     sed_catalog = pd.read_csv(catalog_path)
     sed_catalog = sed_catalog.dropna(subset=["redshift", "r_half_arcsec", "r_half_arcsec_error"])
     sed_catalog = sed_catalog[np.isfinite(sed_catalog["r_half_arcsec_error"])]
-    n_total = len(sed_catalog)
-
-    # Apply z range filter
-    if apply_z_filter:
-        z_mask = (sed_catalog.redshift >= Z_MIN_CUT) & (sed_catalog.redshift <= Z_MAX_CUT)
-        n_low_z = (sed_catalog.redshift < Z_MIN_CUT).sum()
-        n_high_z = (sed_catalog.redshift > Z_MAX_CUT).sum()
-        sed_catalog = sed_catalog[z_mask]
-        n_after_z = len(sed_catalog)
-        print(f"    After {Z_MIN_CUT} <= z <= {Z_MAX_CUT} cut: {n_after_z} galaxies")
-        print(f"    (removed {n_low_z} low-z, {n_high_z} high-z)")
-
-        # Additional quality cut: remove sources with unreliable photo-z (high relative error)
-        if 'redshift_err' in sed_catalog.columns:
-            z_rel_err = sed_catalog['redshift_err'] / sed_catalog['redshift']
-            reliable_z = z_rel_err <= Z_REL_ERR_MAX
-            n_unreliable = (~reliable_z).sum()
-            sed_catalog = sed_catalog[reliable_z]
-            print(f"    After z_err/z <= {Z_REL_ERR_MAX} cut: {len(sed_catalog)} galaxies")
-            print(f"    (removed {n_unreliable} with unreliable photo-z)")
-
-        n_used = len(sed_catalog)
-    else:
-        n_used = n_total
+    n_used = len(sed_catalog)
 
     if n_used < 10:
         print(f"    ERROR: Too few galaxies ({n_used}). Skipping.")
         return
 
-    # Use percentile binning for robust statistics
-    binned = bin_percentile(sed_catalog)
+    # Use Bayesian Blocks binning for adaptive data-driven bins
+    binned = bin_bayesian_blocks(sed_catalog)
 
     # Fit models
     R_lcdm = get_radius(binned.z_mid.values, binned.theta_med.values,
@@ -655,8 +607,7 @@ def generate_angular_size_plot(data_dir, output_path, dataset_name, apply_z_filt
     ax.set_ylabel(r"Angular size $\theta$ (arcsec)", fontsize=12)
 
     # Title with filter info
-    filter_str = f"${Z_MIN_CUT} \\leq z \\leq {Z_MAX_CUT}$" if apply_z_filter else "Full $z$ range"
-    ax.set_title(f"Galaxy Angular Size vs Redshift\n({dataset_name}, {filter_str})", fontsize=14)
+    ax.set_title(f"Galaxy Angular Size vs Redshift\n({dataset_name})", fontsize=14)
 
     ax.legend(fontsize=10, loc="upper right")
     ax.grid(True, alpha=0.3)
@@ -774,7 +725,7 @@ def generate_size_distribution_by_type(data_dir, output_dir, dataset_name):
     for gtype in valid_types:
         subset = sed_catalog[sed_catalog['galaxy_type'] == gtype]
         # Compute R for each type
-        binned = bin_equal_count(subset)
+        binned = bin_percentile(subset)
         R_lcdm = get_radius(binned.z_mid.values, binned.theta_med.values, binned.theta_err.values, model="lcdm")
 
         def lcdm_func(z, R=R_lcdm):
@@ -871,7 +822,7 @@ def generate_type_comparison_overlay(data_dir, output_dir, dataset_name):
         ax.scatter(subset["redshift"], subset["r_half_arcsec"], c=color, alpha=0.3, s=15, zorder=1)
 
         # Bin and fit
-        binned = bin_equal_count(subset)
+        binned = bin_percentile(subset)
         R_lcdm = get_radius(binned.z_mid.values, binned.theta_med.values, binned.theta_err.values, model="lcdm")
 
         # Compute chi2 stats
@@ -922,7 +873,7 @@ def generate_per_type_fit_plot(data_dir, output_dir, dataset_name, galaxy_type):
 
     Creates a detailed plot showing all three binning strategies side-by-side
     (matching the style of binning_comparison.pdf):
-    - 3 columns: Equal Width, Equal Count, Percentile
+    - 3 columns: Equal Width, Percentile, Bayesian Blocks
     - Each column has: main plot, ΛCDM residuals, Static residuals
     - Individual galaxies as scatter points
     - Binned medians with error bars
@@ -955,8 +906,8 @@ def generate_per_type_fit_plot(data_dir, output_dir, dataset_name, galaxy_type):
     # Binning strategies (same order as binning_comparison.pdf)
     binning_strategies = {
         "Equal Width": bin_equal_width,
-        "Equal Count": bin_equal_count,
         "Percentile": bin_percentile,
+        "Bayesian Blocks": bin_bayesian_blocks,
     }
 
     # Apply all binning strategies
@@ -968,13 +919,13 @@ def generate_per_type_fit_plot(data_dir, output_dir, dataset_name, galaxy_type):
             print(f"      {name} binning failed for {galaxy_type}: {e}")
 
     if len(binned_results) == 0:
-        print(f"      No binning strategies succeeded. Skipping.")
+        print("      No binning strategies succeeded. Skipping.")
         return None
 
     # Check if any binning has enough bins
     valid_binnings = {k: v for k, v in binned_results.items() if len(v) >= 3}
     if len(valid_binnings) == 0:
-        print(f"      Too few bins in all strategies. Skipping.")
+        print("      Too few bins in all strategies. Skipping.")
         return None
 
     # Axis limits based on data
@@ -988,13 +939,13 @@ def generate_per_type_fit_plot(data_dir, output_dir, dataset_name, galaxy_type):
     # Colors for each binning strategy (same as binning_comparison.pdf)
     colors = {
         "Equal Width": "green",
-        "Equal Count": "blue",
-        "Percentile": "purple",
+        "Percentile": "blue",
+        "Bayesian Blocks": "purple",
     }
     markers = {
         "Equal Width": "o",
-        "Equal Count": "o",
         "Percentile": "o",
+        "Bayesian Blocks": "o",
     }
 
     # Create figure (3x3 grid like binning_comparison.pdf)
@@ -1038,8 +989,8 @@ def generate_per_type_fit_plot(data_dir, output_dir, dataset_name, galaxy_type):
             binned_data.theta_err.values, static_func_i, n_params=1
         )
 
-        # Store stats for return value (use Equal Count as primary)
-        if name == "Equal Count":
+        # Store stats for return value (use Percentile as primary)
+        if name == "Percentile":
             fit_stats = {
                 'R_lcdm_kpc': R_lcdm_i * 1000,
                 'R_static_kpc': R_static_i * 1000,
@@ -1088,7 +1039,7 @@ def generate_per_type_fit_plot(data_dir, output_dir, dataset_name, galaxy_type):
         ax_resid_lcdm.errorbar(binned_data["z_mid"], residuals_lcdm, yerr=binned_data["theta_err"],
                                fmt=markers[name], capsize=2, capthick=0.6, markersize=5,
                                markeredgewidth=0.6, elinewidth=0.6, color=colors[name], zorder=3)
-        ax_resid_lcdm.set_ylabel(r"$\theta_{\rm data} - \theta_{\Lambda{\rm CDM}}$", fontsize=9)
+        ax_resid_lcdm.set_ylabel(r"$\theta_{\rm bin} - \theta_{\rm fit,\Lambda CDM}$", fontsize=9)
         ax_resid_lcdm.grid(True, alpha=0.3)
         ax_resid_lcdm.set_xlim(z_lim)
         max_resid_lcdm = max(0.05, np.max(np.abs(residuals_lcdm) + binned_data["theta_err"].values) * 1.2)
@@ -1099,6 +1050,207 @@ def generate_per_type_fit_plot(data_dir, output_dir, dataset_name, galaxy_type):
         ax_resid_static.axhline(0, color="gray", linestyle="--", linewidth=1.5, alpha=0.7)
         ax_resid_static.errorbar(binned_data["z_mid"], residuals_static, yerr=binned_data["theta_err"],
                                  fmt=markers[name], capsize=2, capthick=0.6, markersize=5,
+                                 markeredgewidth=0.6, elinewidth=0.6, color=colors[name], zorder=3)
+        ax_resid_static.set_xlabel(r"Redshift $z$", fontsize=11)
+        ax_resid_static.set_ylabel(r"$\theta_{\rm bin} - \theta_{\rm fit,stat}$", fontsize=9)
+        ax_resid_static.grid(True, alpha=0.3)
+        ax_resid_static.set_xlim(z_lim)
+        max_resid_static = max(0.05, np.max(np.abs(residuals_static) + binned_data["theta_err"].values) * 1.2)
+        ax_resid_static.set_ylim(-max_resid_static, max_resid_static)
+
+    fig.suptitle(f"Binning Strategies - {galaxy_type} ({dataset_name}, N={n_galaxies})",
+                 fontsize=14, fontweight="bold")
+
+    # Save with type name in filename (sanitize for filesystem)
+    safe_type = galaxy_type.replace('/', '_').replace(' ', '_')
+    output_path = f"{output_dir}/fit_{safe_type}.pdf"
+    plt.savefig(output_path, dpi=300, bbox_inches="tight")
+    print(f"      Saved: {output_path}")
+    plt.close()
+
+    return {
+        'type': galaxy_type,
+        'N': n_galaxies,
+        **fit_stats,
+    }
+
+
+def generate_per_type_binning_comparison(data_dir, output_dir, dataset_name, galaxy_type,
+                                          min_galaxies=MIN_GALAXIES_PER_TYPE_BINNING):
+    """Generate binning comparison plot for a specific galaxy type.
+
+    Creates a plot matching the style of binning_comparison.pdf but filtered
+    to a single galaxy type. Uses a lower threshold than the standard
+    per-type analysis to allow plotting for types with fewer galaxies.
+
+    Parameters
+    ----------
+    data_dir : str
+        Directory containing galaxy_catalog.csv
+    output_dir : str
+        Directory to save output plot
+    dataset_name : str
+        Name for plot title
+    galaxy_type : str
+        Galaxy type to filter (e.g., 'sbt2', 'sbt6')
+    min_galaxies : int
+        Minimum number of galaxies required (default: 9)
+
+    Returns
+    -------
+    dict or None
+        Fit statistics or None if insufficient data
+    """
+    print(f"    Generating binning comparison for type: {galaxy_type}")
+
+    # Load catalog
+    catalog_path = f"{data_dir}/galaxy_catalog.csv"
+    sed_catalog = pd.read_csv(catalog_path)
+    sed_catalog = sed_catalog.dropna(subset=["redshift", "r_half_arcsec", "r_half_arcsec_error"])
+    sed_catalog = sed_catalog[np.isfinite(sed_catalog["r_half_arcsec_error"])]
+
+    if 'galaxy_type' not in sed_catalog.columns:
+        print(f"      ERROR: No galaxy_type column. Skipping {galaxy_type}.")
+        return None
+
+    # Filter to specific type (no z range cut for binning comparison)
+    type_catalog = sed_catalog[sed_catalog['galaxy_type'] == galaxy_type].copy()
+    n_galaxies = len(type_catalog)
+
+    if n_galaxies < min_galaxies:
+        print(f"      Too few galaxies ({n_galaxies} < {min_galaxies}). Skipping.")
+        return None
+
+    # Binning strategies (same order as binning_comparison.pdf)
+    binning_strategies = {
+        "Equal Width": bin_equal_width,
+        "Percentile": bin_percentile,
+        "Bayesian Blocks": bin_bayesian_blocks,
+    }
+
+    # Apply all binning strategies
+    binned_results = {}
+    for name, bin_func in binning_strategies.items():
+        try:
+            binned_results[name] = bin_func(type_catalog)
+            print(f"      {name}: {len(binned_results[name])} bins")
+        except Exception as e:
+            print(f"      {name} binning failed for {galaxy_type}: {e}")
+
+    if len(binned_results) == 0:
+        print("      No binning strategies succeeded. Skipping.")
+        return None
+
+    # Check if any binning has enough bins
+    valid_binnings = {k: v for k, v in binned_results.items() if len(v) >= 3}
+    if len(valid_binnings) == 0:
+        print("      Too few bins in all strategies. Skipping.")
+        return None
+
+    # Axis limits based on data
+    z_data_min, z_data_max = type_catalog.redshift.min(), type_catalog.redshift.max()
+    theta_data_min, theta_data_max = type_catalog.r_half_arcsec.min(), type_catalog.r_half_arcsec.max()
+    z_padding = (z_data_max - z_data_min) * 0.08
+    theta_padding = (theta_data_max - theta_data_min) * 0.1
+    z_lim = (max(0, z_data_min - z_padding), z_data_max + z_padding)
+    theta_lim = (max(0, theta_data_min - theta_padding), theta_data_max + theta_padding)
+
+    # Colors for each binning strategy (same as binning_comparison.pdf)
+    colors = {
+        "Equal Width": "green",
+        "Percentile": "blue",
+        "Bayesian Blocks": "purple",
+    }
+
+    # Create figure (3x3 grid like binning_comparison.pdf)
+    fig = plt.figure(figsize=(18, 10), constrained_layout=True)
+    gs = fig.add_gridspec(3, 3, height_ratios=[3, 1, 1], hspace=0.08, wspace=0.15)
+
+    strategy_names = list(binned_results.keys())
+    fit_stats = {}
+
+    for idx, name in enumerate(strategy_names):
+        binned_data = binned_results[name]
+        col = idx
+
+        ax_main = fig.add_subplot(gs[0, col])
+        ax_resid_lcdm = fig.add_subplot(gs[1, col], sharex=ax_main)
+        ax_resid_static = fig.add_subplot(gs[2, col], sharex=ax_main)
+
+        # Fit models
+        R_static_i = get_radius(binned_data.z_mid.values, binned_data.theta_med.values,
+                                binned_data.theta_err.values, model="static")
+        R_lcdm_i = get_radius(binned_data.z_mid.values, binned_data.theta_med.values,
+                              binned_data.theta_err.values, model="lcdm")
+
+        z_model_i = np.linspace(max(0.05, z_lim[0]), z_lim[1], 200)
+        theta_static_i = theta_static(z_model_i, R_static_i) * RAD_TO_ARCSEC
+        theta_lcdm_i = theta_lcdm(z_model_i, R_lcdm_i, 0.3, 0.7) * RAD_TO_ARCSEC
+
+        # Chi2 stats
+        def lcdm_func_i(z, R=R_lcdm_i):
+            return theta_lcdm(z, R, 0.3, 0.7) * RAD_TO_ARCSEC
+
+        stats_lcdm_i = compute_chi2_stats(
+            binned_data.z_mid.values, binned_data.theta_med.values,
+            binned_data.theta_err.values, lcdm_func_i, n_params=1
+        )
+
+        # Store stats for return value (use Percentile as primary)
+        if name == "Percentile":
+            fit_stats = {
+                'R_lcdm_kpc': R_lcdm_i * 1000,
+                'chi2_ndf_lcdm': stats_lcdm_i['chi2_ndf'],
+                'p_value_lcdm': stats_lcdm_i['p_value'],
+                'n_bins': len(binned_data),
+            }
+
+        # Main plot
+        ax_main.scatter(type_catalog["redshift"], type_catalog["r_half_arcsec"],
+                       c="lightgray", alpha=0.4, s=15, zorder=1)
+        ax_main.errorbar(binned_data["z_mid"], binned_data["theta_med"], yerr=binned_data["theta_err"],
+                        fmt='o', capsize=3, capthick=0.8, markersize=6, markeredgewidth=0.8,
+                        elinewidth=0.8, color=colors[name],
+                        label="Binned", zorder=3)
+        ax_main.plot(z_model_i, theta_static_i, "--", color="gray", linewidth=1.5, label=r"Static", zorder=2)
+        ax_main.plot(z_model_i, theta_lcdm_i, "-", color="darkblue", linewidth=1.5, label=r"$\Lambda$CDM", zorder=2)
+
+        ax_main.set_ylabel(r"Angular size $\theta$ (arcsec)", fontsize=11)
+        ax_main.set_title(
+            f"{name} ({len(binned_data)} bins)\n"
+            + r"$R_{\Lambda{\rm CDM}}$" + f"={R_lcdm_i*1000:.1f} kpc, "
+            + r"$\chi^2/{\rm ndf}$" + f"={stats_lcdm_i['chi2_ndf']:.2f}, "
+            + f"P={stats_lcdm_i['p_value']:.3f}",
+            fontsize=11
+        )
+        ax_main.legend(fontsize=8, loc="upper right")
+        ax_main.grid(True, alpha=0.3)
+        ax_main.set_xlim(z_lim)
+        ax_main.set_ylim(theta_lim)
+        plt.setp(ax_main.get_xticklabels(), visible=False)
+
+        # Calculate residuals
+        theta_lcdm_at_data = theta_lcdm(binned_data["z_mid"].values, R_lcdm_i, 0.3, 0.7) * RAD_TO_ARCSEC
+        theta_static_at_data = theta_static(binned_data["z_mid"].values, R_static_i) * RAD_TO_ARCSEC
+        residuals_lcdm = binned_data["theta_med"].values - theta_lcdm_at_data
+        residuals_static = binned_data["theta_med"].values - theta_static_at_data
+
+        # LCDM residual plot
+        ax_resid_lcdm.axhline(0, color="darkblue", linestyle="-", linewidth=1.5, alpha=0.7)
+        ax_resid_lcdm.errorbar(binned_data["z_mid"], residuals_lcdm, yerr=binned_data["theta_err"],
+                               fmt='o', capsize=2, capthick=0.6, markersize=5,
+                               markeredgewidth=0.6, elinewidth=0.6, color=colors[name], zorder=3)
+        ax_resid_lcdm.set_ylabel(r"$\theta_{\rm data} - \theta_{\Lambda{\rm CDM}}$", fontsize=9)
+        ax_resid_lcdm.grid(True, alpha=0.3)
+        ax_resid_lcdm.set_xlim(z_lim)
+        max_resid_lcdm = max(0.05, np.max(np.abs(residuals_lcdm) + binned_data["theta_err"].values) * 1.2)
+        ax_resid_lcdm.set_ylim(-max_resid_lcdm, max_resid_lcdm)
+        plt.setp(ax_resid_lcdm.get_xticklabels(), visible=False)
+
+        # Static residual plot
+        ax_resid_static.axhline(0, color="gray", linestyle="--", linewidth=1.5, alpha=0.7)
+        ax_resid_static.errorbar(binned_data["z_mid"], residuals_static, yerr=binned_data["theta_err"],
+                                 fmt='o', capsize=2, capthick=0.6, markersize=5,
                                  markeredgewidth=0.6, elinewidth=0.6, color=colors[name], zorder=3)
         ax_resid_static.set_xlabel(r"Redshift $z$", fontsize=11)
         ax_resid_static.set_ylabel(r"$\theta_{\rm data} - \theta_{\rm Static}$", fontsize=9)
@@ -1112,7 +1264,7 @@ def generate_per_type_fit_plot(data_dir, output_dir, dataset_name, galaxy_type):
 
     # Save with type name in filename (sanitize for filesystem)
     safe_type = galaxy_type.replace('/', '_').replace(' ', '_')
-    output_path = f"{output_dir}/fit_{safe_type}.pdf"
+    output_path = f"{output_dir}/{safe_type}_binning_comparison.pdf"
     plt.savefig(output_path, dpi=300, bbox_inches="tight")
     print(f"      Saved: {output_path}")
     plt.close()
@@ -1164,7 +1316,7 @@ def generate_combined_type_fit_plot(data_dir, output_dir, dataset_name, combined
     sed_catalog = sed_catalog[np.isfinite(sed_catalog["r_half_arcsec_error"])]
 
     if 'galaxy_type' not in sed_catalog.columns:
-        print(f"      ERROR: No galaxy_type column. Skipping.")
+        print("      ERROR: No galaxy_type column. Skipping.")
         return None
 
     # Apply z range filter
@@ -1192,14 +1344,14 @@ def generate_combined_type_fit_plot(data_dir, output_dir, dataset_name, combined
     print(f"      After quality filters: {n_galaxies}")
 
     if n_galaxies < MIN_GALAXIES_PER_TYPE:
-        print(f"      Too few galaxies after filtering. Skipping.")
+        print("      Too few galaxies after filtering. Skipping.")
         return None
 
     # Binning strategies
     binning_strategies = {
         "Equal Width": bin_equal_width,
-        "Equal Count": bin_equal_count,
         "Percentile": bin_percentile,
+        "Bayesian Blocks": bin_bayesian_blocks,
     }
 
     binned_results = {}
@@ -1210,13 +1362,13 @@ def generate_combined_type_fit_plot(data_dir, output_dir, dataset_name, combined
             print(f"      {name} binning failed: {e}")
 
     if len(binned_results) == 0:
-        print(f"      No binning strategies succeeded. Skipping.")
+        print("      No binning strategies succeeded. Skipping.")
         return None
 
     # Check if any binning has enough bins
     valid_binnings = {k: v for k, v in binned_results.items() if len(v) >= 3}
     if len(valid_binnings) == 0:
-        print(f"      Too few bins in all strategies. Skipping.")
+        print("      Too few bins in all strategies. Skipping.")
         return None
 
     # Axis limits based on data
@@ -1228,8 +1380,8 @@ def generate_combined_type_fit_plot(data_dir, output_dir, dataset_name, combined
     theta_lim = (max(0, theta_data_min - theta_padding), theta_data_max + theta_padding)
 
     # Colors
-    colors = {"Equal Width": "green", "Equal Count": "blue", "Percentile": "purple"}
-    markers = {"Equal Width": "o", "Equal Count": "o", "Percentile": "o"}
+    colors = {"Equal Width": "green", "Percentile": "blue", "Bayesian Blocks": "purple"}
+    markers = {"Equal Width": "o", "Percentile": "o", "Bayesian Blocks": "o"}
 
     # Create figure
     fig = plt.figure(figsize=(18, 10), constrained_layout=True)
@@ -1273,7 +1425,7 @@ def generate_combined_type_fit_plot(data_dir, output_dir, dataset_name, combined
         )
 
         # Store stats
-        if name == "Equal Count":
+        if name == "Percentile":
             fit_stats = {
                 'R_lcdm_kpc': R_lcdm_i * 1000,
                 'R_static_kpc': R_static_i * 1000,
@@ -1318,7 +1470,7 @@ def generate_combined_type_fit_plot(data_dir, output_dir, dataset_name, combined
         ax_resid_lcdm.errorbar(binned_data["z_mid"], residuals_lcdm, yerr=binned_data["theta_err"],
                                fmt=markers[name], capsize=2, capthick=0.6, markersize=5,
                                markeredgewidth=0.6, elinewidth=0.6, color=colors[name], zorder=3)
-        ax_resid_lcdm.set_ylabel(r"$\theta_{\rm data} - \theta_{\Lambda{\rm CDM}}$", fontsize=9)
+        ax_resid_lcdm.set_ylabel(r"$\theta_{\rm bin} - \theta_{\rm fit,\Lambda CDM}$", fontsize=9)
         ax_resid_lcdm.grid(True, alpha=0.3)
         ax_resid_lcdm.set_xlim(z_lim)
         max_resid_lcdm = max(0.05, np.max(np.abs(residuals_lcdm) + binned_data["theta_err"].values) * 1.2)
@@ -1330,7 +1482,7 @@ def generate_combined_type_fit_plot(data_dir, output_dir, dataset_name, combined
                                  fmt=markers[name], capsize=2, capthick=0.6, markersize=5,
                                  markeredgewidth=0.6, elinewidth=0.6, color=colors[name], zorder=3)
         ax_resid_static.set_xlabel(r"Redshift $z$", fontsize=11)
-        ax_resid_static.set_ylabel(r"$\theta_{\rm data} - \theta_{\rm Static}$", fontsize=9)
+        ax_resid_static.set_ylabel(r"$\theta_{\rm bin} - \theta_{\rm fit,stat}$", fontsize=9)
         ax_resid_static.grid(True, alpha=0.3)
         ax_resid_static.set_xlim(z_lim)
         max_resid_static = max(0.05, np.max(np.abs(residuals_static) + binned_data["theta_err"].values) * 1.2)
@@ -1359,7 +1511,7 @@ def generate_combined_type_fit_plot(data_dir, output_dir, dataset_name, combined
     }
 
 
-def generate_validation_report(data_dir, output_dir, dataset_name):
+def generate_validation_report(data_dir, output_dir):
     """Generate a validation report comparing photo-z to external catalogs.
 
     Parameters
@@ -1368,8 +1520,6 @@ def generate_validation_report(data_dir, output_dir, dataset_name):
         Directory containing galaxy_catalog.csv
     output_dir : str
         Directory to save output files
-    dataset_name : str
-        Name for report title
     """
     print("\n  === Generating Validation Report ===")
 
@@ -1377,10 +1527,8 @@ def generate_validation_report(data_dir, output_dir, dataset_name):
     sed_catalog = pd.read_csv(catalog_path)
     sed_catalog = sed_catalog.dropna(subset=["redshift", "r_half_arcsec", "ra", "dec"])
 
-    # Try MUSE validation
+    # MUSE validation
     try:
-        from validation.muse_specz import load_muse_catalog, validate_with_specz, print_validation_summary
-
         print("  Attempting MUSE spectroscopic validation...")
         muse_catalog = load_muse_catalog(confidence_min=2)
 
@@ -1397,14 +1545,11 @@ def generate_validation_report(data_dir, output_dir, dataset_name):
                     f.write(f"Matched sources: {result['n_matched']}\n")
                     f.write(f"Valid redshifts: {result['n_valid']}\n\n")
                     f.write("Metrics:\n")
-                    for key, val in result['metrics'].items():
-                        f.write(f"  {key}: {val:.4f}\n")
+                    f.writelines(f"  {key}: {val:.4f}\n" for key, val in result['metrics'].items())
                 print(f"    Saved: {metrics_path}")
         else:
             print("    No MUSE catalog available")
 
-    except ImportError as e:
-        print(f"    MUSE validation skipped (missing dependencies): {e}")
     except Exception as e:
         print(f"    MUSE validation failed: {e}")
 
@@ -1413,15 +1558,15 @@ def generate_validation_report(data_dir, output_dir, dataset_name):
     fs_path = os.path.normpath(fs_path)
 
     if os.path.exists(fs_path):
-        print(f"  Loading Fernandez-Soto 1999 catalog...")
+        print("  Loading Fernandez-Soto 1999 catalog...")
         try:
             fs_catalog = pd.read_csv(fs_path)
             print(f"    Loaded {len(fs_catalog)} sources from Fernandez-Soto 1999")
 
             # This catalog has RA/Dec in sexagesimal format, would need conversion
             # For now, just report availability
-            print(f"    External validation with Fernandez-Soto catalog available")
-            print(f"    (Full cross-match requires coordinate conversion)")
+            print("    External validation with Fernandez-Soto catalog available")
+            print("    (Full cross-match requires coordinate conversion)")
 
         except Exception as e:
             print(f"    Failed to load Fernandez-Soto catalog: {e}")
@@ -1429,32 +1574,26 @@ def generate_validation_report(data_dir, output_dir, dataset_name):
         print(f"    Fernandez-Soto catalog not found at {fs_path}")
 
 
-def generate_redshift_histogram(data_dir, output_path, dataset_name, apply_z_filter=True):
+def generate_redshift_histogram(data_dir, output_path, dataset_name):
     """Generate redshift distribution histogram."""
-    filter_label = "Filtered" if apply_z_filter else "Full z-range"
-    print(f"  Generating {filter_label} redshift histogram...")
+    print("  Generating redshift histogram...")
 
     # Load catalog
     catalog_path = f"{data_dir}/galaxy_catalog.csv"
     sed_catalog = pd.read_csv(catalog_path)
     sed_catalog = sed_catalog.dropna(subset=["redshift", "r_half_arcsec"])
-    n_total = len(sed_catalog)
-
-    if apply_z_filter:
-        sed_catalog = sed_catalog[(sed_catalog.redshift >= Z_MIN_CUT) & (sed_catalog.redshift <= Z_MAX_CUT)]
-
     n_used = len(sed_catalog)
     if n_used < 5:
         print(f"    Too few galaxies ({n_used}). Skipping.")
         return
 
-    fig, ax = plt.subplots(figsize=(10, 6))
+    _fig, ax = plt.subplots(figsize=(10, 6))
 
     # Histogram
     n_bins = min(50, max(15, n_used // 10))
-    counts, bin_edges, patches = ax.hist(sed_catalog['redshift'], bins=n_bins,
-                                          color='steelblue', edgecolor='black',
-                                          linewidth=0.5, alpha=0.7)
+    ax.hist(sed_catalog['redshift'], bins=n_bins,
+            color='steelblue', edgecolor='black',
+            linewidth=0.5, alpha=0.7)
 
     # Statistics
     z_median = sed_catalog['redshift'].median()
@@ -1465,17 +1604,11 @@ def generate_redshift_histogram(data_dir, output_path, dataset_name, apply_z_fil
     ax.axvline(z_median, color='red', linestyle='--', linewidth=2, label=f'Median: {z_median:.3f}')
     ax.axvline(z_mean, color='orange', linestyle=':', linewidth=2, label=f'Mean: {z_mean:.3f}')
 
-    # Add z cut lines if filtered
-    if apply_z_filter:
-        ax.axvline(Z_MIN_CUT, color='gray', linestyle='-', linewidth=1.5, alpha=0.7)
-        ax.axvline(Z_MAX_CUT, color='gray', linestyle='-', linewidth=1.5, alpha=0.7)
-
     ax.set_xlabel(r"Redshift $z$", fontsize=12)
     ax.set_ylabel("Number of Galaxies", fontsize=12)
 
-    filter_str = f"${Z_MIN_CUT} \\leq z \\leq {Z_MAX_CUT}$" if apply_z_filter else "Full $z$ range"
     ax.set_title(f"Redshift Distribution - {dataset_name}\n"
-                 f"({filter_str}, N = {n_used})", fontsize=14)
+                 f"(N = {n_used})", fontsize=14)
 
     # Add statistics text box
     stats_text = (f"N = {n_used}\n"
@@ -1494,10 +1627,9 @@ def generate_redshift_histogram(data_dir, output_path, dataset_name, apply_z_fil
     plt.close()
 
 
-def generate_galaxy_type_histogram(data_dir, output_path, dataset_name, apply_z_filter=True):
+def generate_galaxy_type_histogram(data_dir, output_path, dataset_name):
     """Generate galaxy type distribution histogram."""
-    filter_label = "Filtered" if apply_z_filter else "Full z-range"
-    print(f"  Generating {filter_label} galaxy type histogram...")
+    print("  Generating galaxy type histogram...")
 
     # Load catalog
     catalog_path = f"{data_dir}/galaxy_catalog.csv"
@@ -1507,9 +1639,6 @@ def generate_galaxy_type_histogram(data_dir, output_path, dataset_name, apply_z_
     if 'galaxy_type' not in sed_catalog.columns:
         print("    ERROR: No galaxy_type column. Skipping.")
         return
-
-    if apply_z_filter:
-        sed_catalog = sed_catalog[(sed_catalog.redshift >= Z_MIN_CUT) & (sed_catalog.redshift <= Z_MAX_CUT)]
 
     n_used = len(sed_catalog)
     if n_used < 5:
@@ -1536,7 +1665,7 @@ def generate_galaxy_type_histogram(data_dir, output_path, dataset_name, apply_z_
         'sbt6': '#a65628',
     }
 
-    fig, ax = plt.subplots(figsize=(12, 6))
+    _fig, ax = plt.subplots(figsize=(12, 6))
 
     colors = [type_colors.get(t, 'gray') for t in type_counts.index]
     bars = ax.bar(type_counts.index, type_counts.values, color=colors,
@@ -1553,9 +1682,8 @@ def generate_galaxy_type_histogram(data_dir, output_path, dataset_name, apply_z_
     ax.set_xlabel("Galaxy Type", fontsize=12)
     ax.set_ylabel("Number of Galaxies", fontsize=12)
 
-    filter_str = f"${Z_MIN_CUT} \\leq z \\leq {Z_MAX_CUT}$" if apply_z_filter else "Full $z$ range"
     ax.set_title(f"Galaxy Type Distribution - {dataset_name}\n"
-                 f"({filter_str}, N = {n_used})", fontsize=14)
+                 f"(N = {n_used})", fontsize=14)
 
     plt.xticks(rotation=45, ha='right')
     ax.grid(True, alpha=0.3, axis='y')
@@ -1565,20 +1693,14 @@ def generate_galaxy_type_histogram(data_dir, output_path, dataset_name, apply_z_
     plt.close()
 
 
-def generate_final_sources_plot(data_dir, output_path, dataset_name, apply_z_filter=True):
+def generate_final_sources_plot(data_dir, output_path, dataset_name):
     """Generate visualization of final sources used in analysis."""
-    filter_label = "Filtered" if apply_z_filter else "Full z-range"
-    print(f"  Generating {filter_label} final sources plot...")
+    print("  Generating final sources plot...")
 
     # Load catalog
     catalog_path = f"{data_dir}/galaxy_catalog.csv"
     sed_catalog = pd.read_csv(catalog_path)
     sed_catalog = sed_catalog.dropna(subset=["redshift", "r_half_arcsec"])
-    n_total = len(sed_catalog)
-
-    if apply_z_filter:
-        sed_catalog = sed_catalog[(sed_catalog.redshift >= Z_MIN_CUT) & (sed_catalog.redshift <= Z_MAX_CUT)]
-
     n_used = len(sed_catalog)
     if n_used < 5:
         print(f"    Too few galaxies ({n_used}). Skipping.")
@@ -1616,8 +1738,8 @@ def generate_final_sources_plot(data_dir, output_path, dataset_name, apply_z_fil
 
     # Plot 2: Redshift vs Angular Size (color by type)
     ax2 = axes[0, 1]
-    scatter = ax2.scatter(sed_catalog['redshift'], sed_catalog['r_half_arcsec'],
-                          c=colors, alpha=0.6, s=20)
+    ax2.scatter(sed_catalog['redshift'], sed_catalog['r_half_arcsec'],
+                c=colors, alpha=0.6, s=20)
     ax2.set_xlabel(r"Redshift $z$", fontsize=11)
     ax2.set_ylabel(r"Angular size $\theta$ (arcsec)", fontsize=11)
     ax2.set_title("Redshift vs Angular Size", fontsize=12)
@@ -1657,7 +1779,7 @@ def generate_final_sources_plot(data_dir, output_path, dataset_name, apply_z_fil
 
     # Compute summary statistics
     stats_data = [
-        ["Total sources (after quality cuts)", f"{n_total}"],
+        ["Total sources (after quality cuts)", f"{n_used}"],
         ["Sources in z range", f"{n_used}"],
         ["Redshift range", f"{sed_catalog['redshift'].min():.3f} - {sed_catalog['redshift'].max():.3f}"],
         ["Median redshift", f"{sed_catalog['redshift'].median():.3f}"],
@@ -1687,8 +1809,7 @@ def generate_final_sources_plot(data_dir, output_path, dataset_name, apply_z_fil
         table[(0, i)].set_facecolor('#4472C4')
         table[(0, i)].set_text_props(color='white', fontweight='bold')
 
-    filter_str = f"${Z_MIN_CUT} \\leq z \\leq {Z_MAX_CUT}$" if apply_z_filter else "Full $z$ range"
-    fig.suptitle(f"Final Source Summary - {dataset_name}\n({filter_str})",
+    fig.suptitle(f"Final Source Summary - {dataset_name}",
                  fontsize=14, fontweight='bold')
     plt.tight_layout()
     plt.savefig(output_path, dpi=300, bbox_inches="tight")
@@ -1697,61 +1818,46 @@ def generate_final_sources_plot(data_dir, output_path, dataset_name, apply_z_fil
 
 
 if __name__ == "__main__":
-    base_dir = "/home/tom/ASTRO/astrophysics/astro_labb1/output"
+    base_dir = "/home/tomble/astrophysics-lab/output"
 
-    for dataset, full_dir, filtered_dir in [
-        ("Full Field", f"{base_dir}/full_HDF/full_z", f"{base_dir}/full_HDF/filtered_z"),
-        ("Chip3", f"{base_dir}/chip3_HDF/full_z", f"{base_dir}/chip3_HDF/filtered_z")
+    for dataset, data_dir in [
+        ("Full Field", f"{base_dir}/full_HDF"),
+        ("Chip3", f"{base_dir}/chip3_HDF")
     ]:
         print(f"\n{'='*60}")
         print(f"Processing: {dataset}")
         print(f"{'='*60}")
 
         # Check if catalog exists
-        catalog_path = f"{full_dir}/galaxy_catalog.csv"
+        catalog_path = f"{data_dir}/galaxy_catalog.csv"
         if not os.path.exists(catalog_path):
             print(f"  WARNING: Catalog not found at {catalog_path}. Skipping {dataset}.")
             continue
 
-        # Ensure filtered directory exists
-        os.makedirs(filtered_dir, exist_ok=True)
-
         # ==================================================================
-        # PART 1: All galaxy types combined (existing functionality)
+        # PART 1: All galaxy types combined
         # ==================================================================
         print("\n--- All Galaxy Types ---")
 
         # Binning comparison plots (all types)
-        generate_binning_plot(data_dir=full_dir,
-            output_path=f"{full_dir}/binning_comparison.pdf",
-            dataset_name=dataset, apply_z_filter=False)
-        generate_binning_plot(data_dir=full_dir,
-            output_path=f"{filtered_dir}/binning_comparison.pdf",
-            dataset_name=dataset, apply_z_filter=True)
+        generate_binning_plot(data_dir=data_dir,
+            output_path=f"{data_dir}/binning_comparison.pdf",
+            dataset_name=dataset)
 
         # Overlay plots (all types)
-        generate_overlay_plot(data_dir=full_dir,
-            output_path=f"{full_dir}/binning_overlay.pdf",
-            dataset_name=dataset, apply_z_filter=False)
-        generate_overlay_plot(data_dir=full_dir,
-            output_path=f"{filtered_dir}/binning_overlay.pdf",
-            dataset_name=dataset, apply_z_filter=True)
+        generate_overlay_plot(data_dir=data_dir,
+            output_path=f"{data_dir}/binning_overlay.pdf",
+            dataset_name=dataset)
 
         # Redshift distribution histograms
-        generate_redshift_histogram(data_dir=full_dir,
-            output_path=f"{full_dir}/redshift_histogram.pdf",
-            dataset_name=dataset, apply_z_filter=False)
-        generate_redshift_histogram(data_dir=full_dir,
-            output_path=f"{filtered_dir}/redshift_histogram.pdf",
-            dataset_name=dataset, apply_z_filter=True)
+        generate_redshift_histogram(data_dir=data_dir,
+            output_path=f"{data_dir}/redshift_histogram.pdf",
+            dataset_name=dataset)
 
         # Galaxy type histograms
-        generate_galaxy_type_histogram(data_dir=full_dir,
-            output_path=f"{full_dir}/galaxy_types.pdf",
-            dataset_name=dataset, apply_z_filter=False)
-        generate_galaxy_type_histogram(data_dir=full_dir,
-            output_path=f"{filtered_dir}/galaxy_types.pdf",
-            dataset_name=dataset, apply_z_filter=True)
+        generate_galaxy_type_histogram(data_dir=data_dir,
+            output_path=f"{data_dir}/galaxy_types.pdf",
+            dataset_name=dataset)
 
         # ==================================================================
         # PART 2: Per-galaxy-type analysis
@@ -1762,47 +1868,56 @@ if __name__ == "__main__":
         sed_catalog = sed_catalog.dropna(subset=["redshift", "r_half_arcsec", "r_half_arcsec_error"])
         sed_catalog = sed_catalog[np.isfinite(sed_catalog["r_half_arcsec_error"])]
 
-        # Full z-range analysis
-        print(f"\n--- Per-Galaxy-Type Analysis ({dataset}, full_z) ---")
-        valid_types_full = get_types_with_enough_statistics(sed_catalog)
-        print(f"  Full z-range: Galaxy types with N >= {MIN_GALAXIES_PER_TYPE}: {valid_types_full}")
-        if len(valid_types_full) > 0:
-            generate_size_distribution_by_type(full_dir, full_dir, dataset)
-            generate_type_comparison_overlay(full_dir, full_dir, dataset)
-            print(f"  Generating individual θ(z) fits for {len(valid_types_full)} types...")
-            for gtype in valid_types_full:
-                generate_per_type_fit_plot(full_dir, full_dir, dataset, gtype)
-        else:
-            print("  No galaxy types have enough statistics for per-type analysis.")
-
-        # Filtered z-range analysis
-        print(f"\n--- Per-Galaxy-Type Analysis ({dataset}, filtered_z) ---")
-        sed_catalog_filtered = sed_catalog[
-            (sed_catalog.redshift >= Z_MIN_CUT) & (sed_catalog.redshift <= Z_MAX_CUT)
-        ]
-        valid_types_filtered = get_types_with_enough_statistics(sed_catalog_filtered)
-        print(f"  Filtered z-range: Galaxy types with N >= {MIN_GALAXIES_PER_TYPE}: {valid_types_filtered}")
-        if len(valid_types_filtered) > 0:
-            generate_size_distribution_by_type(full_dir, filtered_dir, dataset)
-            generate_type_comparison_overlay(full_dir, filtered_dir, dataset)
-            print(f"  Generating individual θ(z) fits for {len(valid_types_filtered)} types...")
-            for gtype in valid_types_filtered:
-                generate_per_type_fit_plot(full_dir, filtered_dir, dataset, gtype)
+        print(f"\n--- Per-Galaxy-Type Analysis ({dataset}) ---")
+        valid_types = get_types_with_enough_statistics(sed_catalog)
+        print(f"  Galaxy types with N >= {MIN_GALAXIES_PER_TYPE}: {valid_types}")
+        if len(valid_types) > 0:
+            generate_size_distribution_by_type(data_dir, data_dir, dataset)
+            generate_type_comparison_overlay(data_dir, data_dir, dataset)
+            print(f"  Generating individual θ(z) fits for {len(valid_types)} types...")
+            for gtype in valid_types:
+                generate_per_type_fit_plot(data_dir, data_dir, dataset, gtype)
         else:
             print("  No galaxy types have enough statistics for per-type analysis.")
 
         # ==================================================================
-        # PART 3: Combined galaxy type analysis (NEW)
+        # Per-type binning comparison plots (lower threshold)
+        # ==================================================================
+        print(f"\n--- Per-Type Binning Comparison Plots ({dataset}) ---")
+        types_for_binning = get_types_with_enough_statistics(sed_catalog, min_count=MIN_GALAXIES_PER_TYPE_BINNING)
+        print(f"  Galaxy types with N >= {MIN_GALAXIES_PER_TYPE_BINNING}: {types_for_binning}")
+        if len(types_for_binning) > 0:
+            binning_results = {}
+            for gtype in types_for_binning:
+                result = generate_per_type_binning_comparison(data_dir, data_dir, dataset, gtype)
+                if result:
+                    binning_results[gtype] = result
+
+            # Print summary
+            if binning_results:
+                print("\n  === Per-Type Binning Comparison Summary ===")
+                print(f"  {'Type':<15} {'N':>5} {'R_LCDM':>10} {'χ²/ndf':>10} {'P-value':>10}")
+                print("  " + "-" * 55)
+                for gtype, res in binning_results.items():
+                    r_kpc = res.get('R_lcdm_kpc', np.nan)
+                    chi2 = res.get('chi2_ndf_lcdm', np.nan)
+                    pval = res.get('p_value_lcdm', np.nan)
+                    n = res.get('N', 0)
+                    print(f"  {gtype:<15} {n:>5} {r_kpc:>10.1f} {chi2:>10.2f} {pval:>10.3f}")
+        else:
+            print(f"  No galaxy types have N >= {MIN_GALAXIES_PER_TYPE_BINNING} for binning comparison.")
+
+        # ==================================================================
+        # PART 3: Combined galaxy type analysis
         # ==================================================================
         print(f"\n--- Combined Galaxy Type Analysis ({dataset}) ---")
         print("  Combining galaxy types for better statistics with quality filters...")
 
         combined_results = {}
-        for combined_name in COMBINED_TYPE_GROUPS.keys():
-            # Generate for filtered z-range with quality filters
+        for combined_name in COMBINED_TYPE_GROUPS:
             result = generate_combined_type_fit_plot(
-                data_dir=full_dir,
-                output_dir=filtered_dir,
+                data_dir=data_dir,
+                output_dir=data_dir,
                 dataset_name=dataset,
                 combined_type_name=combined_name,
                 apply_quality_filters=True
@@ -1823,9 +1938,9 @@ if __name__ == "__main__":
                 print(f"  {name:<25} {n:>5} {r_kpc:>10.1f} {chi2:>10.2f} {pval:>10.3f}")
 
         # ==================================================================
-        # PART 4: Validation against external catalogs (NEW)
+        # PART 4: Validation against external catalogs
         # ==================================================================
-        generate_validation_report(full_dir, filtered_dir, dataset)
+        generate_validation_report(data_dir, data_dir)
 
     print("\n" + "="*60)
     print("DONE - All plots generated (individual + combined + validation)")

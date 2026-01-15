@@ -14,12 +14,15 @@ Usage:
 # =============================================================================
 import os
 
-# Optimal thread settings for Intel i7-1065G7 (4 cores, 8 threads)
-_N_THREADS = str(min(os.cpu_count() or 4, 8))
-os.environ.setdefault("NUMBA_NUM_THREADS", _N_THREADS)
-os.environ.setdefault("OMP_NUM_THREADS", _N_THREADS)
-os.environ.setdefault("MKL_NUM_THREADS", _N_THREADS)
-os.environ.setdefault("OPENBLAS_NUM_THREADS", _N_THREADS)
+# Import resource configuration FIRST (before numpy/numba)
+from resource_config import get_config
+
+# Get resource configuration (auto-detects or uses ASTRO_RESOURCE_PROFILE env var)
+_RESOURCE_CONFIG = get_config()
+_RESOURCE_CONFIG.apply_environment()
+
+# Legacy compatibility
+_N_THREADS = str(_RESOURCE_CONFIG.n_threads)
 
 import argparse
 from dataclasses import dataclass
@@ -31,32 +34,53 @@ matplotlib.use("Agg")  # Use non-interactive backend before importing pyplot
 import matplotlib.pyplot as plt
 from matplotlib.ticker import MaxNLocator
 
-# Enable LaTeX rendering
+# Configure matplotlib (LaTeX disabled for compatibility)
 plt.rcParams.update({
-    "text.usetex": True,
+    "text.usetex": False,
     "font.family": "serif",
-    "font.serif": ["Computer Modern Roman"],
     "axes.labelsize": 12,
     "font.size": 11,
     "legend.fontsize": 10,
     "xtick.labelsize": 10,
     "ytick.labelsize": 10,
 })
-import numpy as np  # noqa: E402
-import pandas as pd  # noqa: E402
-from astropy.convolution import convolve  # noqa: E402
-from astropy.io import fits  # noqa: E402
-from photutils.background import Background2D, MedianBackground  # noqa: E402
-from photutils.segmentation import SourceCatalog, SourceFinder, make_2dgaussian_kernel  # noqa: E402
-from scipy import ndimage  # noqa: E402
-from scipy.spatial import cKDTree  # noqa: E402
-
-from classify import (  # noqa: E402
-    classify_batch_ultrafast,
-    classify_galaxy,
-    classify_galaxy_batch_with_pdf,
+import numpy as np
+import pandas as pd
+from astropy.convolution import convolve
+from astropy.io import fits
+from astropy.stats import bayesian_blocks
+from astropy.wcs import WCS as AstropyWCS
+from photutils.aperture import ApertureStats, CircularAnnulus, CircularAperture, aperture_photometry
+from photutils.background import Background2D, MedianBackground
+from photutils.segmentation import (
+    SourceCatalog,
+    SourceFinder,
+    deblend_sources,
+    detect_sources,
+    make_2dgaussian_kernel,
 )
-from scientific import (  # noqa: E402
+from photutils.utils import calc_total_error
+from scipy import ndimage
+from scipy.spatial import cKDTree
+
+from classify import (
+    classify_batch_ultrafast,
+)
+from generate_filtered_binning import (
+    MIN_GALAXIES_PER_TYPE,
+    generate_angular_size_plot,
+    generate_binning_plot,
+    generate_galaxy_type_histogram,
+    generate_overlay_plot,
+    generate_per_type_fit_plot,
+    generate_redshift_histogram,
+    generate_size_distribution_by_type,
+    generate_type_comparison_overlay,
+    get_types_with_enough_statistics,
+)
+from morphology.professional_classification import classify_professional
+from morphology.star_galaxy import query_gaia_for_classification
+from scientific import (
     H0,
     D_A_LCDM_vectorized,
     c,
@@ -67,6 +91,39 @@ from scientific import (  # noqa: E402
     theta_lcdm_flat,
     theta_static,
 )
+from validation.external_crossmatch import apply_spectroscopic_redshifts, crossmatch_with_3dhst
+
+# =============================================================================
+# Modern Methods Configuration (Optional Upgrades)
+# =============================================================================
+# These settings enable modern ML-enhanced methods for improved analysis.
+# Each can be toggled independently. Disabled by default for reproducibility.
+
+# Hybrid Photo-z: Combine template fitting with ML for improved redshifts
+# Requires training on spectroscopic sample (will auto-train if spec-z available)
+USE_HYBRID_PHOTOZ = True  # ML-enhanced photo-z enabled
+
+# Zoobot Morphology Validation: Cross-validate SED types with deep learning morphology
+USE_ZOOBOT_VALIDATION = False  # Disabled - useful for validation runs only
+
+# Deep Learning Detection: Use CNN-enhanced source detection with artifact rejection
+# Provides star/galaxy/artifact classification at detection stage
+USE_DEEP_DETECTION = False  # Disabled - needs pre-trained weights to be useful
+
+# Import modules when enabled
+if USE_HYBRID_PHOTOZ:
+    from classify_hybrid import HybridPhotoZEstimator, train_hybrid_photoz_from_specz
+
+if USE_ZOOBOT_VALIDATION:
+    from validation.zoobot_morphology import (
+        extract_cutouts,
+        run_zoobot_predictions,
+        interpret_zoobot_predictions,
+        validate_morphology_with_zoobot,
+    )
+
+if USE_DEEP_DETECTION:
+    from detection import DeepSourceDetector, detect_sources_deep
 
 # Professional star-galaxy classification (research-standard)
 USE_PROFESSIONAL_CLASSIFICATION = True  # Set to False to use basic classification only
@@ -79,6 +136,34 @@ RAD_TO_ARCSEC = 180.0 * 3600.0 / np.pi  # ~206265 arcsec/radian
 # Chip3 is 2048x2048, placed at offset (127, 184) after 180° rotation
 CHIP3_X_MIN, CHIP3_X_MAX = 127, 2175  # 127 + 2048
 CHIP3_Y_MIN, CHIP3_Y_MAX = 184, 2232  # 184 + 2048
+
+# =============================================================================
+# Photometry Constants (HST WFPC2 HDF-N specific)
+# =============================================================================
+# References:
+# - HDF Data Reduction: Williams et al. 1996, AJ, 112, 1335
+# - DrizzlePac Handbook: https://hst-docs.stsci.edu/drizzpac
+# - WFPC2 Instrument Handbook
+
+# WFPC2 gain for HDF observations (electrons per DN)
+# WF chips: 7 e-/DN, PC chip: 7 e-/DN (standard gain setting)
+WFPC2_GAIN = 7.0  # electrons per DN
+
+# Drizzle correlated noise correction factor
+# HDF v2 used pixfrac=0.6, scale=0.5 (output pixel = 0.5x input)
+# This creates noise correlation between adjacent output pixels
+# Correction factor depends on drizzle parameters:
+#   R ≈ 1 / sqrt(pixfrac) for pixfrac < 1
+# For pixfrac=0.6: R ≈ 1.29
+# Adding margin for aperture summation effects: ~1.4
+# Reference: Fruchter & Hook 2002, PASP, 114, 144
+DRIZZLE_NOISE_CORR = 1.4
+
+# Background estimation uncertainty factor
+# When estimating background from annulus, there's uncertainty in that estimate
+# This adds variance: area² × σ_sky² / nsky
+# For segment-based photometry, we approximate nsky ~ 10 × source_area
+SKY_ANNULUS_FACTOR = 10.0
 
 # =============================================================================
 # Quality Flags (following COSMOS/SDSS conventions)
@@ -157,39 +242,6 @@ FLAG_DESCRIPTIONS = {
     FLAG_MASKED: "masked",
     FLAG_UNRELIABLE_Z: "unreliable_z",
 }
-
-
-def decode_flags(flag_value: int) -> list[str]:
-    """Convert bit-packed flag integer to list of flag names."""
-    if flag_value == 0:
-        return ["clean"]
-    return [desc for flag, desc in FLAG_DESCRIPTIONS.items() if flag_value & flag]
-
-
-def compute_concentration(r50: float, r90: float) -> float:
-    """
-    Compute concentration index C = r50/r90.
-
-    Following SDSS methodology:
-    - de Vaucouleurs profile (ellipticals): C ≈ 0.30
-    - Exponential profile (spirals): C ≈ 0.43
-    - Point source (stars): C ≈ 0.45-0.50
-
-    Parameters
-    ----------
-    r50 : float
-        Half-light radius (50% enclosed flux)
-    r90 : float
-        90% light radius
-
-    Returns
-    -------
-    float
-        Concentration index (0 to 1)
-    """
-    if r90 <= 0 or not np.isfinite(r90):
-        return np.nan
-    return r50 / r90
 
 
 def correct_radius_for_psf(r_measured: float, psf_sigma: float) -> float:
@@ -285,63 +337,6 @@ def compute_stellarity_score(
 
     # Weighted average (size counts double)
     return float(np.average(scores, weights=weights))
-
-
-def check_stellar_colors(flux_u: float, flux_b: float, flux_v: float, flux_i: float) -> tuple[bool, float]:
-    """
-    Check if source has stellar-like colors (approximately flat SED).
-
-    Stars have relatively flat SEDs compared to galaxies, so color differences
-    between adjacent bands should be small (within ~0.5 mag).
-
-    Parameters
-    ----------
-    flux_u, flux_b, flux_v, flux_i : float
-        Flux measurements in each band
-
-    Returns
-    -------
-    is_stellar_color : bool
-        True if colors are consistent with stellar SED
-    color_score : float
-        Score from 0 (galaxy-like colors) to 1 (stellar-like flat colors)
-
-    References
-    ----------
-    - SDSS stellar locus: https://www.sdss.org/dr17/algorithms/magnitudes/
-    """
-    # Convert to instrumental magnitudes (relative)
-    with np.errstate(divide='ignore', invalid='ignore'):
-        mag_u = -2.5 * np.log10(np.abs(flux_u)) if flux_u > 0 else np.nan
-        mag_b = -2.5 * np.log10(np.abs(flux_b)) if flux_b > 0 else np.nan
-        mag_v = -2.5 * np.log10(np.abs(flux_v)) if flux_v > 0 else np.nan
-        mag_i = -2.5 * np.log10(np.abs(flux_i)) if flux_i > 0 else np.nan
-
-    # Color indices (adjacent bands)
-    colors = []
-    if np.isfinite(mag_u) and np.isfinite(mag_b):
-        colors.append(mag_u - mag_b)  # U-B
-    if np.isfinite(mag_b) and np.isfinite(mag_v):
-        colors.append(mag_b - mag_v)  # B-V
-    if np.isfinite(mag_v) and np.isfinite(mag_i):
-        colors.append(mag_v - mag_i)  # V-I
-
-    if len(colors) == 0:
-        return False, 0.0
-
-    # Stars have colors close to 0 (flat SED)
-    # Galaxies have stronger color variations due to stellar populations, dust, redshift
-    color_scatter = np.std(colors)
-    max_color = np.max(np.abs(colors))
-
-    # Stellar-like: small scatter AND small maximum color difference
-    # Threshold: scatter < 0.5 mag AND max color < 1.0 mag
-    is_stellar = color_scatter < 0.5 and max_color < 1.0
-
-    # Score: 1 if very flat colors, 0 if strong colors
-    color_score = max(0, 1.0 - color_scatter / 1.0) * max(0, 1.0 - max_color / 2.0)
-
-    return is_stellar, float(color_score)
 
 
 def check_stellar_colors_vectorized(
@@ -454,8 +449,8 @@ def bin_equal_width(sed_catalog, n_bins=None):
     return aggregate_bins(sed_catalog)
 
 
-def bin_equal_count(sed_catalog, n_bins=None):
-    """Equal-count bins (quantile-based) for similar statistical weight per bin."""
+def bin_percentile(sed_catalog, n_bins=None):
+    """Percentile bins (quantile-based) for similar statistical weight per bin."""
     if n_bins is None:
         n_bins = get_adaptive_n_bins(len(sed_catalog))
     sed_catalog = sed_catalog.copy()
@@ -463,31 +458,50 @@ def bin_equal_count(sed_catalog, n_bins=None):
     return aggregate_bins(sed_catalog)
 
 
-def bin_logarithmic(sed_catalog, n_bins=None):
-    """Logarithmic bins in (1+z) - better sampling at low-z where evolution is rapid."""
-    if n_bins is None:
-        n_bins = get_adaptive_n_bins(len(sed_catalog))
-    z_min, z_max = sed_catalog.redshift.min(), sed_catalog.redshift.max()
-    log_bins = np.linspace(np.log10(1 + z_min), np.log10(1 + z_max), n_bins + 1)
-    bins = 10**log_bins - 1
-    sed_catalog = sed_catalog.copy()
-    sed_catalog["z_bin"] = pd.cut(sed_catalog.redshift, bins, include_lowest=True)
-    return aggregate_bins(sed_catalog)
+def bin_bayesian_blocks(sed_catalog, p0=0.05):
+    """Bayesian Blocks adaptive binning (Scargle et al. 2013).
 
+    Uses astropy's bayesian_blocks algorithm to find optimal bin edges
+    based on the data structure. This is data-driven binning that creates
+    more bins where data is dense/variable and fewer where sparse/uniform.
 
-def bin_percentile(sed_catalog, n_bins=None):
-    """Percentile-based bins using quantile edges for robust statistics."""
-    if n_bins is None:
-        n_bins = get_adaptive_n_bins(len(sed_catalog))
+    Args:
+        sed_catalog: DataFrame with 'redshift' and 'r_half_arcsec' columns
+        p0: False alarm probability (default 0.05). Lower values = fewer bins.
+
+    Returns:
+        DataFrame with binned statistics (z_mid, theta_med, theta_err, n)
+    """
     sed_catalog = sed_catalog.copy()
-    bins = choose_redshift_bin_edges(
-        sed_catalog.redshift.values,
-        target_count_per_bin=len(sed_catalog) // n_bins,
-        min_bins=max(3, n_bins - 2),
-        max_bins=n_bins + 2,
-        method="quantile",
-    )
-    sed_catalog["z_bin"] = pd.cut(sed_catalog.redshift, bins, include_lowest=True)
+    z = sed_catalog.redshift.values
+    theta = sed_catalog.r_half_arcsec.values
+
+    # Use point measures fitness with angular sizes as values
+    # sigma estimated as MAD-based robust standard deviation
+    sigma = np.median(np.abs(theta - np.median(theta))) * 1.4826
+    sigma = max(sigma, 0.01 * np.median(theta))  # Floor at 1% of median
+
+    try:
+        # Get optimal bin edges from Bayesian Blocks
+        edges = bayesian_blocks(z, theta, sigma=sigma, fitness='measures', p0=p0)
+
+        # Ensure we have at least 3 bins for meaningful analysis
+        if len(edges) < 4:
+            # Fall back to equal-width with 3 bins if BB gives too few
+            edges = np.linspace(z.min(), z.max(), 4)
+
+        # Limit to reasonable number of bins (max ~15)
+        if len(edges) > 16:
+            # Too many bins - increase p0 to reduce sensitivity
+            edges = bayesian_blocks(z, theta, sigma=sigma, fitness='measures', p0=0.2)
+            if len(edges) > 16:
+                edges = np.linspace(z.min(), z.max(), 12)
+    except Exception:
+        # Fallback to equal-width binning if Bayesian Blocks fails
+        n_bins = get_adaptive_n_bins(len(sed_catalog))
+        edges = np.linspace(z.min(), z.max(), n_bins + 1)
+
+    sed_catalog["z_bin"] = pd.cut(sed_catalog.redshift, edges, include_lowest=True)
     return aggregate_bins(sed_catalog)
 
 
@@ -499,8 +513,12 @@ def standard_error_median(x):
     Reference: Euclid Consortium methodology, Astropy robust statistics.
     """
     x = x.dropna() if hasattr(x, 'dropna') else x[np.isfinite(x)]
+    if len(x) < 2:
+        # Single source: use a default fractional error (10% of median value)
+        return 0.1 * np.median(x) if len(x) == 1 else np.nan
     if len(x) < 3:
-        return np.nan
+        # Two sources: use half the range as error estimate
+        return (np.max(x) - np.min(x)) / 2.0
     return 1.2533 * np.std(x, ddof=1) / np.sqrt(len(x))
 
 
@@ -627,137 +645,8 @@ def read_fits(file_path, weight_path=None):
 
 
 # ============================================================================
-# Advanced background estimation (following photutils best practices)
+# Analysis and Plotting
 # ============================================================================
-
-
-def iterative_background(data, box_size=100, n_iterations=2, sigma_clip=3.0, mask=None):
-    """
-    Iteratively estimate background with source masking.
-
-    Following the photutils documentation recommendation:
-    "An even better procedure is to exclude the sources in the image by masking them.
-    This technique requires an iterative procedure."
-
-    Parameters
-    ----------
-    data : np.ndarray
-        Input image data
-    box_size : int
-        Box size for background estimation
-    n_iterations : int
-        Number of source-masking iterations
-    sigma_clip : float
-        Sigma threshold for source detection in each iteration
-    mask : np.ndarray, optional
-        Initial mask (True = masked pixels)
-
-    Returns
-    -------
-    Background2D
-        Final background estimate with source masking
-    """
-    from photutils.background import Background2D, MedianBackground
-
-    bkg_estimator = MedianBackground()
-    current_mask = mask.copy() if mask is not None else np.zeros(data.shape, dtype=bool)
-
-    for _iteration in range(n_iterations):
-        # Estimate background with current mask
-        bkg = Background2D(
-            data,
-            (box_size, box_size),
-            filter_size=(3, 3),
-            bkg_estimator=bkg_estimator,
-            mask=current_mask,
-        )
-
-        # Detect sources above threshold
-        residual = data - bkg.background
-        threshold = sigma_clip * bkg.background_rms
-        source_mask = residual > threshold
-
-        # Update mask by combining with detected sources
-        current_mask = current_mask | source_mask
-
-    # Final background estimate with all sources masked
-    final_bkg = Background2D(
-        data,
-        (box_size, box_size),
-        filter_size=(3, 3),
-        bkg_estimator=bkg_estimator,
-        mask=current_mask,
-    )
-
-    return final_bkg
-
-
-# ============================================================================
-# Parallel processing helper functions
-# ============================================================================
-
-
-def _process_single_band(args):
-    """Process a single band for source detection (for parallel execution).
-
-    This function is designed to be called in a separate process.
-    """
-    band, data, _weight, mask, kernel, detection_sigma, npixels, nlevels, contrast = args
-
-    from astropy.convolution import convolve
-    from photutils.background import Background2D, MedianBackground
-    from photutils.segmentation import SourceCatalog, SourceFinder
-
-    bkg_estimator = MedianBackground()
-    box_size = 100 if data.shape[0] > 2048 else 50
-    bkg = Background2D(data, (box_size, box_size), filter_size=(3, 3), bkg_estimator=bkg_estimator)
-    data_sub = data - bkg.background
-
-    # Convolve with Gaussian kernel
-    convolved_data = convolve(data_sub, kernel)
-
-    # Adaptive threshold based on background RMS
-    threshold = detection_sigma * bkg.background_rms
-
-    # Use SourceFinder for combined detection + deblending
-    finder = SourceFinder(
-        npixels=npixels,
-        deblend=True,
-        nlevels=nlevels,
-        contrast=contrast,
-        connectivity=8,
-        progress_bar=False,
-    )
-
-    segm = finder(convolved_data, threshold, mask=mask)
-
-    if segm is not None and mask is not None:
-        masked_labels = np.unique(segm.data[mask])
-        masked_labels = masked_labels[masked_labels != 0]
-        if len(masked_labels) > 0:
-            segm.remove_labels(masked_labels)
-
-    catalog = SourceCatalog(data_sub, segm, convolved_data=convolved_data)
-    n_sources = len(catalog) if catalog is not None else 0
-
-    return band, segm, catalog, bkg, data_sub, convolved_data, n_sources
-
-
-def _classify_single_galaxy(args):
-    """Classify a single galaxy (for parallel execution)."""
-    idx, fluxes, errors, spectra_path = args
-    galaxy_type, redshift = classify_galaxy(fluxes, errors, spectra_path=spectra_path)
-    return idx, galaxy_type, redshift
-
-
-def _classify_galaxy_batch(args):
-    """Classify a batch of galaxies with PDF uncertainties (reduces IPC overhead)."""
-    batch, spectra_path = args
-
-    # Use the new PDF-based batch classification
-    # Returns: (idx, galaxy_type, redshift, z_lo, z_hi, chi_sq_min, odds)
-    results = classify_galaxy_batch_with_pdf(batch, spectra_path)
-    return results
 
 
 def analyze_and_plot_catalog(
@@ -818,9 +707,8 @@ def analyze_and_plot_catalog(
     # Binning - use same 4 strategies as full analysis
     binning_strategies = {
         "Equal Width": bin_equal_width,
-        "Equal Count": bin_equal_count,
-        "Logarithmic": bin_logarithmic,
         "Percentile": bin_percentile,
+        "Bayesian Blocks": bin_bayesian_blocks,
     }
 
     binned_results = {}
@@ -836,7 +724,7 @@ def analyze_and_plot_catalog(
         print("  No valid binning results!")
         return
 
-    binned = binned_results.get("Equal Count", next(iter(binned_results.values())))
+    binned = binned_results.get("Percentile", next(iter(binned_results.values())))
 
     # Model fitting
     z_data = binned["z_mid"].values
@@ -958,11 +846,10 @@ def analyze_and_plot_catalog(
 
     colors = {
         "Equal Width": "green",
-        "Equal Count": "blue",
-        "Logarithmic": "orange",
-        "Percentile": "purple",
+        "Percentile": "blue",
+        "Bayesian Blocks": "purple",
     }
-    markers = {"Equal Width": "o", "Equal Count": "o", "Logarithmic": "o", "Percentile": "o"}
+    markers = {"Equal Width": "o", "Percentile": "o", "Bayesian Blocks": "o"}
 
     strategy_names = list(binned_results.keys())
 
@@ -1091,6 +978,168 @@ def analyze_and_plot_catalog(
     plt.close()
     print(f"    Saved: {output_dir}/binning_comparison.pdf")
 
+    # Plot 3b: Per-galaxy-type binning comparison plots
+    # Only for galaxy types with enough statistics (>= 20 sources for meaningful binning)
+    MIN_SOURCES_FOR_TYPE_PLOT = 20
+    for gtype, gtype_count in type_counts.items():
+        if gtype_count < MIN_SOURCES_FOR_TYPE_PLOT:
+            continue
+
+        # Filter catalog for this galaxy type
+        type_catalog = sed_catalog_analysis[sed_catalog_analysis["galaxy_type"] == gtype].copy()
+
+        # Compute binning for this type
+        type_binned_results = {}
+        for name, bin_func in binning_strategies.items():
+            try:
+                type_binned_results[name] = bin_func(type_catalog)
+            except Exception:
+                pass  # Skip if binning fails for this type
+
+        if len(type_binned_results) < 2:
+            continue  # Need at least 2 strategies to make a comparison plot
+
+        # Create the same 2x2 grid with residuals plot
+        fig_type = plt.figure(figsize=(14, 16), constrained_layout=True)
+        gs_type = fig_type.add_gridspec(4, 2, height_ratios=[3, 1, 3, 1], hspace=0.08, wspace=0.15)
+
+        # Dynamic axis limits for this type
+        z_min_type = type_catalog["redshift"].min()
+        z_max_type = type_catalog["redshift"].max()
+        z_padding_type = (z_max_type - z_min_type) * 0.1
+        z_lim_type = (max(0, z_min_type - z_padding_type), z_max_type + z_padding_type)
+
+        theta_min_type = type_catalog["r_half_arcsec"].min()
+        theta_max_type = type_catalog["r_half_arcsec"].max()
+        theta_padding_type = (theta_max_type - theta_min_type) * 0.1
+        theta_lim_type = (max(0, theta_min_type - theta_padding_type), theta_max_type + theta_padding_type)
+
+        strategy_names_type = list(type_binned_results.keys())
+
+        for idx, name in enumerate(strategy_names_type[:4]):  # Max 4 strategies
+            binned_data = type_binned_results[name]
+            row_base = (idx // 2) * 2
+            col = idx % 2
+
+            ax_main = fig_type.add_subplot(gs_type[row_base, col])
+            ax_resid = fig_type.add_subplot(gs_type[row_base + 1, col], sharex=ax_main)
+
+            # Fit models for this binning
+            R_static_type = get_radius(
+                binned_data.z_mid.values,
+                binned_data.theta_med.values,
+                binned_data.theta_err.values,
+                model="static",
+            )
+            R_lcdm_type, Omega_m_type = get_radius_and_omega(
+                binned_data.z_mid.values,
+                binned_data.theta_med.values,
+                binned_data.theta_err.values,
+            )
+
+            z_model_type = np.linspace(max(0.05, z_lim_type[0]), z_lim_type[1], 200)
+            theta_static_type = theta_static(z_model_type, R_static_type) * RAD_TO_ARCSEC
+            theta_lcdm_type = theta_lcdm_flat(z_model_type, R_lcdm_type, Omega_m_type) * RAD_TO_ARCSEC
+
+            # Compute chi2/ndf for both models
+            def static_func_type(z, R=R_static_type):
+                return theta_static(z, R) * RAD_TO_ARCSEC
+            def lcdm_func_type(z, R=R_lcdm_type, Om=Omega_m_type):
+                return theta_lcdm_flat(z, R, Om) * RAD_TO_ARCSEC
+
+            stats_static_type = compute_chi2_stats(
+                binned_data.z_mid.values, binned_data.theta_med.values,
+                binned_data.theta_err.values, static_func_type, n_params=1
+            )
+            stats_lcdm_type = compute_chi2_stats(
+                binned_data.z_mid.values, binned_data.theta_med.values,
+                binned_data.theta_err.values, lcdm_func_type, n_params=2
+            )
+
+            # Plot individual galaxies as background
+            ax_main.scatter(
+                type_catalog["redshift"],
+                type_catalog["r_half_arcsec"],
+                c="lightgray",
+                alpha=0.4,
+                s=15,
+                zorder=1,
+            )
+
+            # Plot binned data
+            ax_main.errorbar(
+                binned_data["z_mid"],
+                binned_data["theta_med"],
+                yerr=binned_data["theta_err"],
+                fmt=markers[name],
+                capsize=3,
+                capthick=0.8,
+                markersize=6,
+                markeredgewidth=0.8,
+                elinewidth=0.8,
+                color=colors[name],
+                label="Binned",
+                zorder=3,
+            )
+
+            # Plot models
+            ax_main.plot(
+                z_model_type, theta_static_type, "--", color="gray", linewidth=1.5, label=r"Static", zorder=2
+            )
+            ax_main.plot(
+                z_model_type, theta_lcdm_type, "-", color="darkblue", linewidth=1.5, label=r"$\Lambda$CDM", zorder=2
+            )
+
+            ax_main.set_ylabel(r"Angular size $\theta$ (arcsec)", fontsize=11)
+            ax_main.set_title(
+                f"{name} ({len(binned_data)} bins)\n"
+                + r"$\Lambda$CDM: $R$" + f"={R_lcdm_type*1000:.1f} kpc, "
+                + r"$\chi^2/{\rm ndf}$" + f"={stats_lcdm_type['chi2_ndf']:.2f}, "
+                + f"P={stats_lcdm_type['p_value']:.3f}\n"
+                + r"Static: $R$" + f"={R_static_type*1000:.1f} kpc, "
+                + r"$\chi^2/{\rm ndf}$" + f"={stats_static_type['chi2_ndf']:.2f}, "
+                + f"P={stats_static_type['p_value']:.3f}",
+                fontsize=10
+            )
+            ax_main.legend(fontsize=8, loc="upper right")
+            ax_main.grid(True, alpha=0.3)
+            ax_main.set_xlim(z_lim_type)
+            ax_main.set_ylim(theta_lim_type)
+            plt.setp(ax_main.get_xticklabels(), visible=False)
+
+            # Calculate residuals
+            theta_lcdm_at_data_type = theta_lcdm_flat(binned_data["z_mid"].values, R_lcdm_type, Omega_m_type) * RAD_TO_ARCSEC
+            residuals_lcdm_type = binned_data["theta_med"].values - theta_lcdm_at_data_type
+
+            # Residual plot
+            ax_resid.axhline(0, color="darkblue", linestyle="-", linewidth=1.5, alpha=0.7)
+            ax_resid.errorbar(
+                binned_data["z_mid"],
+                residuals_lcdm_type,
+                yerr=binned_data["theta_err"],
+                fmt=markers[name],
+                capsize=2,
+                capthick=0.6,
+                markersize=5,
+                markeredgewidth=0.6,
+                elinewidth=0.6,
+                color=colors[name],
+                zorder=3,
+            )
+            ax_resid.set_xlabel(r"Redshift $z$", fontsize=11)
+            ax_resid.set_ylabel(r"$\theta - \theta_{\Lambda\mathrm{CDM}}$", fontsize=9)
+            ax_resid.grid(True, alpha=0.3)
+            ax_resid.set_xlim(z_lim_type)
+            max_resid_type = max(0.05, np.max(np.abs(residuals_lcdm_type) + binned_data["theta_err"].values) * 1.2)
+            ax_resid.set_ylim(-max_resid_type, max_resid_type)
+
+        # Create safe filename from galaxy type
+        safe_gtype = gtype.replace(" ", "_").replace("/", "-").lower()
+        fig_type.suptitle(f"Binning Strategies: {gtype}" + title_suffix + f" (n={gtype_count})", fontsize=14, fontweight="bold")
+        plt.savefig(f"{output_dir}/binning_comparison_{safe_gtype}.pdf", dpi=300, bbox_inches="tight")
+        plt.close()
+        print(f"    Saved: {output_dir}/binning_comparison_{safe_gtype}.pdf")
+
     # Plot 4: All binning strategies overlaid
     _fig, ax = plt.subplots(figsize=(12, 8))
 
@@ -1123,7 +1172,7 @@ def analyze_and_plot_catalog(
             zorder=2,
         )
 
-    # Add LCDM model curve (using equal-count fit)
+    # Add LCDM model curve (using percentile fit)
     ax.plot(
         z_model, theta_lcdm_model, "-", color="black", linewidth=2, label=r"$\Lambda$CDM model", zorder=3
     )
@@ -1243,35 +1292,7 @@ def analyze_and_plot_catalog(
             else:
                 plot_images.append(img)
 
-        # Plot 8: Source detection
-        _fig, axes = plt.subplots(2, 2, figsize=(12, 12))
-        for idx, image in enumerate(plot_images):
-            ax = axes[idx // 2, idx % 2]
-            vmin, vmax = np.percentile(image.data, [20, 99])
-            ax.imshow(image.data, cmap="gray_r", vmin=vmin, vmax=vmax, origin="lower")
-
-            # Red: galaxies
-            if n_galaxies > 0:
-                ax.scatter(
-                    plot_catalog.loc[is_galaxy, "xcentroid"],
-                    plot_catalog.loc[is_galaxy, "ycentroid"],
-                    s=10, facecolors="none", edgecolors="red", linewidth=0.5,
-                )
-
-            ax.set_title(
-                f"Band {image.band.upper()} -- {n_galaxies} galaxies",
-                fontsize=9,
-            )
-            ax.set_xlabel(r"X (pixels)")
-            ax.set_ylabel(r"Y (pixels)")
-
-        plt.suptitle(f"Source Detection{title_suffix} ({n_galaxies} galaxies)", fontsize=14, fontweight="bold", y=1.01)
-        plt.tight_layout()
-        plt.savefig(f"{output_dir}/source_detection.pdf", dpi=150, bbox_inches="tight")
-        plt.close()
-        print(f"    Saved: {output_dir}/source_detection.pdf")
-
-        # Plot 9: Final selection (same as source detection but different title)
+        # Plot 8: Final selection
         _fig, axes = plt.subplots(2, 2, figsize=(12, 12))
         for idx, image in enumerate(plot_images):
             ax = axes[idx // 2, idx % 2]
@@ -1307,6 +1328,351 @@ def analyze_and_plot_catalog(
     print(f"\n  Analysis complete for{title_suffix.lower() if title_suffix else ' catalog'}!")
 
 
+# =============================================================================
+# Professional Source Detection and Photometry Functions
+# =============================================================================
+
+
+def detect_sources_professional(
+    data: np.ndarray,
+    weight: np.ndarray | None = None,
+    gain: float = WFPC2_GAIN,
+    box_size: int = 64,
+    filter_size: int = 5,
+    kernel_fwhm: float = 3.0,
+    nsigma: float = 2.0,
+    npixels: int = 10,
+    nlevels: int = 32,
+    contrast: float = 0.001,
+    connectivity: int = 8,
+    mask: np.ndarray | None = None,
+) -> tuple[SourceCatalog | None, object | None, Background2D]:
+    """
+    Professional source detection using photutils best practices.
+
+    This function implements a complete source detection pipeline following
+    photutils documentation and professional astronomy standards:
+
+    1. 2D background estimation using Background2D with MedianBackground
+    2. Matched-filter detection using a 2D Gaussian kernel
+    3. Source detection using detect_sources with sigma-clipped threshold
+    4. Deblending overlapping sources with deblend_sources
+    5. Proper error estimation using calc_total_error (includes Poisson noise)
+    6. Source catalog extraction with SourceCatalog
+
+    Parameters
+    ----------
+    data : np.ndarray
+        2D image data array (science image in DN or electrons)
+    weight : np.ndarray or None, optional
+        Inverse variance weight map. If provided, used to compute error map.
+        If None, error is estimated from background RMS and Poisson noise.
+    gain : float, optional
+        Detector gain in electrons/DN (default: WFPC2_GAIN = 7.0).
+        Used for Poisson noise calculation in calc_total_error.
+    box_size : int, optional
+        Size of the boxes for background estimation (default: 50).
+        Larger values give smoother background but may miss local variations.
+    filter_size : int, optional
+        Size of the median filter for smoothing the background (default: 3).
+    kernel_fwhm : float, optional
+        FWHM of the 2D Gaussian detection kernel in pixels (default: 3.0).
+        Should match or slightly exceed the PSF FWHM for optimal detection.
+    nsigma : float, optional
+        Detection threshold in units of background RMS (default: 2.0).
+        Lower values detect more sources but increase false positives.
+    npixels : int, optional
+        Minimum number of connected pixels above threshold (default: 10).
+        Larger values reject cosmic rays and noise spikes.
+    nlevels : int, optional
+        Number of multi-thresholding levels for deblending (default: 32).
+    contrast : float, optional
+        Contrast parameter for deblending (default: 0.001).
+        Lower values split sources more aggressively.
+    connectivity : int, optional
+        Pixel connectivity (4 or 8) for source identification (default: 8).
+    mask : np.ndarray or None, optional
+        Boolean mask where True values are excluded from detection.
+
+    Returns
+    -------
+    catalog : SourceCatalog or None
+        Source catalog with photometry and morphology. None if no sources found.
+    segm_deblend : SegmentationImage or None
+        Deblended segmentation map. None if no sources found.
+    bkg : Background2D
+        2D background model.
+
+    Examples
+    --------
+    >>> data, header, weight = read_fits('image.fits', 'weight.fits')
+    >>> catalog, segm, bkg = detect_sources_professional(data, weight=weight)
+    >>> print(f"Detected {len(catalog)} sources")
+    >>> # Access source properties
+    >>> fluxes = catalog.segment_flux
+    >>> positions = catalog.centroid
+
+    Notes
+    -----
+    The error map is computed using photutils.utils.calc_total_error which
+    properly combines background error and Poisson noise from source counts:
+
+        total_error = sqrt(bkg_error**2 + data/gain)
+
+    This is the standard approach used in professional photometry pipelines
+    (DAOPHOT, SExtractor, etc.).
+
+    References
+    ----------
+    - photutils documentation: https://photutils.readthedocs.io/
+    - DAOPHOT II: Stetson 1987, PASP, 99, 191
+    - SExtractor: Bertin & Arnouts 1996, A&AS, 117, 393
+    """
+    # Step 1: Estimate 2D background with MedianBackground
+    # MedianBackground is robust to source contamination
+    bkg_estimator = MedianBackground()
+    bkg = Background2D(
+        data,
+        (box_size, box_size),
+        filter_size=(filter_size, filter_size),
+        bkg_estimator=bkg_estimator,
+        exclude_percentile=10.0,  # Exclude bright pixels from background
+    )
+
+    # Step 2: Subtract background
+    data_sub = data - bkg.background
+
+    # Step 3: Create matched-filter detection kernel
+    # The kernel should approximate the PSF for optimal SNR
+    kernel = make_2dgaussian_kernel(kernel_fwhm, size=int(4 * kernel_fwhm) | 1)  # Ensure odd size
+
+    # Step 4: Convolve with detection kernel (matched filter)
+    convolved_data = convolve(data_sub, kernel)
+
+    # Step 5: Calculate proper error map using calc_total_error
+    # This combines background RMS and Poisson noise from source counts
+    if weight is not None:
+        # Use weight map to get background error
+        # Weight = inverse variance, so error = 1/sqrt(weight)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            bkg_error = np.where(weight > 0, 1.0 / np.sqrt(weight), bkg.background_rms)
+    else:
+        # Use background RMS as error estimate
+        bkg_error = bkg.background_rms
+
+    # calc_total_error adds Poisson noise from source counts
+    # This is the professional standard for photometric errors
+    # Note: data must be in electrons or DN with appropriate gain
+    effective_gain = gain if gain > 0 else 1.0
+    total_error = calc_total_error(
+        data_sub,
+        bkg_error,
+        effective_gain=effective_gain
+    )
+
+    # Step 6: Calculate detection threshold
+    threshold = nsigma * bkg.background_rms
+
+    # Step 7: Detect sources using segmentation
+    segm = detect_sources(
+        convolved_data,
+        threshold,
+        npixels=npixels,
+        connectivity=connectivity,
+        mask=mask,
+    )
+
+    if segm is None:
+        print("  No sources detected!")
+        return None, None, bkg
+
+    # Step 8: Deblend overlapping sources
+    segm_deblend = deblend_sources(
+        convolved_data,
+        segm,
+        npixels=npixels,
+        nlevels=nlevels,
+        contrast=contrast,
+        progress_bar=False,
+    )
+
+    # Step 9: Create source catalog with error map
+    catalog = SourceCatalog(
+        data_sub,
+        segm_deblend,
+        convolved_data=convolved_data,
+        error=total_error,
+    )
+
+    return catalog, segm_deblend, bkg
+
+
+def aperture_photometry_with_local_background(
+    data: np.ndarray,
+    positions: np.ndarray | list,
+    aperture_radius: float = 5.0,
+    annulus_r_in: float = 10.0,
+    annulus_r_out: float = 15.0,
+    error: np.ndarray | None = None,
+    mask: np.ndarray | None = None,
+    method: str = 'exact',
+) -> dict:
+    """
+    Perform aperture photometry with local background estimation.
+
+    This function implements professional aperture photometry following
+    photutils best practices:
+
+    1. CircularAperture for source flux measurement
+    2. CircularAnnulus for local background estimation
+    3. ApertureStats for robust background statistics (median, sigma-clipping)
+    4. Proper error propagation including background subtraction uncertainty
+
+    Parameters
+    ----------
+    data : np.ndarray
+        2D image data array (background-subtracted or raw).
+    positions : np.ndarray or list
+        Source positions as Nx2 array of (x, y) coordinates or list of tuples.
+    aperture_radius : float, optional
+        Radius of the circular source aperture in pixels (default: 5.0).
+        Should be 2-3x the PSF FWHM for point sources.
+    annulus_r_in : float, optional
+        Inner radius of the background annulus in pixels (default: 10.0).
+        Should be far enough from source to avoid contamination.
+    annulus_r_out : float, optional
+        Outer radius of the background annulus in pixels (default: 15.0).
+        Larger annuli give more robust background but may include neighbors.
+    error : np.ndarray or None, optional
+        Error map (1-sigma uncertainties per pixel). If provided, used
+        for error propagation in aperture sums.
+    mask : np.ndarray or None, optional
+        Boolean mask where True values are excluded from photometry.
+    method : str, optional
+        Aperture photometry method: 'exact', 'center', or 'subpixel'.
+        'exact' (default) gives accurate fractional pixel contributions.
+
+    Returns
+    -------
+    dict
+        Dictionary containing:
+        - 'flux': Background-subtracted aperture flux (array)
+        - 'flux_error': Total flux uncertainty (array)
+        - 'bkg_median': Local background median per pixel (array)
+        - 'bkg_std': Local background standard deviation (array)
+        - 'bkg_total': Total background subtracted from aperture (array)
+        - 'aperture_area': Area of source aperture in pixels (float)
+        - 'annulus_area': Area of background annulus in pixels (float)
+        - 'raw_flux': Raw aperture flux before background subtraction (array)
+
+    Examples
+    --------
+    >>> # Detect sources first
+    >>> catalog, segm, bkg = detect_sources_professional(data)
+    >>> positions = np.column_stack([catalog.xcentroid, catalog.ycentroid])
+    >>>
+    >>> # Perform aperture photometry
+    >>> phot = aperture_photometry_with_local_background(
+    ...     data - bkg.background,
+    ...     positions,
+    ...     aperture_radius=3.0,  # ~1.5x PSF FWHM
+    ...     annulus_r_in=6.0,
+    ...     annulus_r_out=10.0,
+    ...     error=total_error,
+    ... )
+    >>> print(f"Flux: {phot['flux'][0]:.2f} +/- {phot['flux_error'][0]:.2f}")
+
+    Notes
+    -----
+    The local background is estimated using the median of pixels in the
+    annulus, which is robust to outliers (cosmic rays, neighboring sources).
+    ApertureStats provides sigma-clipped statistics for even better robustness.
+
+    Error propagation follows the standard formula:
+        flux_error = sqrt(aperture_flux_err^2 + (area * bkg_std)^2 / n_bkg)
+
+    where n_bkg is the number of pixels in the background annulus.
+
+    References
+    ----------
+    - photutils aperture photometry: https://photutils.readthedocs.io/en/stable/aperture.html
+    - DAOPHOT aperture photometry: Stetson 1987, PASP, 99, 191
+    """
+    # Convert positions to numpy array
+    positions = np.atleast_2d(positions)
+    if positions.shape[1] != 2:
+        raise ValueError("Positions must be Nx2 array of (x, y) coordinates")
+
+    n_sources = len(positions)
+
+    # Create apertures
+    source_apertures = CircularAperture(positions, r=aperture_radius)
+    background_annuli = CircularAnnulus(
+        positions,
+        r_in=annulus_r_in,
+        r_out=annulus_r_out,
+    )
+
+    # Calculate aperture areas
+    aperture_area = source_apertures.area  # pi * r^2
+    annulus_area = background_annuli.area  # pi * (r_out^2 - r_in^2)
+
+    # Perform raw aperture photometry
+    phot_table = aperture_photometry(
+        data,
+        source_apertures,
+        error=error,
+        mask=mask,
+        method=method,
+    )
+
+    raw_flux = np.array(phot_table['aperture_sum'])
+
+    # Get raw flux errors if error map provided
+    if error is not None and 'aperture_sum_err' in phot_table.colnames:
+        raw_flux_err = np.array(phot_table['aperture_sum_err'])
+    else:
+        raw_flux_err = np.zeros(n_sources)
+
+    # Estimate local background using ApertureStats
+    # ApertureStats provides robust statistics with sigma-clipping
+    bkg_stats = ApertureStats(data, background_annuli, sigma_clip=None)
+
+    # Use median for robust background estimate
+    bkg_median = np.array(bkg_stats.median)
+    bkg_std = np.array(bkg_stats.std)
+
+    # Handle NaN values (sources near edge or in masked regions)
+    bkg_median = np.nan_to_num(bkg_median, nan=0.0)
+    bkg_std = np.nan_to_num(bkg_std, nan=0.0)
+
+    # Calculate total background to subtract
+    bkg_total = bkg_median * aperture_area
+
+    # Background-subtracted flux
+    flux = raw_flux - bkg_total
+
+    # Error propagation
+    # Total error includes:
+    # 1. Aperture flux error (from error map, includes Poisson + read noise)
+    # 2. Background estimation uncertainty: area * bkg_std / sqrt(n_bkg_pixels)
+    n_bkg_pixels = annulus_area  # Approximate, actual may differ due to masking
+    bkg_error = aperture_area * bkg_std / np.sqrt(np.maximum(n_bkg_pixels, 1.0))
+
+    flux_error = np.sqrt(raw_flux_err**2 + bkg_error**2)
+
+    return {
+        'flux': flux,
+        'flux_error': flux_error,
+        'bkg_median': bkg_median,
+        'bkg_std': bkg_std,
+        'bkg_total': bkg_total,
+        'aperture_area': aperture_area,
+        'annulus_area': annulus_area,
+        'raw_flux': raw_flux,
+    }
+
+
 def main(mode: str = "full", output_subdir: str | None = None):
     """
     Run the analysis pipeline.
@@ -1335,24 +1701,24 @@ def main(mode: str = "full", output_subdir: str | None = None):
     USE_FULL_RESOLUTION = (mode == "full")
 
     if USE_FULL_RESOLUTION:
-        # Full-resolution HDF v2 mosaics (4096x4096) with inverse variance weights
+        # Official STScI HDF v2 mosaics (4096x4096) with context/weight maps
+        # Filter mapping: F300W=UV, F450W=B, F606W=V, F814W=I
         files = {
-            "b": {"science": "./fits/b_full.fits", "weight": "./fits/b_weight.fits"},
-            "i": {"science": "./fits/i_full.fits", "weight": "./fits/i_weight.fits"},
-            "u": {"science": "./fits/u_full.fits", "weight": "./fits/u_weight.fits"},
-            "v": {"science": "./fits/v_full.fits", "weight": "./fits/v_weight.fits"},
+            "f300": {"science": "./data/hdf_north/mosaics/f300_mosaic_v2.fits", "weight": "./data/hdf_north/mosaics/f300c_mosaic_v2.fits"},
+            "f450": {"science": "./data/hdf_north/mosaics/f450_mosaic_v2.fits", "weight": "./data/hdf_north/mosaics/f450c_mosaic_v2.fits"},
+            "f606": {"science": "./data/hdf_north/mosaics/f606_mosaic_v2.fits", "weight": "./data/hdf_north/mosaics/f606c_mosaic_v2.fits"},
+            "f814": {"science": "./data/hdf_north/mosaics/f814_mosaic_v2.fits", "weight": "./data/hdf_north/mosaics/f814c_mosaic_v2.fits"},
         }
-        print("  Using full-resolution 4096x4096 data with weight maps")
+        print("  Using official STScI HDF v2 4096x4096 mosaics with weight maps")
     else:
-        # Chip 3 2048x2048 data (no matching weight maps available)
-        # Filter mapping: f300=U, f450=B, f606=V, f814=I
+        # Official STScI HDF v2 chip3 drizzled images (2048x2048) with context maps
         files = {
-            "b": {"science": "./fits_official/f450_3_v2.fits", "weight": None},
-            "i": {"science": "./fits_official/f814_3_v2.fits", "weight": None},
-            "u": {"science": "./fits_official/f300_3_v2.fits", "weight": None},
-            "v": {"science": "./fits_official/f606_3_v2.fits", "weight": None},
+            "f300": {"science": "./data/hdf_north/chips/f300_3_v2.fits", "weight": "./data/hdf_north/chips/f300_3c_v2.fits"},
+            "f450": {"science": "./data/hdf_north/chips/f450_3_v2.fits", "weight": "./data/hdf_north/chips/f450_3c_v2.fits"},
+            "f606": {"science": "./data/hdf_north/chips/f606_3_v2.fits", "weight": "./data/hdf_north/chips/f606_3c_v2.fits"},
+            "f814": {"science": "./data/hdf_north/chips/f814_3_v2.fits", "weight": "./data/hdf_north/chips/f814_3c_v2.fits"},
         }
-        print("  Using chip3 2048x2048 data (no weight maps)")
+        print("  Using official STScI HDF v2 chip3 2048x2048 drizzled data")
 
     images = []
     use_weights = True  # Set to False to disable weight-based errors
@@ -1372,7 +1738,6 @@ def main(mode: str = "full", output_subdir: str | None = None):
     reference_header = images[0].header
     reference_wcs = None
     try:
-        from astropy.wcs import WCS as AstropyWCS
         reference_wcs = AstropyWCS(reference_header)
         if reference_wcs.has_celestial:
             print(f"  Extracted WCS from {next(iter(files.keys()))} band")
@@ -1387,13 +1752,12 @@ def main(mode: str = "full", output_subdir: str | None = None):
 
     # Load star mask for flagging sources as stars
     # Sources inside this mask will be flagged as stars (from course staff)
-    # For 4096x4096 mosaic: use WCS-transformed mask (star_mask_mosaic.fits)
-    # For 2048x2048 chip 3: use original star mask (star_mask.fits)
+    # Star masks for flagging bright stars (6 stars, same region in both)
     star_mask = None
     if image_shape == (4096, 4096):
-        star_mask_path = "./data/star_mask_mosaic.fits"
+        star_mask_path = "./data/hdf_north/star_mask_mosaic.fits"
     else:
-        star_mask_path = "./data/star_mask.fits"
+        star_mask_path = "./data/hdf_north/star_mask_chip3.fits"
     try:
         star_mask_data, _, _ = read_fits(star_mask_path)
         if star_mask_data.shape == image_shape:
@@ -1419,26 +1783,8 @@ def main(mode: str = "full", output_subdir: str | None = None):
             star_mask_centers.append((cx, cy))
         print(f"  Star mask has {n_regions} regions (course staff identified stars)")
 
-    if USE_FULL_RESOLUTION:
-        # For 4096x4096 data, use the combined mask if available, or no mask
-        combined_mask_path = "./data/combined_mask.fits"
-        try:
-            mask_data, _, _ = read_fits(combined_mask_path)
-            if mask_data.shape == image_shape:
-                mask = mask_data.astype(bool)
-                print(f"  Loaded detection mask: {combined_mask_path} (shape: {mask.shape})")
-            else:
-                # Mask doesn't match - create empty mask
-                mask = np.zeros(image_shape, dtype=bool)
-                print(f"  No matching mask for {image_shape} - using no mask")
-        except FileNotFoundError:
-            mask = np.zeros(image_shape, dtype=bool)
-            print("  No mask file found - using no mask")
-    else:
-        # For 2048x2048 data, don't mask during detection - we'll flag stars instead
-        # This allows sources in star regions to be detected and flagged
-        mask = np.zeros(image_shape, dtype=bool)
-        print("  Detection mask: none (star flagging enabled via star_mask)")
+    # No detection mask - sources in star regions are detected and flagged via star_mask
+    mask = np.zeros(image_shape, dtype=bool)
 
     # Step 2: Source detection using adaptive PSF-based parameters
     print("\n[2/6] Detecting sources (adaptive PSF-based method)...")
@@ -1465,8 +1811,8 @@ def main(mode: str = "full", output_subdir: str | None = None):
         return int(base_npixels * scale)
 
     # Detection threshold: sigma above background RMS
-    # Lower threshold for sensitive detection of faint galaxies
-    DETECTION_SIGMA = 1.5  # Lower threshold to detect faint sources
+    # Higher threshold on low-resource machines detects fewer sources (faster)
+    DETECTION_SIGMA = _RESOURCE_CONFIG.detection_sigma
 
     # Deblending parameters for separating overlapping galaxies
     NLEVELS = 32  # Multi-thresholding levels
@@ -1489,8 +1835,9 @@ def main(mode: str = "full", output_subdir: str | None = None):
         import gc as gc_local
 
         bkg_estimator = MedianBackground()
-        box_size = 100 if image.data.shape[0] > 2048 else 50
-        bkg = Background2D(image.data, (box_size, box_size), filter_size=(3, 3), bkg_estimator=bkg_estimator)
+        # Larger box/filter sizes for faster background estimation (2-3x speedup)
+        box_size = 128 if image.data.shape[0] > 2048 else 64
+        bkg = Background2D(image.data, (box_size, box_size), filter_size=(5, 5), bkg_estimator=bkg_estimator)
 
         # Compute background-subtracted data
         data_sub = image.data - bkg.background
@@ -1564,35 +1911,74 @@ def main(mode: str = "full", output_subdir: str | None = None):
         r90_safe = np.where(r90_vals > 0, r90_vals, np.nan)
         cat["concentration"] = (cat["r_half_pix"].to_numpy() / r90_safe).astype(np.float32)
 
-        # Calculate photometric errors using weight map if available
+        # Calculate photometric errors using professional DAOPHOT-style formula
+        # Reference: DAOPHOT II (Stetson 1987), DrizzlePac photometry_tools
+        # Formula: err = sqrt(poisson_var + sky_var + sky_uncertainty_var) × corr_factor
+        #
+        # Components:
+        # 1. Poisson noise: source_flux / gain (shot noise from source photons)
+        # 2. Sky variance: area × σ_sky² (background noise in aperture)
+        # 3. Sky uncertainty: area² × σ_sky² / nsky (uncertainty in background estimate)
+        # 4. Drizzle correlation: multiply by DRIZZLE_NOISE_CORR (~1.4 for HDF)
+        #
+        # The weight map provides per-pixel inverse variance from drizzle combination
+
+        labels = image.catalog.labels
+        segm_data = image.segm.data
+        bkg_rms = image.bkg.background_rms_median
+
+        # Count pixels per segment using bincount
+        label_counts = np.bincount(segm_data.ravel())
+        segment_areas = label_counts[labels]
+
         if image.weight is not None:
-            # Get variance map (1/weight)
+            # Get variance map from weight (weight = inverse variance)
             with np.errstate(divide="ignore", invalid="ignore"):
                 variance_map = np.where(image.weight > 0, 1.0 / image.weight, np.inf)
 
-            labels = image.catalog.labels
-            segm_data = image.segm.data
-
-            # Vectorized: sum variance over all segments at once
-            segment_variances = ndsum(variance_map, labels=segm_data, index=labels)
+            # Sum variance over all segments (this is the drizzle-combined variance)
+            # This already includes readnoise and dark current from pipeline
+            drizzle_variances = ndsum(variance_map, labels=segm_data, index=labels)
 
             # Free variance_map immediately - this is ~128MB
             del variance_map
             gc.collect()
 
-            # Count pixels per segment using bincount
-            label_counts = np.bincount(segm_data.ravel())
-            segment_areas = label_counts[labels]
+            # Component 1: Poisson noise from source (if not fully captured in weight map)
+            # HDF weight maps are inverse variance, but we add explicit Poisson term
+            # to ensure shot noise is properly accounted for
+            source_flux = np.abs(cat["segment_flux"].to_numpy())
+            poisson_var = source_flux / WFPC2_GAIN
 
-            # Add background variance contribution
-            bkg_rms = image.bkg.background_rms_median
-            total_variances = segment_variances + segment_areas * bkg_rms**2
-            cat["source_error"] = np.sqrt(total_variances).astype(np.float32)
+            # Component 2: Sky variance in aperture
+            sky_var = segment_areas * bkg_rms**2
+
+            # Component 3: Uncertainty in background estimation
+            # nsky ≈ SKY_ANNULUS_FACTOR × source_area (typical annulus is ~10× source)
+            nsky = segment_areas * SKY_ANNULUS_FACTOR
+            sky_uncertainty_var = (segment_areas**2 * bkg_rms**2) / np.maximum(nsky, 1.0)
+
+            # Total variance: drizzle + poisson + sky + sky_uncertainty
+            # Note: drizzle_variances may already include some of these, but
+            # weight maps often underestimate due to correlated noise
+            total_variances = drizzle_variances + poisson_var + sky_var + sky_uncertainty_var
+
+            # Apply drizzle correlated noise correction factor
+            # Drizzle creates pixel-to-pixel correlations that cause summed variance
+            # to underestimate true aperture noise by factor of ~1.2-1.5
+            cat["source_error"] = (np.sqrt(total_variances) * DRIZZLE_NOISE_CORR).astype(np.float32)
         else:
-            # Fallback: Poisson noise + background RMS
-            cat["source_error"] = np.sqrt(
-                np.abs(cat["segment_flux"]) + cat["area"] * image.bkg.background_rms_median**2
-            ).astype(np.float32)
+            # Fallback without weight map: full DAOPHOT formula
+            source_flux = np.abs(cat["segment_flux"].to_numpy())
+            segment_areas = cat["area"].to_numpy()
+
+            poisson_var = source_flux / WFPC2_GAIN
+            sky_var = segment_areas * bkg_rms**2
+            nsky = segment_areas * SKY_ANNULUS_FACTOR
+            sky_uncertainty_var = (segment_areas**2 * bkg_rms**2) / np.maximum(nsky, 1.0)
+
+            total_variances = poisson_var + sky_var + sky_uncertainty_var
+            cat["source_error"] = (np.sqrt(total_variances) * DRIZZLE_NOISE_CORR).astype(np.float32)
 
         # Calculate SNR for quality flagging
         cat["snr"] = (np.abs(cat["source_sky"]) / (cat["source_error"] + 1e-10)).astype(np.float32)
@@ -1639,12 +2025,12 @@ def main(mode: str = "full", output_subdir: str | None = None):
             image.data = image.data.astype(np.float32)
     gc.collect()
 
-    reference_band = "b"
+    reference_band = "f450"  # B band (blue)
     matched_sources = []
     match_radius = 3.0
 
     # Build KD-trees for fast spatial matching (O(N log N) instead of O(N²))
-    other_bands = ["i", "u", "v"]
+    other_bands = ["f814", "f300", "f606"]  # I, U, V bands
     kdtrees = {}
     coords_arrays = {}
     for band in other_bands:
@@ -1873,10 +2259,10 @@ def main(mode: str = "full", output_subdir: str | None = None):
     # Step 4: Convert to physical units and classify
     print("\n[4/6] Converting fluxes and classifying galaxies...")
     conversion_factors = {
-        "b": 8.8e-18,
-        "i": 2.45e-18,
-        "u": 5.99e-17,
-        "v": 1.89e-18,
+        "f450": 8.8e-18,   # B band (blue)
+        "f814": 2.45e-18,  # I band (infrared)
+        "f300": 5.99e-17,  # U band (ultraviolet)
+        "f606": 1.89e-18,  # V band (visual)
     }
 
     # Build SED catalog using vectorized operations (much faster than iterrows)
@@ -1887,7 +2273,7 @@ def main(mode: str = "full", output_subdir: str | None = None):
     ]].copy()
 
     # Vectorized flux conversion for all bands
-    for band in ["b", "i", "u", "v"]:
+    for band in ["f450", "f814", "f300", "f606"]:
         sed_catalog[f"flux_{band}"] = cross_matched_catalog[f"source_sky_{band}"] * conversion_factors[band]
         sed_catalog[f"error_{band}"] = cross_matched_catalog[f"source_error_{band}"] * conversion_factors[band]
 
@@ -1919,30 +2305,36 @@ def main(mode: str = "full", output_subdir: str | None = None):
     # Force garbage collection before heavy computation
     gc.collect()
 
-    # ULTRA FAST: Classify ALL galaxies at once with coarse-to-fine + float32 + parallel numba
-    # This eliminates ProcessPoolExecutor overhead and processes everything in parallel
-    # Speed: ~600,000 galaxies/second!
+    # Classify galaxies using template fitting with parallel processing
+    # Uses ProcessPoolExecutor for multi-core parallelism
+    # Note: Speed is ~4-10 galaxies/sec depending on z_step and hardware
     n_galaxies = len(sed_catalog)
-    print(f"  Classifying {n_galaxies} galaxies with ULTRA FAST classifier (~600k/sec)...")
+    print(f"  Classifying {n_galaxies} galaxies with template fitting...")
 
     # Build flux and error arrays in [U, B, V, I] order for vectorized classifier
     flux_array = np.column_stack([
-        sed_catalog["flux_u"].to_numpy(),
-        sed_catalog["flux_b"].to_numpy(),
-        sed_catalog["flux_v"].to_numpy(),
-        sed_catalog["flux_i"].to_numpy(),
+        sed_catalog["flux_f300"].to_numpy(),  # U band
+        sed_catalog["flux_f450"].to_numpy(),  # B band
+        sed_catalog["flux_f606"].to_numpy(),  # V band
+        sed_catalog["flux_f814"].to_numpy(),  # I band
     ])
     error_array = np.column_stack([
-        sed_catalog["error_u"].to_numpy(),
-        sed_catalog["error_b"].to_numpy(),
-        sed_catalog["error_v"].to_numpy(),
-        sed_catalog["error_i"].to_numpy(),
+        sed_catalog["error_f300"].to_numpy(),  # U band
+        sed_catalog["error_f450"].to_numpy(),  # B band
+        sed_catalog["error_f606"].to_numpy(),  # V band
+        sed_catalog["error_f814"].to_numpy(),  # I band
     ])
 
-    # ULTRA FAST: Coarse-to-fine + float32 + parallel numba
+    # Template fitting with configurable redshift step
+    # z_step from resource config: larger steps for faster processing on constrained machines
     import time
     t0 = time.perf_counter()
-    results = classify_batch_ultrafast(flux_array, error_array, spectra_path="./spectra")
+    results = classify_batch_ultrafast(
+        flux_array, error_array,
+        spectra_path="./spectra",
+        z_step=_RESOURCE_CONFIG.z_step,
+        z_step_coarse=_RESOURCE_CONFIG.z_step_coarse
+    )
     t1 = time.perf_counter()
     print(f"    Classified {n_galaxies} galaxies in {t1-t0:.4f}s ({n_galaxies/(t1-t0):.0f} galaxies/sec)")
 
@@ -1976,7 +2368,7 @@ def main(mode: str = "full", output_subdir: str | None = None):
         sed_catalog["n_valid_bands"] = results['n_valid_bands']
     else:
         # Fallback: count non-NaN flux values
-        flux_cols = [f"flux_{b}" for b in ["u", "b", "v", "i"]]
+        flux_cols = [f"flux_{b}" for b in ["f300", "f450", "f606", "f814"]]
         sed_catalog["n_valid_bands"] = sed_catalog[flux_cols].notna().sum(axis=1)
 
     # Use PSF-corrected radius for angular size (vectorized)
@@ -2007,10 +2399,10 @@ def main(mode: str = "full", output_subdir: str | None = None):
     # Using vectorized computation (100-700x faster than iterrows)
     print("  Checking for stellar contamination via colors (vectorized)...")
     sed_catalog["color_stellarity"] = check_stellar_colors_vectorized(
-        sed_catalog["flux_u"].to_numpy(),
-        sed_catalog["flux_b"].to_numpy(),
-        sed_catalog["flux_v"].to_numpy(),
-        sed_catalog["flux_i"].to_numpy(),
+        sed_catalog["flux_f300"].to_numpy(),  # U band
+        sed_catalog["flux_f450"].to_numpy(),  # B band
+        sed_catalog["flux_f606"].to_numpy(),  # V band
+        sed_catalog["flux_f814"].to_numpy(),  # I band
     )
 
     # Update FLAG_PSF_LIKE for sources with stellar colors AND high morphological stellarity
@@ -2032,9 +2424,6 @@ def main(mode: str = "full", output_subdir: str | None = None):
     if USE_PROFESSIONAL_CLASSIFICATION:
         print("\n  Running professional star-galaxy classification...")
         try:
-            from morphology.professional_classification import classify_professional
-            from morphology.star_galaxy import query_gaia_for_classification
-
             # Query Gaia DR3 for foreground stars
             HDF_CENTER_RA = 189.228621
             HDF_CENTER_DEC = 62.212572
@@ -2054,7 +2443,7 @@ def main(mode: str = "full", output_subdir: str | None = None):
             # Get reference image for morphological analysis (use I-band)
             ref_image = None
             for img in images:
-                if img.band == 'i':
+                if img.band == 'f814':  # I band
                     ref_image = img.data
                     break
             if ref_image is None:
@@ -2070,7 +2459,6 @@ def main(mode: str = "full", output_subdir: str | None = None):
                 y_col="ycentroid",
                 ra_col="ra",
                 dec_col="dec",
-                pixel_scale=PIXEL_SCALE,
                 verbose=True,
             )
 
@@ -2114,20 +2502,6 @@ def main(mode: str = "full", output_subdir: str | None = None):
                         if n_tier > 0:
                             print(f"      Tier {tier} ({name}): {n_tier} sources")
 
-                # Skip diagnostic plot (star_galaxy_classification.pdf) - not needed
-                # try:
-                #     from morphology.professional_classification import plot_classification_diagnostics
-                #     plot_classification_diagnostics(
-                #         classification_results,
-                #         output_path=f"{output_dir}/star_galaxy_classification.pdf"
-                #     )
-                #     print(f"    Saved: {output_dir}/star_galaxy_classification.pdf")
-                # except Exception as plot_error:
-                #     print(f"    Could not save diagnostic plot: {plot_error}")
-
-        except ImportError as e:
-            print(f"    Warning: Professional classification not available: {e}")
-            print("    Using basic classification only")
         except Exception as e:
             print(f"    Warning: Professional classification failed: {e}")
             print("    Using basic classification only")
@@ -2136,8 +2510,6 @@ def main(mode: str = "full", output_subdir: str | None = None):
     # This catches stars our morphological methods miss
     print("\n  Cross-matching with 3D-HST catalog (Skelton et al. 2014)...")
     try:
-        from validation.external_crossmatch import crossmatch_with_3dhst
-
         sed_catalog = crossmatch_with_3dhst(sed_catalog, match_radius_arcsec=1.0)
 
         # Flag sources identified as stars by 3D-HST
@@ -2156,7 +2528,6 @@ def main(mode: str = "full", output_subdir: str | None = None):
 
         # Apply spectroscopic redshifts from 3D-HST where available
         # This fixes catastrophic photo-z failures
-        from validation.external_crossmatch import apply_spectroscopic_redshifts
         sed_catalog = apply_spectroscopic_redshifts(
             sed_catalog,
             z_col='redshift',
@@ -2169,16 +2540,149 @@ def main(mode: str = "full", output_subdir: str | None = None):
         if 'has_specz' in sed_catalog.columns:
             n_specz = sed_catalog['has_specz'].sum()
             if n_specz > 0:
-                print(f"    Applied {n_specz} spectroscopic redshifts from 3D-HST")
+                print(f"  Applied {n_specz} spectroscopic redshifts from 3D-HST")
                 if 'catastrophic_photoz' in sed_catalog.columns:
                     n_catastrophic = sed_catalog['catastrophic_photoz'].sum()
                     if n_catastrophic > 0:
-                        print(f"    Fixed {n_catastrophic} catastrophic photo-z failures")
+                        print(f"  Catastrophic photo-z outliers corrected: {n_catastrophic}")
 
-    except ImportError:
-        print("    Warning: 3D-HST cross-match not available (install astroquery)")
+                # Clear bad photo-z flags for sources with spectroscopic redshifts
+                # Spec-z are trusted, so these sources should not be flagged as bad_photoz
+                specz_mask = sed_catalog['has_specz']
+                current_flags = sed_catalog.loc[specz_mask, "quality_flag"].astype(int)
+                # Clear FLAG_BAD_PHOTOZ (32) and FLAG_UNRELIABLE_Z (256)
+                cleared_flags = current_flags & ~(FLAG_BAD_PHOTOZ | FLAG_UNRELIABLE_Z)
+                sed_catalog.loc[specz_mask, "quality_flag"] = cleared_flags
+
     except Exception as e:
         print(f"    Warning: 3D-HST cross-match failed: {e}")
+
+    # ==========================================================================
+    # OPTIONAL: Hybrid Photo-z Enhancement (ML + Templates)
+    # ==========================================================================
+    if USE_HYBRID_PHOTOZ:
+        print("\n  Running hybrid photo-z enhancement...")
+        try:
+            # Check if we have enough spectroscopic redshifts for training
+            has_specz = 'has_specz' in sed_catalog.columns and sed_catalog['has_specz'].sum() >= 20
+
+            if has_specz:
+                print("    Training hybrid photo-z model on spectroscopic sample...")
+
+                # Determine the correct spec-z column
+                # z_spec_3dhst contains actual spectroscopic redshifts from 3D-HST
+                # 'redshift' may have been updated with spec-z values already
+                if 'z_spec_3dhst' in sed_catalog.columns:
+                    spec_z_column = 'z_spec_3dhst'
+                elif 'spec_z' in sed_catalog.columns:
+                    spec_z_column = 'spec_z'
+                else:
+                    spec_z_column = 'redshift'
+
+                # Train the hybrid estimator
+                hybrid_estimator, hybrid_metrics = train_hybrid_photoz_from_specz(
+                    sed_catalog,
+                    spec_z_col=spec_z_column,
+                    flux_cols=('flux_f300', 'flux_f450', 'flux_f606', 'flux_f814'),
+                    error_cols=('error_f300', 'error_f450', 'error_f606', 'error_f814'),
+                    ml_method='rf',
+                    spectra_path='./spectra',
+                    has_specz_col='has_specz',  # Use proper filter for spec-z sources
+                )
+
+                # Apply hybrid photo-z to all sources
+                print("    Applying hybrid photo-z to full catalog...")
+                flux_array_hybrid = np.column_stack([
+                    sed_catalog['flux_f300'].values,
+                    sed_catalog['flux_f450'].values,
+                    sed_catalog['flux_f606'].values,
+                    sed_catalog['flux_f814'].values,
+                ])
+                error_array_hybrid = np.column_stack([
+                    sed_catalog['error_f300'].values,
+                    sed_catalog['error_f450'].values,
+                    sed_catalog['error_f606'].values,
+                    sed_catalog['error_f814'].values,
+                ])
+
+                # Pass catalog values to ensure consistency between template and hybrid results
+                catalog_odds = sed_catalog['photo_z_odds'].values if 'photo_z_odds' in sed_catalog.columns else None
+                catalog_z_lo = sed_catalog['redshift_lo'].values if 'redshift_lo' in sed_catalog.columns else None
+                catalog_z_hi = sed_catalog['redshift_hi'].values if 'redshift_hi' in sed_catalog.columns else None
+                catalog_redshift = sed_catalog['redshift'].values if 'redshift' in sed_catalog.columns else None
+                has_specz_arr = sed_catalog['has_specz'].values if 'has_specz' in sed_catalog.columns else None
+
+                hybrid_results = hybrid_estimator.predict_batch(
+                    flux_array_hybrid, error_array_hybrid,
+                    catalog_odds=catalog_odds,
+                    catalog_z_lo=catalog_z_lo,
+                    catalog_z_hi=catalog_z_hi,
+                    catalog_redshift=catalog_redshift,
+                    has_specz=has_specz_arr,
+                )
+
+                # Add hybrid results to catalog
+                for key, values in hybrid_results.items():
+                    sed_catalog[key] = values
+
+                print(f"    Hybrid photo-z improvement: {100*hybrid_metrics.get('improvement_nmad', 0):.1f}% NMAD reduction")
+            else:
+                print("    Skipping hybrid photo-z: insufficient spectroscopic training data")
+
+        except Exception as e:
+            print(f"    Warning: Hybrid photo-z failed: {e}")
+
+    # ==========================================================================
+    # OPTIONAL: Zoobot Morphology Validation
+    # ==========================================================================
+    if USE_ZOOBOT_VALIDATION:
+        print("\n  Running Zoobot morphology validation...")
+        try:
+            # Get reference image for cutout extraction (use I-band)
+            ref_image_zoobot = None
+            for img in images:
+                if img.band == 'f814':
+                    ref_image_zoobot = img.data
+                    break
+            if ref_image_zoobot is None:
+                ref_image_zoobot = images[0].data
+
+            # Filter to galaxies only for Zoobot validation
+            galaxy_mask = (sed_catalog["quality_flag"].astype(int) & FLAG_PSF_LIKE) == 0
+            galaxy_catalog = sed_catalog[galaxy_mask].copy()
+
+            if len(galaxy_catalog) > 10:
+                # Extract cutouts for Zoobot
+                print(f"    Extracting cutouts for {len(galaxy_catalog)} galaxies...")
+                cutouts = extract_cutouts(
+                    ref_image_zoobot,
+                    galaxy_catalog,
+                    size=128,
+                    output_dir=Path(output_dir) / 'zoobot_cutouts',
+                )
+
+                # Run Zoobot predictions
+                image_paths = [c[2] for c in cutouts if c[2] is not None]
+                if len(image_paths) > 0:
+                    print(f"    Running Zoobot on {len(image_paths)} cutouts...")
+                    zoobot_preds = run_zoobot_predictions(image_paths)
+                    zoobot_morphs = interpret_zoobot_predictions(zoobot_preds)
+
+                    # Validate against SED classifications
+                    if 'galaxy_type' in galaxy_catalog.columns:
+                        validation_report = validate_morphology_with_zoobot(
+                            galaxy_catalog, zoobot_morphs
+                        )
+                        print(validation_report)
+
+                        # Save validation report
+                        with open(f"{output_dir}/zoobot_validation.txt", "w") as f:
+                            f.write(str(validation_report))
+            else:
+                print("    Skipping Zoobot: insufficient galaxies for validation")
+
+        except Exception as e:
+            print(f"    Warning: Zoobot validation failed: {e}")
 
     # Report photo-z quality statistics
     odds_good = (sed_catalog["photo_z_odds"] >= 0.9).sum()
@@ -2264,11 +2768,10 @@ def main(mode: str = "full", output_subdir: str | None = None):
         # Report filtering breakdown
         n_total = len(sed_catalog)
         n_kept = len(sed_catalog_filtered)
-        n_rejected = n_total - n_kept
 
-        print(f"\n  HIGH-QUALITY MODE: Applied strict quality filtering")
+        print("\n  HIGH-QUALITY MODE: Applied strict quality filtering")
         print(f"    Input: {n_total} sources")
-        print(f"    Rejection breakdown:")
+        print("    Rejection breakdown:")
 
         # Count sources rejected by each criterion
         n_flag_rejected = ((sed_catalog["quality_flag"].astype(int) & STRICT_EXCLUDE_FLAGS) != 0).sum()
@@ -2287,11 +2790,34 @@ def main(mode: str = "full", output_subdir: str | None = None):
         sed_catalog_filtered = sed_catalog[
             (sed_catalog["quality_flag"].astype(int) & EXCLUDE_FLAGS) == 0
         ]
-        print(f"\n  MODERATE MODE: Basic quality filtering")
+        print("\n  MODERATE MODE: Basic quality filtering")
         print(f"    - After filtering (excluding bad_photoz, psf_like, masked): {len(sed_catalog_filtered)}")
 
     # Use filtered catalog for analysis
     sed_catalog_analysis = sed_catalog_filtered
+
+    # Fallback to moderate filtering if high-quality mode yields too few sources
+    MIN_SOURCES_FOR_ANALYSIS = 10
+    if len(sed_catalog_analysis) < MIN_SOURCES_FOR_ANALYSIS and HIGH_QUALITY_MODE:
+        print(f"\n  WARNING: High-quality filtering yielded only {len(sed_catalog_analysis)} sources")
+        print("  Falling back to moderate filtering to enable analysis...")
+
+        # Moderate filtering - excludes only clearly bad sources
+        FALLBACK_FLAGS = FLAG_BAD_PHOTOZ | FLAG_PSF_LIKE | FLAG_MASKED
+        sed_catalog_analysis = sed_catalog[
+            (sed_catalog["quality_flag"].astype(int) & FALLBACK_FLAGS) == 0
+        ]
+        print(f"  After moderate filtering: {len(sed_catalog_analysis)} sources")
+
+        # If still too few, use minimal filtering (only masked sources)
+        if len(sed_catalog_analysis) < MIN_SOURCES_FOR_ANALYSIS:
+            print("  WARNING: Moderate filtering still too restrictive")
+            print("  Falling back to minimal filtering (excluding only masked sources)...")
+            MINIMAL_FLAGS = FLAG_MASKED | FLAG_PSF_LIKE
+            sed_catalog_analysis = sed_catalog[
+                (sed_catalog["quality_flag"].astype(int) & MINIMAL_FLAGS) == 0
+            ]
+            print(f"  After minimal filtering: {len(sed_catalog_analysis)} sources")
 
     # Print redshift distribution
     print("\n  Redshift statistics (filtered):")
@@ -2336,8 +2862,18 @@ def main(mode: str = "full", output_subdir: str | None = None):
 
     # Dynamic binning with multiple strategies (use filtered catalog)
     z_min_raw, z_max_raw = sed_catalog_analysis.redshift.min(), sed_catalog_analysis.redshift.max()
-    if not np.isfinite(z_min_raw) or not np.isfinite(z_max_raw) or z_min_raw == z_max_raw:
-        raise ValueError("Cannot bin redshifts: invalid or zero range")
+    if len(sed_catalog_analysis) < 3 or not np.isfinite(z_min_raw) or not np.isfinite(z_max_raw) or z_min_raw == z_max_raw:
+        print("\n  WARNING: Insufficient data for binning analysis")
+        print(f"    Sources: {len(sed_catalog_analysis)}, z range: [{z_min_raw:.3f}, {z_max_raw:.3f}]")
+        print("    Skipping binning and model fitting. Results will be incomplete.")
+        # Save catalogs before returning
+        sed_catalog.to_csv(f"{output_dir}/galaxy_catalog_full.csv", index=False)
+        sed_catalog_analysis.to_csv(f"{output_dir}/galaxy_catalog.csv", index=False)
+        print(f"  Saved: {output_dir}/galaxy_catalog.csv ({len(sed_catalog_analysis)} sources)")
+        # Return minimal results
+        binned = pd.DataFrame(columns=["z_mid", "theta_med", "theta_err", "n"])
+        binned_results = {}
+        return sed_catalog, sed_catalog_analysis, binned, binned_results, star_mask_centers
 
     # Calculate adaptive number of bins based on data size
     n_bins_adaptive = get_adaptive_n_bins(len(sed_catalog_analysis))
@@ -2346,9 +2882,8 @@ def main(mode: str = "full", output_subdir: str | None = None):
     # Define binning strategies
     binning_strategies = {
         "Equal Width": bin_equal_width,
-        "Equal Count": bin_equal_count,
-        "Logarithmic": bin_logarithmic,
         "Percentile": bin_percentile,
+        "Bayesian Blocks": bin_bayesian_blocks,
     }
 
     # Apply all binning strategies with adaptive bin count
@@ -2361,12 +2896,13 @@ def main(mode: str = "full", output_subdir: str | None = None):
         except Exception as e:
             print(f"\n  {name} binning failed: {e}")
 
-    # Use equal-count as the primary binning (most physically justified)
-    binned = binned_results.get("Equal Count", bin_equal_width(sed_catalog_analysis))
+    # Use percentile as the primary binning (most physically justified)
+    binned = binned_results.get("Percentile", bin_equal_width(sed_catalog_analysis))
 
     # Fit models
     z_min = max(1e-4, binned.z_mid.min())
-    z_model = np.linspace(z_min, binned.z_mid.max(), 300)
+    z_data_max_for_curve = sed_catalog_analysis.redshift.max()
+    z_model = np.linspace(z_min, z_data_max_for_curve, 300)
 
     # Static model: fit only R
     R_static = get_radius(
@@ -2511,11 +3047,10 @@ def main(mode: str = "full", output_subdir: str | None = None):
 
     colors = {
         "Equal Width": "green",
-        "Equal Count": "blue",
-        "Logarithmic": "orange",
-        "Percentile": "purple",
+        "Percentile": "blue",
+        "Bayesian Blocks": "purple",
     }
-    markers = {"Equal Width": "o", "Equal Count": "o", "Logarithmic": "o", "Percentile": "o"}
+    markers = {"Equal Width": "o", "Percentile": "o", "Bayesian Blocks": "o"}
 
     strategy_names = list(binned_results.keys())
 
@@ -2644,6 +3179,169 @@ def main(mode: str = "full", output_subdir: str | None = None):
     plt.close()
     print(f"  Saved: {output_dir}/binning_comparison.pdf")
 
+    # Plot 3b: Per-galaxy-type binning comparison plots
+    # Only for galaxy types with enough statistics (>= 20 sources for meaningful binning)
+    MIN_SOURCES_FOR_TYPE_PLOT = 20
+    type_counts_for_binning = sed_catalog_analysis["galaxy_type"].value_counts()
+    for gtype, gtype_count in type_counts_for_binning.items():
+        if gtype_count < MIN_SOURCES_FOR_TYPE_PLOT:
+            continue
+
+        # Filter catalog for this galaxy type
+        type_catalog = sed_catalog_analysis[sed_catalog_analysis["galaxy_type"] == gtype].copy()
+
+        # Compute binning for this type
+        type_binned_results = {}
+        for name, bin_func in binning_strategies.items():
+            try:
+                type_binned_results[name] = bin_func(type_catalog)
+            except Exception:
+                pass  # Skip if binning fails for this type
+
+        if len(type_binned_results) < 2:
+            continue  # Need at least 2 strategies to make a comparison plot
+
+        # Create the same 2x2 grid with residuals plot
+        fig_type = plt.figure(figsize=(14, 16), constrained_layout=True)
+        gs_type = fig_type.add_gridspec(4, 2, height_ratios=[3, 1, 3, 1], hspace=0.08, wspace=0.15)
+
+        # Dynamic axis limits for this type
+        z_min_type = type_catalog["redshift"].min()
+        z_max_type = type_catalog["redshift"].max()
+        z_padding_type = (z_max_type - z_min_type) * 0.1
+        z_lim_type = (max(0, z_min_type - z_padding_type), z_max_type + z_padding_type)
+
+        theta_min_type = type_catalog["r_half_arcsec"].min()
+        theta_max_type = type_catalog["r_half_arcsec"].max()
+        theta_padding_type = (theta_max_type - theta_min_type) * 0.1
+        theta_lim_type = (max(0, theta_min_type - theta_padding_type), theta_max_type + theta_padding_type)
+
+        strategy_names_type = list(type_binned_results.keys())
+
+        for idx, name in enumerate(strategy_names_type[:4]):  # Max 4 strategies
+            binned_data = type_binned_results[name]
+            row_base = (idx // 2) * 2
+            col = idx % 2
+
+            ax_main = fig_type.add_subplot(gs_type[row_base, col])
+            ax_resid = fig_type.add_subplot(gs_type[row_base + 1, col], sharex=ax_main)
+
+            # Fit models for this binning
+            R_static_type = get_radius(
+                binned_data.z_mid.values,
+                binned_data.theta_med.values,
+                binned_data.theta_err.values,
+                model="static",
+            )
+            R_lcdm_type, Omega_m_type = get_radius_and_omega(
+                binned_data.z_mid.values,
+                binned_data.theta_med.values,
+                binned_data.theta_err.values,
+            )
+
+            z_model_type = np.linspace(max(0.05, z_lim_type[0]), z_lim_type[1], 200)
+            theta_static_type = theta_static(z_model_type, R_static_type) * RAD_TO_ARCSEC
+            theta_lcdm_type = theta_lcdm_flat(z_model_type, R_lcdm_type, Omega_m_type) * RAD_TO_ARCSEC
+
+            # Compute chi2/ndf for both models
+            def static_func_type(z, R=R_static_type):
+                return theta_static(z, R) * RAD_TO_ARCSEC
+            def lcdm_func_type(z, R=R_lcdm_type, Om=Omega_m_type):
+                return theta_lcdm_flat(z, R, Om) * RAD_TO_ARCSEC
+
+            stats_static_type = compute_chi2_stats(
+                binned_data.z_mid.values, binned_data.theta_med.values,
+                binned_data.theta_err.values, static_func_type, n_params=1
+            )
+            stats_lcdm_type = compute_chi2_stats(
+                binned_data.z_mid.values, binned_data.theta_med.values,
+                binned_data.theta_err.values, lcdm_func_type, n_params=2
+            )
+
+            # Plot individual galaxies as background
+            ax_main.scatter(
+                type_catalog["redshift"],
+                type_catalog["r_half_arcsec"],
+                c="lightgray",
+                alpha=0.4,
+                s=15,
+                zorder=1,
+            )
+
+            # Plot binned data
+            ax_main.errorbar(
+                binned_data["z_mid"],
+                binned_data["theta_med"],
+                yerr=binned_data["theta_err"],
+                fmt=markers[name],
+                capsize=3,
+                capthick=0.8,
+                markersize=6,
+                markeredgewidth=0.8,
+                elinewidth=0.8,
+                color=colors[name],
+                label="Binned",
+                zorder=3,
+            )
+
+            # Plot models
+            ax_main.plot(
+                z_model_type, theta_static_type, "--", color="gray", linewidth=1.5, label=r"Static", zorder=2
+            )
+            ax_main.plot(
+                z_model_type, theta_lcdm_type, "-", color="darkblue", linewidth=1.5, label=r"$\Lambda$CDM", zorder=2
+            )
+
+            ax_main.set_ylabel(r"Angular size $\theta$ (arcsec)", fontsize=11)
+            ax_main.set_title(
+                f"{name} ({len(binned_data)} bins)\n"
+                + r"$\Lambda$CDM: $R$" + f"={R_lcdm_type*1000:.1f} kpc, "
+                + r"$\chi^2/{\rm ndf}$" + f"={stats_lcdm_type['chi2_ndf']:.2f}, "
+                + f"P={stats_lcdm_type['p_value']:.3f}\n"
+                + r"Static: $R$" + f"={R_static_type*1000:.1f} kpc, "
+                + r"$\chi^2/{\rm ndf}$" + f"={stats_static_type['chi2_ndf']:.2f}, "
+                + f"P={stats_static_type['p_value']:.3f}",
+                fontsize=10
+            )
+            ax_main.legend(fontsize=8, loc="upper right")
+            ax_main.grid(True, alpha=0.3)
+            ax_main.set_xlim(z_lim_type)
+            ax_main.set_ylim(theta_lim_type)
+            plt.setp(ax_main.get_xticklabels(), visible=False)
+
+            # Calculate residuals
+            theta_lcdm_at_data_type = theta_lcdm_flat(binned_data["z_mid"].values, R_lcdm_type, Omega_m_type) * RAD_TO_ARCSEC
+            residuals_lcdm_type = binned_data["theta_med"].values - theta_lcdm_at_data_type
+
+            # Residual plot
+            ax_resid.axhline(0, color="darkblue", linestyle="-", linewidth=1.5, alpha=0.7)
+            ax_resid.errorbar(
+                binned_data["z_mid"],
+                residuals_lcdm_type,
+                yerr=binned_data["theta_err"],
+                fmt=markers[name],
+                capsize=2,
+                capthick=0.6,
+                markersize=5,
+                markeredgewidth=0.6,
+                elinewidth=0.6,
+                color=colors[name],
+                zorder=3,
+            )
+            ax_resid.set_xlabel(r"Redshift $z$", fontsize=11)
+            ax_resid.set_ylabel(r"$\theta - \theta_{\Lambda\mathrm{CDM}}$", fontsize=9)
+            ax_resid.grid(True, alpha=0.3)
+            ax_resid.set_xlim(z_lim_type)
+            max_resid_type = max(0.05, np.max(np.abs(residuals_lcdm_type) + binned_data["theta_err"].values) * 1.2)
+            ax_resid.set_ylim(-max_resid_type, max_resid_type)
+
+        # Create safe filename from galaxy type
+        safe_gtype = gtype.replace(" ", "_").replace("/", "-").lower()
+        fig_type.suptitle(f"Binning Strategies: {gtype} (n={gtype_count})", fontsize=14, fontweight="bold")
+        plt.savefig(f"{output_dir}/binning_comparison_{safe_gtype}.pdf", dpi=300, bbox_inches="tight")
+        plt.close()
+        print(f"  Saved: {output_dir}/binning_comparison_{safe_gtype}.pdf")
+
     # Plot 4: All binning strategies overlaid
     _fig, ax = plt.subplots(figsize=(12, 8))
 
@@ -2676,7 +3374,7 @@ def main(mode: str = "full", output_subdir: str | None = None):
             zorder=2,
         )
 
-    # Add ΛCDM model curve (using equal-count fit)
+    # Add ΛCDM model curve (using percentile fit)
     ax.plot(
         z_model, theta_lcdm_model, "-", color="black", linewidth=2, label=r"$\Lambda$CDM model", zorder=3
     )
@@ -2768,51 +3466,13 @@ def main(mode: str = "full", output_subdir: str | None = None):
     plt.close()
     print(f"  Saved: {output_dir}/angular_diameter_distance.pdf")
 
-    # Plot 8: Source detection image
-    # Separate sources into 3 categories:
-    # 1. Purple: sources inside mask (stars by mask)
-    # 2. Blue: stars detected by stellarity/concentration (NOT in mask)
-    # 3. Red: galaxies (not flagged as stars at all)
+    # Plot 8: Final selection (cross-matched sources in all 4 bands)
+    # Separate sources into categories:
+    # Red: galaxies (not flagged as stars)
 
     is_in_mask = cross_matched_catalog["in_star_mask"]
-    is_detected_star = ((cross_matched_catalog["quality_flag"] & FLAG_PSF_LIKE) != 0) & ~is_in_mask
     is_galaxy = ((cross_matched_catalog["quality_flag"] & FLAG_PSF_LIKE) == 0) & ~is_in_mask
-
-    is_in_mask.sum()
-    is_detected_star.sum()
     n_galaxies = is_galaxy.sum()
-
-    _fig, axes = plt.subplots(2, 2, figsize=(12, 12))
-    for idx, image in enumerate(images):
-        ax = axes[idx // 2, idx % 2]
-        vmin, vmax = np.percentile(image.data, [20, 99])
-        ax.imshow(image.data, cmap="gray_r", vmin=vmin, vmax=vmax, origin="lower")
-
-        # Red: galaxies (not flagged as stars)
-        if n_galaxies > 0:
-            ax.scatter(
-                cross_matched_catalog.loc[is_galaxy, "xcentroid"],
-                cross_matched_catalog.loc[is_galaxy, "ycentroid"],
-                s=10,
-                facecolors="none",
-                edgecolors="red",
-                linewidth=0.5,
-            )
-
-        ax.set_title(
-            f"Band {image.band.upper()} -- {n_galaxies} galaxies",
-            fontsize=9,
-        )
-        ax.set_xlabel(r"X (pixels)")
-        ax.set_ylabel(r"Y (pixels)")
-
-    plt.suptitle(f"Source Detection ({n_galaxies} galaxies)", fontsize=14, fontweight="bold", y=1.01)
-    plt.tight_layout()
-    plt.savefig(f"{output_dir}/source_detection.pdf", dpi=150, bbox_inches="tight")
-    plt.close()
-    print(f"  Saved: {output_dir}/source_detection.pdf")
-
-    # Plot 9: Final selection (cross-matched sources in all 4 bands)
 
     _fig, axes = plt.subplots(2, 2, figsize=(12, 12))
     for idx, image in enumerate(images):
@@ -2960,6 +3620,14 @@ Examples:
     python run_analysis.py chip3                         # Run analysis on chip3 only
     python run_analysis.py both                          # Run full and extract chip3
     python run_analysis.py full --run-qc                 # Run with quality control
+    python run_analysis.py full --resource-profile low   # Run with low resource usage (constrained machines)
+    python run_analysis.py full --resource-profile high  # Run with high resource usage (workstations)
+
+Resource Profiles:
+    low:    2-4GB RAM, 2 cores - uses coarser redshift grid (z_step=0.02), fewer threads
+    medium: 4-8GB RAM, 4 cores - standard precision (z_step=0.01)
+    high:   8GB+ RAM, 8+ cores - full precision with maximum parallelism
+    auto:   Automatically detect based on available system resources (default)
         """
     )
     parser.add_argument(
@@ -2979,11 +3647,31 @@ Examples:
         metavar="PATH",
         help="Path to external reference catalog for QC validation (CSV with ra, dec, z_phot columns)"
     )
+    parser.add_argument(
+        "--resource-profile",
+        type=str,
+        choices=["low", "medium", "high", "auto"],
+        default="auto",
+        help="Resource usage profile: 'low' for constrained machines (2-4GB RAM), "
+             "'medium' for typical laptops (4-8GB), 'high' for workstations (8GB+), "
+             "'auto' to detect automatically (default)"
+    )
     args = parser.parse_args()
+
+    # Apply resource profile if specified via command line
+    # Note: For full effect, set ASTRO_RESOURCE_PROFILE env var before running
+    if args.resource_profile != "auto":
+        import os
+        os.environ["ASTRO_RESOURCE_PROFILE"] = args.resource_profile
+
+    # Get the active config (may have been set by env var or command line)
+    active_config = get_config()
 
     print("=" * 60)
     print("ANGULAR SIZE TEST ANALYSIS")
     print(f"Mode: {args.mode}")
+    print(f"Resource profile: {active_config.profile.value} "
+          f"(threads={active_config.n_threads}, z_step={active_config.z_step})")
     print("=" * 60)
 
     if args.mode == "both":
@@ -3012,10 +3700,10 @@ Examples:
         # Load full images for chip3 detection plots
         print("\n  Loading full images for chip3 detection plots...")
         full_files = {
-            "b": "./fits/b_full.fits",
-            "i": "./fits/i_full.fits",
-            "u": "./fits/u_full.fits",
-            "v": "./fits/v_full.fits",
+            "f300": "./data/hdf_north/mosaics/f300_mosaic_v2.fits",
+            "f450": "./data/hdf_north/mosaics/f450_mosaic_v2.fits",
+            "f606": "./data/hdf_north/mosaics/f606_mosaic_v2.fits",
+            "f814": "./data/hdf_north/mosaics/f814_mosaic_v2.fits",
         }
         chip3_images = []
         for band, path in full_files.items():
@@ -3035,72 +3723,57 @@ Examples:
         )
 
         # Generate plots for both full and chip3
-        try:
-            from generate_filtered_binning import (
-                MIN_GALAXIES_PER_TYPE,
-                generate_angular_size_plot,
-                generate_binning_plot,
-                generate_galaxy_type_histogram,
-                generate_overlay_plot,
-                generate_per_type_fit_plot,
-                generate_redshift_histogram,
-                generate_size_distribution_by_type,
-                generate_type_comparison_overlay,
-                get_types_with_enough_statistics,
-            )
-            print("\n" + "=" * 60)
-            print("GENERATING PLOTS")
-            print("=" * 60)
+        print("\n" + "=" * 60)
+        print("GENERATING PLOTS")
+        print("=" * 60)
 
-            for mode_name, output_dir in [
-                ("Full Field", "./output/full_HDF"),
-                ("Chip3", "./output/chip3_HDF")
-            ]:
-                # All types combined plots
-                generate_binning_plot(data_dir=output_dir,
-                    output_path=f"{output_dir}/binning_comparison.pdf",
-                    dataset_name=mode_name, apply_z_filter=False)
-                generate_overlay_plot(data_dir=output_dir,
-                    output_path=f"{output_dir}/binning_overlay.pdf",
-                    dataset_name=mode_name, apply_z_filter=False)
+        for mode_name, output_dir in [
+            ("Full Field", "./output/full_HDF"),
+            ("Chip3", "./output/chip3_HDF")
+        ]:
+            # All types combined plots
+            generate_binning_plot(data_dir=output_dir,
+                output_path=f"{output_dir}/binning_comparison.pdf",
+                dataset_name=mode_name)
+            generate_overlay_plot(data_dir=output_dir,
+                output_path=f"{output_dir}/binning_overlay.pdf",
+                dataset_name=mode_name)
 
-                # Angular size vs redshift (main science plot)
-                generate_angular_size_plot(data_dir=output_dir,
-                    output_path=f"{output_dir}/angular_size_vs_redshift.pdf",
-                    dataset_name=mode_name, apply_z_filter=False)
+            # Angular size vs redshift (main science plot)
+            generate_angular_size_plot(data_dir=output_dir,
+                output_path=f"{output_dir}/angular_size_vs_redshift.pdf",
+                dataset_name=mode_name)
 
-                # Redshift distribution histograms
-                generate_redshift_histogram(data_dir=output_dir,
-                    output_path=f"{output_dir}/redshift_histogram.pdf",
-                    dataset_name=mode_name, apply_z_filter=False)
+            # Redshift distribution histograms
+            generate_redshift_histogram(data_dir=output_dir,
+                output_path=f"{output_dir}/redshift_histogram.pdf",
+                dataset_name=mode_name)
 
-                # Galaxy type histograms
-                generate_galaxy_type_histogram(data_dir=output_dir,
-                    output_path=f"{output_dir}/galaxy_types.pdf",
-                    dataset_name=mode_name, apply_z_filter=False)
+            # Galaxy type histograms
+            generate_galaxy_type_histogram(data_dir=output_dir,
+                output_path=f"{output_dir}/galaxy_types.pdf",
+                dataset_name=mode_name)
 
-                # Per-galaxy-type analysis
-                print(f"\n--- Per-Galaxy-Type Analysis ({mode_name}) ---")
-                catalog_path = f"{output_dir}/galaxy_catalog.csv"
-                if os.path.exists(catalog_path):
-                    type_catalog = pd.read_csv(catalog_path)
-                    type_catalog = type_catalog.dropna(subset=["redshift", "r_half_arcsec", "r_half_arcsec_error"])
-                    type_catalog = type_catalog[np.isfinite(type_catalog["r_half_arcsec_error"])]
+            # Per-galaxy-type analysis
+            print(f"\n--- Per-Galaxy-Type Analysis ({mode_name}) ---")
+            catalog_path = f"{output_dir}/galaxy_catalog.csv"
+            if os.path.exists(catalog_path):
+                type_catalog = pd.read_csv(catalog_path)
+                type_catalog = type_catalog.dropna(subset=["redshift", "r_half_arcsec", "r_half_arcsec_error"])
+                type_catalog = type_catalog[np.isfinite(type_catalog["r_half_arcsec_error"])]
 
-                    valid_types = get_types_with_enough_statistics(type_catalog)
-                    print(f"  Galaxy types with N >= {MIN_GALAXIES_PER_TYPE}: {valid_types}")
-                    if len(valid_types) > 0:
-                        generate_size_distribution_by_type(output_dir, output_dir, mode_name)
-                        generate_type_comparison_overlay(output_dir, output_dir, mode_name)
-                        print(f"  Generating individual θ(z) fits for {len(valid_types)} types...")
-                        for gtype in valid_types:
-                            generate_per_type_fit_plot(output_dir, output_dir, mode_name, gtype)
-                    else:
-                        print("  No galaxy types have enough statistics for per-type analysis.")
+                valid_types = get_types_with_enough_statistics(type_catalog)
+                print(f"  Galaxy types with N >= {MIN_GALAXIES_PER_TYPE}: {valid_types}")
+                if len(valid_types) > 0:
+                    generate_size_distribution_by_type(output_dir, output_dir, mode_name)
+                    generate_type_comparison_overlay(output_dir, output_dir, mode_name)
+                    print(f"  Generating individual θ(z) fits for {len(valid_types)} types...")
+                    for gtype in valid_types:
+                        generate_per_type_fit_plot(output_dir, output_dir, mode_name, gtype)
+                else:
+                    print("  No galaxy types have enough statistics for per-type analysis.")
 
-            print("\nPlots saved to: ./output/full_HDF/ and ./output/chip3_HDF/")
-        except ImportError as e:
-            print(f"\nWarning: Could not generate plots: {e}")
+        print("\nPlots saved to: ./output/full_HDF/ and ./output/chip3_HDF/")
 
     else:
         # Single mode (full or chip3)
@@ -3112,69 +3785,54 @@ Examples:
             run_quality_control(sed_catalog, output_dir, args.qc_reference)
 
         # Generate plots
-        try:
-            from generate_filtered_binning import (
-                MIN_GALAXIES_PER_TYPE,
-                generate_angular_size_plot,
-                generate_binning_plot,
-                generate_galaxy_type_histogram,
-                generate_overlay_plot,
-                generate_per_type_fit_plot,
-                generate_redshift_histogram,
-                generate_size_distribution_by_type,
-                generate_type_comparison_overlay,
-                get_types_with_enough_statistics,
-            )
-            output_dir = f"./output/{args.mode}_HDF"
-            dataset_name = "Full Field" if args.mode == "full" else "Chip3"
-            print("\n" + "=" * 60)
-            print("GENERATING PLOTS")
-            print("=" * 60)
+        output_dir = f"./output/{args.mode}_HDF"
+        dataset_name = "Full Field" if args.mode == "full" else "Chip3"
+        print("\n" + "=" * 60)
+        print("GENERATING PLOTS")
+        print("=" * 60)
 
-            # Binning comparison (all types)
-            generate_binning_plot(data_dir=output_dir,
-                output_path=f"{output_dir}/binning_comparison.pdf",
-                dataset_name=dataset_name, apply_z_filter=False)
+        # Binning comparison (all types)
+        generate_binning_plot(data_dir=output_dir,
+            output_path=f"{output_dir}/binning_comparison.pdf",
+            dataset_name=dataset_name)
 
-            # Overlay (all types)
-            generate_overlay_plot(data_dir=output_dir,
-                output_path=f"{output_dir}/binning_overlay.pdf",
-                dataset_name=dataset_name, apply_z_filter=False)
+        # Overlay (all types)
+        generate_overlay_plot(data_dir=output_dir,
+            output_path=f"{output_dir}/binning_overlay.pdf",
+            dataset_name=dataset_name)
 
-            # Angular size vs redshift (main science plot)
-            generate_angular_size_plot(data_dir=output_dir,
-                output_path=f"{output_dir}/angular_size_vs_redshift.pdf",
-                dataset_name=dataset_name, apply_z_filter=False)
+        # Angular size vs redshift (main science plot)
+        generate_angular_size_plot(data_dir=output_dir,
+            output_path=f"{output_dir}/angular_size_vs_redshift.pdf",
+            dataset_name=dataset_name)
 
-            # Redshift distribution histograms
-            generate_redshift_histogram(data_dir=output_dir,
-                output_path=f"{output_dir}/redshift_histogram.pdf",
-                dataset_name=dataset_name, apply_z_filter=False)
+        # Redshift distribution histograms
+        generate_redshift_histogram(data_dir=output_dir,
+            output_path=f"{output_dir}/redshift_histogram.pdf",
+            dataset_name=dataset_name)
 
-            # Galaxy type histograms
-            generate_galaxy_type_histogram(data_dir=output_dir,
-                output_path=f"{output_dir}/galaxy_types.pdf",
-                dataset_name=dataset_name, apply_z_filter=False)
+        # Galaxy type histograms
+        generate_galaxy_type_histogram(data_dir=output_dir,
+            output_path=f"{output_dir}/galaxy_types.pdf",
+            dataset_name=dataset_name)
 
-            # Per-galaxy-type analysis
-            catalog_path = f"{output_dir}/galaxy_catalog.csv"
-            if os.path.exists(catalog_path):
-                type_catalog = pd.read_csv(catalog_path)
-                type_catalog = type_catalog.dropna(subset=["redshift", "r_half_arcsec", "r_half_arcsec_error"])
-                type_catalog = type_catalog[np.isfinite(type_catalog["r_half_arcsec_error"])]
+        # Per-galaxy-type analysis
+        catalog_path = f"{output_dir}/galaxy_catalog.csv"
+        if os.path.exists(catalog_path):
+            type_catalog = pd.read_csv(catalog_path)
+            type_catalog = type_catalog.dropna(subset=["redshift", "r_half_arcsec", "r_half_arcsec_error"])
+            type_catalog = type_catalog[np.isfinite(type_catalog["r_half_arcsec_error"])]
 
-                print(f"\n--- Per-Galaxy-Type Analysis ({dataset_name}) ---")
-                valid_types = get_types_with_enough_statistics(type_catalog)
-                print(f"  Galaxy types with N >= {MIN_GALAXIES_PER_TYPE}: {valid_types}")
-                if len(valid_types) > 0:
-                    generate_size_distribution_by_type(output_dir, output_dir, dataset_name)
-                    generate_type_comparison_overlay(output_dir, output_dir, dataset_name)
-                    print(f"  Generating individual θ(z) fits for {len(valid_types)} types...")
-                    for gtype in valid_types:
-                        generate_per_type_fit_plot(output_dir, output_dir, dataset_name, gtype)
-                else:
-                    print("  No galaxy types have enough statistics for per-type analysis.")
+            print(f"\n--- Per-Galaxy-Type Analysis ({dataset_name}) ---")
+            valid_types = get_types_with_enough_statistics(type_catalog)
+            print(f"  Galaxy types with N >= {MIN_GALAXIES_PER_TYPE}: {valid_types}")
+            if len(valid_types) > 0:
+                generate_size_distribution_by_type(output_dir, output_dir, dataset_name)
+                generate_type_comparison_overlay(output_dir, output_dir, dataset_name)
+                print(f"  Generating individual θ(z) fits for {len(valid_types)} types...")
+                for gtype in valid_types:
+                    generate_per_type_fit_plot(output_dir, output_dir, dataset_name, gtype)
+            else:
+                print("  No galaxy types have enough statistics for per-type analysis.")
 
-            print(f"\nPlots saved to: {output_dir}/")
-        except ImportError as e:
-            print(f"\nWarning: Could not generate plots: {e}")
+        print(f"\nPlots saved to: {output_dir}/")

@@ -21,24 +21,54 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from numpy.typing import NDArray
 
 # Local imports
 from classify import compute_chi2_flag, compute_odds_flag
-
-# External catalog validation removed
-HAS_EXTERNAL_CATALOGS = False
-ValidationReport = None
+from validation.metrics import cross_match_catalogs
+from validation.zoobot_morphology import ZoobotValidationReport
 
 
-try:
-    from validation.zoobot_morphology import ZoobotValidationReport
-    HAS_ZOOBOT = True
-except ImportError:
-    HAS_ZOOBOT = False
-    ZoobotValidationReport = None
+@dataclass
+class ValidationReport:
+    """Report on external catalog validation.
+
+    Attributes
+    ----------
+    n_matched : int
+        Number of matched sources
+    n_total_ours : int
+        Total sources in our catalog
+    n_total_reference : int
+        Total sources in reference catalog
+    nmad : float
+        Normalized median absolute deviation
+    bias : float
+        Median bias in dz/(1+z)
+    outlier_fraction : float
+        Fraction with |dz/(1+z)| > 0.15
+    catastrophic_fraction : float
+        Fraction with |dz/(1+z)| > 0.5
+    z_ours : NDArray
+        Our redshifts for matched sources
+    z_reference : NDArray
+        Reference redshifts for matched sources
+    separation_arcsec : NDArray
+        Angular separations in arcseconds
+    """
+    n_matched: int
+    n_total_ours: int
+    n_total_reference: int
+    nmad: float
+    bias: float
+    outlier_fraction: float
+    catastrophic_fraction: float
+    z_ours: NDArray | None = None
+    z_reference: NDArray | None = None
+    separation_arcsec: NDArray | None = None
 
 
 # Galaxy types from classify.py
@@ -676,10 +706,6 @@ class QualityControlPipeline:
         ValidationReport or None
             Validation results
         """
-        if not HAS_EXTERNAL_CATALOGS:
-            warnings.warn("External catalogs module not available", stacklevel=2)
-            return None
-
         if reference_catalog is None:
             reference_catalog = self.reference_catalog
 
@@ -884,15 +910,14 @@ class QualityControlPipeline:
             if np.isnan(s_agree):
                 s_agree = 0
 
-            if HAS_ZOOBOT and ZoobotValidationReport is not None:
-                self.report.zoobot_validation = ZoobotValidationReport(
-                    n_compared=int((ell_mask | spi_mask).sum()),
-                    agreement_fraction=(e_agree + s_agree) / 2,
-                    confusion=results['by_type'],
-                    elliptical_agreement=e_agree,
-                    spiral_agreement=s_agree,
-                    starburst_agreement=0.0,
-                )
+            self.report.zoobot_validation = ZoobotValidationReport(
+                n_compared=int((ell_mask | spi_mask).sum()),
+                agreement_fraction=(e_agree + s_agree) / 2,
+                confusion=results['by_type'],
+                elliptical_agreement=e_agree,
+                spiral_agreement=s_agree,
+                starburst_agreement=0.0,
+            )
 
         return results
 
@@ -1123,7 +1148,8 @@ class QualityControlPipeline:
 
             # Check for specific type problems
             for gtype, details in tv.color_disagreements.items():
-                if details.get('disagree_fraction', 0) > 0.5:
+                # Skip error messages (string values) in disagreements dict
+                if isinstance(details, dict) and details.get('disagree_fraction', 0) > 0.5:
                     recs.append(
                         f"Type '{gtype}' has {100*details['disagree_fraction']:.0f}% "
                         "color disagreement - review template or classification threshold"
@@ -1235,12 +1261,6 @@ class QualityControlPipeline:
 
     def _generate_validation_plots(self) -> None:
         """Generate all validation plots."""
-        try:
-            import matplotlib.pyplot as plt
-        except ImportError:
-            warnings.warn("matplotlib not available for plotting", stacklevel=2)
-            return
-
         plot_dir = self.output_dir / 'plots'
         plot_dir.mkdir(exist_ok=True)
 
