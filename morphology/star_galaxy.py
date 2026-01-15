@@ -31,7 +31,13 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 import pandas as pd
+from astroquery.gaia import Gaia
 from numpy.typing import NDArray
+
+from morphology.ml_classifier import (
+    MLStarGalaxyClassifier,
+    extract_features_from_catalog,
+)
 
 if TYPE_CHECKING:
     pass
@@ -39,7 +45,6 @@ if TYPE_CHECKING:
 
 def get_stellarity_index(
     flux_radius: float,
-    peak_flux: float,
     psf_fwhm: float = 2.5,
 ) -> float:
     """Calculate a simple stellarity index.
@@ -51,8 +56,6 @@ def get_stellarity_index(
     ----------
     flux_radius : float
         Source half-light radius in pixels
-    peak_flux : float
-        Peak flux (not used directly but can be for SNR weighting)
     psf_fwhm : float
         PSF FWHM in pixels (default: 2.5 for HST/WFPC2)
 
@@ -197,17 +200,6 @@ def classify_star_galaxy_batch(
     """
     # Handle ML method
     if method == "ml":
-        try:
-            from morphology.ml_classifier import (
-                MLStarGalaxyClassifier,
-                extract_features_from_catalog,
-            )
-        except ImportError as e:
-            raise ImportError(
-                "ML classification requires scikit-learn. "
-                "Install with: pip install scikit-learn joblib"
-            ) from e
-
         if ml_model_path is None:
             raise ValueError("ml_model_path required for method='ml'")
 
@@ -258,14 +250,8 @@ def classify_star_galaxy_batch(
     stellarity_values = np.full(n_sources, np.nan)
     valid_r_half = np.isfinite(r_half_values)
 
-    # Get peak flux values for valid sources
-    y_int = np.clip(y_coords.astype(int), 0, image.shape[0] - 1)
-    x_int = np.clip(x_coords.astype(int), 0, image.shape[1] - 1)
-    peak_flux = image[y_int, x_int]
-
-    # Vectorized stellarity calculation
     stellarity_values[valid_r_half] = np.array([
-        get_stellarity_index(r_half_values[i], peak_flux[i], psf_fwhm)
+        get_stellarity_index(r_half_values[i], psf_fwhm)
         for i in np.where(valid_r_half)[0]
     ])
 
@@ -563,12 +549,6 @@ def query_gaia_for_classification(
     pd.DataFrame
         Gaia catalog with columns needed for classification
     """
-    try:
-        from astroquery.gaia import Gaia
-    except ImportError:
-        print("Warning: astroquery not installed. Install with: pip install astroquery")
-        return pd.DataFrame()
-
     query = f"""
     SELECT
         source_id,

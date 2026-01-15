@@ -18,17 +18,29 @@ Example usage:
     # Classify stars vs galaxies (classical method)
     is_galaxy = classify_star_galaxy(image, catalog)
 
-    # ML-based classification (requires scikit-learn)
-    from morphology import MLStarGalaxyClassifier, HAS_ML_CLASSIFIER
-    if HAS_ML_CLASSIFIER:
-        clf = MLStarGalaxyClassifier.load("model.joblib")
-        results = clf.predict(features)
+    # ML-based classification
+    from morphology import MLStarGalaxyClassifier
+    clf = MLStarGalaxyClassifier.load("model.joblib")
+    results = clf.predict(features)
 """
 
 from morphology.concentration import (
-    calculate_concentration_c,
+    compute_morphology,
+    compute_morphology_batch,
+    compute_morphology_batch_parallel,
     concentration_index,
-    petrosian_radius,
+    concentration_index_batch,
+    concentration_index_batch_parallel,
+    half_light_radius,
+    half_light_radius_batch,
+    half_light_radius_batch_parallel,
+)
+from morphology.ml_classifier import (
+    ClassificationResult,
+    ClassifierMetrics,
+    MLStarGalaxyClassifier,
+    extract_features_from_catalog,
+    extract_features_from_photometry,
 )
 from morphology.sersic_fitting import (
     SersicParams,
@@ -40,43 +52,28 @@ from morphology.star_galaxy import (
     get_stellarity_index,
 )
 
-# ML classifier with graceful fallback if sklearn not available
-try:
-    from morphology.ml_classifier import (
-        HAS_SKLEARN as HAS_ML_CLASSIFIER,
-    )
-    from morphology.ml_classifier import (
-        ClassificationResult,
-        ClassifierMetrics,
-        MLStarGalaxyClassifier,
-        extract_features_from_catalog,
-        extract_features_from_photometry,
-    )
-except ImportError:
-    HAS_ML_CLASSIFIER = False
-    MLStarGalaxyClassifier = None
-    ClassificationResult = None
-    ClassifierMetrics = None
-    extract_features_from_catalog = None
-    extract_features_from_photometry = None
-
 __all__ = [
     # ML star-galaxy classification
-    "HAS_ML_CLASSIFIER",
     "ClassificationResult",
     "ClassifierMetrics",
     "MLStarGalaxyClassifier",
     "SersicParams",
-    "calculate_concentration_c",
     # Classical star-galaxy classification
     "classify_star_galaxy",
     # Concentration and morphology
+    "compute_morphology",
+    "compute_morphology_batch",
+    "compute_morphology_batch_parallel",
     "concentration_index",
+    "concentration_index_batch",
+    "concentration_index_batch_parallel",
+    "half_light_radius",
+    "half_light_radius_batch",
+    "half_light_radius_batch_parallel",
     "extract_features_from_catalog",
     "extract_features_from_photometry",
     "fit_sersic_profile",
     "get_stellarity_index",
     # Sérsic fitting
     "measure_sersic_params",
-    "petrosian_radius",
 ]

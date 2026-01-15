@@ -22,29 +22,22 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import ClassVar
 
+import joblib
 import numpy as np
 import pandas as pd
 from numpy.typing import NDArray
-
-# Optional sklearn import with graceful fallback
-try:
-    import joblib
-    from sklearn.ensemble import RandomForestClassifier
-    from sklearn.metrics import (
-        classification_report,
-        confusion_matrix,
-        roc_auc_score,
-    )
-    from sklearn.model_selection import (
-        StratifiedKFold,
-        cross_val_score,
-        train_test_split,
-    )
-    from sklearn.preprocessing import StandardScaler
-
-    HAS_SKLEARN = True
-except ImportError:
-    HAS_SKLEARN = False
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import (
+    classification_report,
+    confusion_matrix,
+    roc_auc_score,
+)
+from sklearn.model_selection import (
+    StratifiedKFold,
+    cross_val_score,
+    train_test_split,
+)
+from sklearn.preprocessing import StandardScaler
 
 
 @dataclass
@@ -200,12 +193,6 @@ class MLStarGalaxyClassifier:
         n_jobs : int
             Number of parallel jobs, -1 for all cores (default: -1)
         """
-        if not HAS_SKLEARN:
-            raise ImportError(
-                "scikit-learn required for ML classifier. "
-                "Install with: pip install scikit-learn joblib"
-            )
-
         self.model = RandomForestClassifier(
             n_estimators=n_estimators,
             max_depth=max_depth,
@@ -439,11 +426,6 @@ class MLStarGalaxyClassifier:
         MLStarGalaxyClassifier
             Loaded classifier instance
         """
-        if not HAS_SKLEARN:
-            raise ImportError(
-                "scikit-learn required. Install with: pip install scikit-learn joblib"
-            )
-
         path = Path(path)
         data = joblib.load(path)
 

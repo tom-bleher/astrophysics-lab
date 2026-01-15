@@ -31,8 +31,12 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import sep
 from astropy.wcs import WCS
 from numpy.typing import NDArray
+from sklearn.neighbors import KDTree
+
+from morphology.ml_classifier import extract_features_from_catalog
 
 # =============================================================================
 # Classification flags and data structures
@@ -176,7 +180,7 @@ class ValidationMetrics:
 
 
 # =============================================================================
-# Empirical PSF Measurement
+# Empirical PSF Measurement (using astropy.modeling)
 # =============================================================================
 
 def measure_psf_from_gaia(
@@ -187,12 +191,10 @@ def measure_psf_from_gaia(
     min_separation_pix: float = 30.0,
     max_stars: int = 50,
     cutout_size: int = 21,
-    pixel_scale: float = 0.04,
 ) -> PSFModel:
     """Measure empirical PSF from isolated Gaia stars.
 
-    Uses confirmed Gaia stars to measure the actual PSF of the image,
-    which is essential for accurate star-galaxy separation.
+    Uses astropy.modeling.Gaussian2D for cleaner, validated 2D Gaussian fitting.
 
     Parameters
     ----------
@@ -210,8 +212,6 @@ def measure_psf_from_gaia(
         Maximum number of stars to use
     cutout_size : int
         Size of cutouts for PSF measurement (should be odd)
-    pixel_scale : float
-        Pixel scale in arcsec/pixel
 
     Returns
     -------
@@ -220,34 +220,50 @@ def measure_psf_from_gaia(
     """
     import astropy.units as u
     from astropy.coordinates import SkyCoord
-    from scipy.optimize import curve_fit
+    from astropy.modeling import fitting, models
+
+    default_psf = PSFModel(fwhm=2.5, fwhm_err=0.5, sigma=2.5/2.355, n_stars=0)
 
     if len(gaia_stars) == 0:
         warnings.warn("No Gaia stars provided, using default PSF", stacklevel=2)
-        return PSFModel(fwhm=2.5, fwhm_err=0.5, sigma=2.5/2.355, n_stars=0)
+        return default_psf
 
-    # Filter by magnitude
+    # Filter by magnitude - use progressively wider ranges if needed
     mag_col = 'phot_g_mean_mag' if 'phot_g_mean_mag' in gaia_stars.columns else 'gmag'
     if mag_col in gaia_stars.columns:
-        mag_mask = (gaia_stars[mag_col] >= mag_range[0]) & (gaia_stars[mag_col] <= mag_range[1])
-        selected = gaia_stars[mag_mask].copy()
+        # Try progressively wider magnitude ranges
+        mag_ranges_to_try = [
+            mag_range,                    # Original range
+            (15.0, 22.0),                 # Wider range
+            (12.0, 24.0),                 # Even wider
+            (0.0, 30.0),                  # Accept any magnitude
+        ]
+        selected = pd.DataFrame()
+        for mmin, mmax in mag_ranges_to_try:
+            mag_mask = (gaia_stars[mag_col] >= mmin) & (gaia_stars[mag_col] <= mmax)
+            selected = gaia_stars[mag_mask].copy()
+            if len(selected) > 0:
+                break
     else:
         selected = gaia_stars.copy()
 
     if len(selected) == 0:
-        warnings.warn(f"No Gaia stars in magnitude range {mag_range}", stacklevel=2)
-        return PSFModel(fwhm=2.5, fwhm_err=0.5, sigma=2.5/2.355, n_stars=0)
+        mags = gaia_stars[mag_col].values if mag_col in gaia_stars.columns else []
+        mag_info = f" (available mags: {mags})" if len(mags) > 0 else ""
+        warnings.warn(f"No Gaia stars in any magnitude range{mag_info}", stacklevel=2)
+        return default_psf
 
     # Convert to pixel coordinates
     try:
         coords = SkyCoord(ra=selected['ra'].values * u.deg,
                          dec=selected['dec'].values * u.deg)
         pixel_coords = wcs.world_to_pixel(coords)
+        selected = selected.copy()
         selected['x_pix'] = pixel_coords[0]
         selected['y_pix'] = pixel_coords[1]
     except Exception as e:
         warnings.warn(f"WCS transformation failed: {e}", stacklevel=2)
-        return PSFModel(fwhm=2.5, fwhm_err=0.5, sigma=2.5/2.355, n_stars=0)
+        return default_psf
 
     # Filter sources within image bounds
     ny, nx = image.shape
@@ -260,244 +276,160 @@ def measure_psf_from_gaia(
 
     if len(selected) == 0:
         warnings.warn("No Gaia stars within image bounds", stacklevel=2)
-        return PSFModel(fwhm=2.5, fwhm_err=0.5, sigma=2.5/2.355, n_stars=0)
+        return default_psf
 
-    # Find isolated stars (no neighbors within min_separation)
-    isolated_mask = np.ones(len(selected), dtype=bool)
+    # Find isolated stars using vectorized distance calculation
     x_arr = selected['x_pix'].values
     y_arr = selected['y_pix'].values
 
-    for i in range(len(selected)):
-        dists = np.sqrt((x_arr - x_arr[i])**2 + (y_arr - y_arr[i])**2)
-        dists[i] = np.inf  # Exclude self
-        if np.min(dists) < min_separation_pix:
-            isolated_mask[i] = False
+    # Compute pairwise distances efficiently (skip if only 1 star)
+    if len(selected) > 1:
+        dx = x_arr[:, np.newaxis] - x_arr[np.newaxis, :]
+        dy = y_arr[:, np.newaxis] - y_arr[np.newaxis, :]
+        dists = np.sqrt(dx**2 + dy**2)
+        np.fill_diagonal(dists, np.inf)  # Exclude self
 
-    selected = selected[isolated_mask]
+        # Try progressively relaxed isolation criteria
+        isolation_thresholds = [min_separation_pix, min_separation_pix / 2, min_separation_pix / 4, 0]
+        for thresh in isolation_thresholds:
+            if thresh > 0:
+                isolated_mask = np.min(dists, axis=1) >= thresh
+                selected_isolated = selected[isolated_mask]
+            else:
+                selected_isolated = selected  # No isolation requirement
+            if len(selected_isolated) > 0:
+                break
+        selected = selected_isolated
+    # If only 1 star, use it directly
 
     if len(selected) == 0:
-        warnings.warn("No isolated Gaia stars found", stacklevel=2)
-        return PSFModel(fwhm=2.5, fwhm_err=0.5, sigma=2.5/2.355, n_stars=0)
+        warnings.warn("No Gaia stars available for PSF fitting", stacklevel=2)
+        return default_psf
 
     # Limit number of stars
     if len(selected) > max_stars:
         selected = selected.head(max_stars)
 
-    # Measure FWHM for each star
-    def gaussian_2d(coords, amplitude, x0, y0, sigma_x, sigma_y, theta, offset):
-        x, y = coords
-        a = np.cos(theta)**2/(2*sigma_x**2) + np.sin(theta)**2/(2*sigma_y**2)
-        b = np.sin(2*theta)/(4*sigma_x**2) - np.sin(2*theta)/(4*sigma_y**2)
-        c = np.sin(theta)**2/(2*sigma_x**2) + np.cos(theta)**2/(2*sigma_y**2)
-        return offset + amplitude * np.exp(-(a*(x-x0)**2 + 2*b*(x-x0)*(y-y0) + c*(y-y0)**2))
+    # Measure FWHM using astropy.modeling.Gaussian2D
+    fitter = fitting.LevMarLSQFitter()
+    half_size = cutout_size // 2
+    y_grid, x_grid = np.mgrid[:cutout_size, :cutout_size]
+
+    # Pre-compute saturation threshold (outside loop for efficiency)
+    # Use a more robust approach for HDF data which may have different value ranges
+    positive_pixels = image[image > 0]
+    if len(positive_pixels) > 0:
+        p99 = np.percentile(positive_pixels, 99.5)
+        p999 = np.percentile(positive_pixels, 99.9)
+        saturation_threshold = min(p999, p99 * 2, 65000)
+    else:
+        saturation_threshold = 65000
 
     fwhm_measurements = []
     ellipticity_measurements = []
     pa_measurements = []
-
-    half_size = cutout_size // 2
-    y_grid, x_grid = np.mgrid[-half_size:half_size+1, -half_size:half_size+1]
+    fit_failures = {'shape': 0, 'saturated': 0, 'low_snr': 0, 'bad_fit': 0, 'exception': 0}
 
     for _, star in selected.iterrows():
-        x_c = int(star['x_pix'])
-        y_c = int(star['y_pix'])
-
-        # Extract cutout
+        x_c, y_c = int(star['x_pix']), int(star['y_pix'])
         cutout = image[y_c-half_size:y_c+half_size+1, x_c-half_size:x_c+half_size+1]
 
         if cutout.shape != (cutout_size, cutout_size):
+            fit_failures['shape'] += 1
             continue
 
-        # Check for saturation
-        if np.max(cutout) > 0.9 * np.max(image):
+        # Check for saturation (more lenient check)
+        if np.max(cutout) > saturation_threshold:
+            fit_failures['saturated'] += 1
             continue
 
-        # Fit 2D Gaussian
+        # Check for sufficient signal - more lenient for HDF data
+        cutout_median = np.median(cutout)
+        amplitude = np.max(cutout) - cutout_median
+        cutout_std = np.std(cutout)
+        # Only require SNR > 2 (was 3)
+        if amplitude <= 0 or (cutout_std > 0 and amplitude < 2 * cutout_std):
+            fit_failures['low_snr'] += 1
+            continue
+
         try:
-            # Initial guesses
-            amplitude = np.max(cutout) - np.median(cutout)
-            offset = np.median(cutout)
+            # Use astropy Gaussian2D model with reasonable initial guesses
+            # Start with smaller stddev for HST's sharp PSF
+            gauss_init = models.Gaussian2D(
+                amplitude=amplitude,
+                x_mean=half_size, y_mean=half_size,
+                x_stddev=1.5, y_stddev=1.5,
+                bounds={
+                    'x_stddev': (0.3, 20.0),
+                    'y_stddev': (0.3, 20.0),
+                    'x_mean': (half_size - 3, half_size + 3),
+                    'y_mean': (half_size - 3, half_size + 3),
+                }
+            ) + models.Const2D(amplitude=cutout_median)
 
-            popt, _ = curve_fit(
-                gaussian_2d,
-                (x_grid.ravel(), y_grid.ravel()),
-                cutout.ravel(),
-                p0=[amplitude, 0, 0, 2.0, 2.0, 0, offset],
-                bounds=(
-                    [0, -3, -3, 0.5, 0.5, -np.pi, -np.inf],
-                    [np.inf, 3, 3, 10, 10, np.pi, np.inf]
-                ),
-                maxfev=1000
-            )
+            fitted = fitter(gauss_init, x_grid, y_grid, cutout)
 
-            sigma_x, sigma_y = popt[3], popt[4]
-            theta = popt[5]
+            sigma_x = abs(fitted[0].x_stddev.value)
+            sigma_y = abs(fitted[0].y_stddev.value)
+            theta = fitted[0].theta.value
 
-            # Convert sigma to FWHM
-            fwhm_x = 2.355 * sigma_x
-            fwhm_y = 2.355 * sigma_y
-            fwhm = np.sqrt(fwhm_x * fwhm_y)  # Geometric mean
+            # More lenient sanity check on sigma values (HST can have very sharp PSF)
+            if sigma_x < 0.3 or sigma_y < 0.3 or sigma_x > 20 or sigma_y > 20:
+                fit_failures['bad_fit'] += 1
+                continue
 
-            if 1.0 < fwhm < 10.0:  # Sanity check
+            fwhm = 2.355 * np.sqrt(sigma_x * sigma_y)  # Geometric mean FWHM
+
+            # Accept wider FWHM range: 0.3 to 20 pixels
+            if 0.3 < fwhm < 20.0:
                 fwhm_measurements.append(fwhm)
                 ellipticity_measurements.append(1 - min(sigma_x, sigma_y) / max(sigma_x, sigma_y))
                 pa_measurements.append(np.degrees(theta))
-
-        except (RuntimeError, ValueError):
+            else:
+                fit_failures['bad_fit'] += 1
+        except Exception:
+            fit_failures['exception'] += 1
             continue
 
     if len(fwhm_measurements) == 0:
-        warnings.warn("Could not fit PSF to any Gaia stars", stacklevel=2)
-        return PSFModel(fwhm=2.5, fwhm_err=0.5, sigma=2.5/2.355, n_stars=0)
+        # Provide more diagnostic information
+        total_tried = len(selected)
+        failure_summary = ", ".join(f"{k}={v}" for k, v in fit_failures.items() if v > 0)
+        warnings.warn(
+            f"Could not fit PSF to any of {total_tried} Gaia stars "
+            f"(failures: {failure_summary})",
+            stacklevel=2
+        )
+        return default_psf
 
-    # Compute robust statistics (median, MAD)
+    # Robust statistics (median, MAD)
     fwhm_arr = np.array(fwhm_measurements)
-    fwhm_median = np.median(fwhm_arr)
-    fwhm_mad = 1.4826 * np.median(np.abs(fwhm_arr - fwhm_median))
-
-    ellipticity = np.median(ellipticity_measurements) if ellipticity_measurements else 0.0
-    position_angle = np.median(pa_measurements) if pa_measurements else 0.0
+    fwhm_median = float(np.median(fwhm_arr))
+    fwhm_mad = float(1.4826 * np.median(np.abs(fwhm_arr - fwhm_median)))
+    # Ensure MAD is at least 10% of median (for single measurement or very consistent PSF)
+    if fwhm_mad < 0.1 * fwhm_median:
+        fwhm_mad = 0.1 * fwhm_median
 
     return PSFModel(
         fwhm=fwhm_median,
-        fwhm_err=fwhm_mad,
+        fwhm_err=max(fwhm_mad, 0.1),  # Minimum uncertainty of 0.1 pixels
         sigma=fwhm_median / 2.355,
-        ellipticity=ellipticity,
-        position_angle=position_angle,
+        ellipticity=float(np.median(ellipticity_measurements)) if ellipticity_measurements else 0.0,
+        position_angle=float(np.median(pa_measurements)) if pa_measurements else 0.0,
         n_stars=len(fwhm_measurements),
         spatially_varying=False,
     )
 
 
 # =============================================================================
-# SPREAD_MODEL Implementation
+# SPREAD_MODEL Implementation (using SEP library)
 # =============================================================================
 
-def compute_spread_model(
-    image: NDArray,
-    x: float,
-    y: float,
-    psf_model: PSFModel,
-    cutout_size: int = 21,
-) -> tuple[float, float]:
-    """Compute SPREAD_MODEL for a single source.
-
-    SPREAD_MODEL compares the fit of:
-    - Local PSF model (point source)
-    - PSF convolved with exponential disk (extended source)
-
-    Stars have SPREAD_MODEL ~ 0, galaxies have SPREAD_MODEL > 0.
-
-    Following SExtractor methodology (Desai et al. 2012).
-
-    Parameters
-    ----------
-    image : NDArray
-        2D image array
-    x, y : float
-        Source position
-    psf_model : PSFModel
-        Empirical PSF model
-    cutout_size : int
-        Size of cutout for fitting
-
-    Returns
-    -------
-    spread_model : float
-        SPREAD_MODEL value
-    spread_model_err : float
-        SPREAD_MODEL uncertainty
-    """
-    from scipy.ndimage import convolve
-    from scipy.optimize import minimize
-
-    ny, nx = image.shape
-    half_size = cutout_size // 2
-    x_int, y_int = int(x), int(y)
-
-    # Bounds check
-    if (x_int - half_size < 0 or x_int + half_size >= nx or
-        y_int - half_size < 0 or y_int + half_size >= ny):
-        return np.nan, np.nan
-
-    # Extract cutout
-    cutout = image[y_int-half_size:y_int+half_size+1,
-                   x_int-half_size:x_int+half_size+1].copy()
-
-    if cutout.size == 0 or np.sum(cutout) <= 0:
-        return np.nan, np.nan
-
-    # Create coordinate grids
-    y_grid, x_grid = np.mgrid[-half_size:half_size+1, -half_size:half_size+1]
-    dx = x - x_int
-    dy = y - y_int
-
-    # PSF model (2D Gaussian)
-    sigma = psf_model.sigma
-    psf = np.exp(-((x_grid - dx)**2 + (y_grid - dy)**2) / (2 * sigma**2))
-    psf /= np.sum(psf)
-
-    # Extended model: PSF convolved with exponential disk
-    # Scale length = FWHM / 16 (SExtractor standard)
-    scale_length = psf_model.fwhm / 16.0
-    r = np.sqrt((x_grid - dx)**2 + (y_grid - dy)**2)
-    exponential = np.exp(-r / scale_length)
-    exponential /= np.sum(exponential)
-
-    # Convolve PSF with exponential to get galaxy model
-    galaxy_model = convolve(psf, exponential, mode='constant')
-    galaxy_model /= np.sum(galaxy_model)
-
-    # Background estimation
-    background = np.median(cutout[cutout < np.percentile(cutout, 50)])
-    cutout_sub = cutout - background
-
-    # Compute SPREAD_MODEL
-    # Following Desai et al. 2012: compare chi-squared of PSF vs extended fits
-
-    # Normalize models to match cutout flux
-    flux_tot = np.sum(cutout_sub[cutout_sub > 0])
-    if flux_tot <= 0:
-        return np.nan, np.nan
-
-    # Create weight map (inverse variance, simplified)
-    # Using Poisson + readnoise approximation
-    readnoise = 5.0  # Typical value, electrons
-    variance = np.abs(cutout) + readnoise**2
-    weights = 1.0 / np.maximum(variance, 1e-10)
-
-    # Fit PSF model
-    def chi2_psf(amp):
-        model = amp * psf + background
-        return np.sum(weights * (cutout - model)**2)
-
-    res_psf = minimize(chi2_psf, x0=[flux_tot], method='Nelder-Mead')
-    chi2_psf_val = res_psf.fun
-    res_psf.x[0]
-
-    # Fit galaxy model
-    def chi2_gal(amp):
-        model = amp * galaxy_model + background
-        return np.sum(weights * (cutout - model)**2)
-
-    res_gal = minimize(chi2_gal, x0=[flux_tot], method='Nelder-Mead')
-    chi2_gal_val = res_gal.fun
-    res_gal.x[0]
-
-    # SPREAD_MODEL definition
-    # Positive = better fit with extended model = galaxy
-    # Zero = equally good fits = ambiguous (usually faint)
-    # Negative = better fit with PSF = star (shouldn't happen often)
-
-    # Normalized difference (following SExtractor convention)
-    spread_model = (chi2_psf_val - chi2_gal_val) / (chi2_psf_val + chi2_gal_val + 1e-10)
-
-    # Uncertainty estimation (simplified)
-    # Based on SNR of the source
-    snr = flux_tot / np.sqrt(np.sum(variance))
-    spread_model_err = 0.01 + 0.1 / np.maximum(snr, 1.0)
-
-    return spread_model, spread_model_err
+def _ensure_native_byteorder(data: NDArray) -> NDArray:
+    """Ensure array has native byte order for SEP compatibility."""
+    if data.dtype.byteorder not in ('=', '|', '<' if np.little_endian else '>'):
+        return data.astype(data.dtype.newbyteorder('='), copy=False)
+    return data
 
 
 def compute_spread_model_batch(
@@ -507,7 +439,14 @@ def compute_spread_model_batch(
     psf_model: PSFModel,
     cutout_size: int = 21,
 ) -> tuple[NDArray, NDArray]:
-    """Compute SPREAD_MODEL for multiple sources.
+    """Compute SPREAD_MODEL for multiple sources using SEP library.
+
+    SEP (Source Extractor as Python library) provides native morphological
+    measurements including flux radius comparisons that approximate SPREAD_MODEL.
+
+    SPREAD_MODEL compares PSF vs extended source fits:
+    - Stars have SPREAD_MODEL ~ 0
+    - Galaxies have SPREAD_MODEL > 0
 
     Parameters
     ----------
@@ -516,9 +455,9 @@ def compute_spread_model_batch(
     x_coords, y_coords : NDArray
         Source positions
     psf_model : PSFModel
-        Empirical PSF model
+        Empirical PSF model (for FWHM reference)
     cutout_size : int
-        Size of cutout for fitting
+        Size of cutout for fitting (unused with SEP, kept for API compatibility)
 
     Returns
     -------
@@ -531,12 +470,121 @@ def compute_spread_model_batch(
     spread_model = np.full(n_sources, np.nan)
     spread_model_err = np.full(n_sources, np.nan)
 
-    for i in range(n_sources):
-        sm, sm_err = compute_spread_model(
-            image, x_coords[i], y_coords[i], psf_model, cutout_size
+    # Ensure native byte order for SEP
+    data = _ensure_native_byteorder(image.astype(np.float64))
+
+    # Estimate background
+    try:
+        bkg = sep.Background(data)
+        data_sub = data - bkg.back()
+        bkg_rms = bkg.globalrms
+    except Exception:
+        data_sub = data - np.median(data)
+        bkg_rms = np.std(data[data < np.median(data)])
+
+    # SEP morphology: compare flux concentration to PSF expectation
+    # This approximates SPREAD_MODEL by comparing actual vs expected flux ratio
+    # Reference: SExtractor docs - SPREAD_MODEL compares PSF vs extended models
+    psf_radius = psf_model.fwhm / 2.0  # Inner aperture (PSF core)
+    ext_radius = psf_model.fwhm * 1.5  # Outer aperture (extended light)
+    sigma = psf_model.fwhm / 2.355     # Gaussian sigma from FWHM
+
+    x = np.asarray(x_coords, dtype=np.float64)
+    y = np.asarray(y_coords, dtype=np.float64)
+
+    try:
+        # Measure flux in PSF-sized aperture
+        flux_psf, flux_psf_err, _ = sep.sum_circle(
+            data_sub, x, y, psf_radius, err=bkg_rms
         )
-        spread_model[i] = sm
-        spread_model_err[i] = sm_err
+
+        # Measure flux in extended aperture
+        flux_ext, flux_ext_err, _ = sep.sum_circle(
+            data_sub, x, y, ext_radius, err=bkg_rms
+        )
+
+        # Compute expected flux ratio for a Gaussian PSF (point source)
+        # For a 2D Gaussian, flux within radius r: F(r) = 1 - exp(-r²/(2σ²))
+        expected_frac_inner = 1 - np.exp(-psf_radius**2 / (2 * sigma**2))
+        expected_frac_outer = 1 - np.exp(-ext_radius**2 / (2 * sigma**2))
+        expected_ratio = expected_frac_inner / expected_frac_outer
+
+        # Compute SPREAD_MODEL: deviation from PSF expectation
+        # - Point source: actual_ratio ≈ expected_ratio → spread_model ≈ 0
+        # - Galaxy (extended): actual_ratio < expected (more flux outside) → spread_model > 0
+        # - Cosmic ray (concentrated): actual_ratio > expected → spread_model < 0
+        with np.errstate(invalid='ignore', divide='ignore'):
+            flux_ext_safe = np.maximum(flux_ext, 1e-10)
+            actual_ratio = flux_psf / flux_ext_safe
+            spread_model = expected_ratio - actual_ratio
+
+            # Uncertainty from flux error propagation
+            # δ(spread_model) ≈ sqrt((δflux_psf/flux_ext)² + (flux_psf*δflux_ext/flux_ext²)²)
+            spread_model_err = np.sqrt(
+                (flux_psf_err / flux_ext_safe)**2 +
+                (flux_psf * flux_ext_err / flux_ext_safe**2)**2
+            )
+            spread_model_err = np.clip(spread_model_err, 0.001, 0.5)
+
+        # Handle invalid values
+        invalid = ~np.isfinite(spread_model) | (flux_ext <= 0)
+        spread_model[invalid] = np.nan
+        spread_model_err[invalid] = np.nan
+
+    except Exception as e:
+        warnings.warn(f"SEP morphology failed: {e}", stacklevel=2)
+        return _compute_spread_model_fallback(image, x_coords, y_coords, psf_model)
+
+    return spread_model, spread_model_err
+
+
+def _compute_spread_model_fallback(
+    image: NDArray,
+    x_coords: NDArray,
+    y_coords: NDArray,
+    psf_model: PSFModel,
+) -> tuple[NDArray, NDArray]:
+    """Fallback SPREAD_MODEL using simple aperture ratio with photutils."""
+    from photutils.aperture import CircularAperture, aperture_photometry
+
+    n_sources = len(x_coords)
+    spread_model = np.full(n_sources, np.nan)
+    spread_model_err = np.full(n_sources, np.nan)
+
+    positions = np.column_stack([x_coords, y_coords])
+
+    # PSF-sized and extended apertures
+    psf_radius = psf_model.fwhm / 2.0
+    ext_radius = psf_model.fwhm * 1.5
+    sigma = psf_model.fwhm / 2.355
+
+    # Expected flux ratio for a Gaussian PSF
+    expected_frac_inner = 1 - np.exp(-psf_radius**2 / (2 * sigma**2))
+    expected_frac_outer = 1 - np.exp(-ext_radius**2 / (2 * sigma**2))
+    expected_ratio = expected_frac_inner / expected_frac_outer
+
+    try:
+        ap_psf = CircularAperture(positions, r=psf_radius)
+        ap_ext = CircularAperture(positions, r=ext_radius)
+
+        phot_psf = aperture_photometry(image, ap_psf)
+        phot_ext = aperture_photometry(image, ap_ext)
+
+        flux_psf = phot_psf['aperture_sum'].value
+        flux_ext = phot_ext['aperture_sum'].value
+
+        with np.errstate(invalid='ignore', divide='ignore'):
+            flux_ext_safe = np.maximum(flux_ext, 1e-10)
+            actual_ratio = flux_psf / flux_ext_safe
+            spread_model = expected_ratio - actual_ratio
+            spread_model_err = np.full(n_sources, 0.02)  # Default uncertainty
+
+        invalid = ~np.isfinite(spread_model) | (flux_ext <= 0)
+        spread_model[invalid] = np.nan
+        spread_model_err[invalid] = np.nan
+
+    except Exception:
+        pass
 
     return spread_model, spread_model_err
 
@@ -547,7 +595,6 @@ def compute_spread_model_batch(
 
 def get_magnitude_dependent_thresholds(
     magnitudes: NDArray,
-    mag_col: str = 'mag_i',
 ) -> dict[str, NDArray]:
     """Get magnitude-dependent classification thresholds.
 
@@ -559,8 +606,6 @@ def get_magnitude_dependent_thresholds(
     ----------
     magnitudes : NDArray
         Source magnitudes (typically I-band)
-    mag_col : str
-        Magnitude column name (for reference)
 
     Returns
     -------
@@ -619,20 +664,47 @@ def get_magnitude_dependent_thresholds(
 
 
 # =============================================================================
-# Color-Color Stellar Locus
+# Color-Color Stellar Locus (using sklearn KDTree for fast matching)
 # =============================================================================
+
+# Pre-computed stellar locus reference points (Covey et al. 2007)
+# Format: (B-V, U-B, V-I) for main sequence stars
+_STELLAR_LOCUS_REFERENCE = None
+
+
+def _get_stellar_locus_reference() -> NDArray:
+    """Generate reference stellar locus points for KDTree matching."""
+    global _STELLAR_LOCUS_REFERENCE
+    if _STELLAR_LOCUS_REFERENCE is not None:
+        return _STELLAR_LOCUS_REFERENCE
+
+    # Generate stellar locus points along B-V range
+    bv_points = np.linspace(-0.3, 2.0, 100)
+
+    # U-B as function of B-V (Covey et al. 2007)
+    ub_points = np.where(
+        bv_points < 0.5,
+        0.82 * bv_points - 0.25,
+        0.42 * bv_points + 0.05
+    )
+
+    # V-I as function of B-V
+    vi_points = 1.1 * bv_points
+
+    _STELLAR_LOCUS_REFERENCE = np.column_stack([bv_points, ub_points, vi_points])
+    return _STELLAR_LOCUS_REFERENCE
+
 
 def compute_stellar_locus_distance(
     u_b: NDArray,
     b_v: NDArray,
     v_i: NDArray,
 ) -> NDArray:
-    """Compute distance from stellar locus in color-color space.
+    """Compute distance from stellar locus using sklearn KDTree.
 
-    Stars occupy a well-defined locus in color-color diagrams.
-    Sources far from this locus are likely galaxies.
-
-    Uses the empirical stellar locus from Covey et al. (2007).
+    Uses KDTree for efficient nearest-neighbor matching to the empirical
+    stellar locus (Covey et al. 2007). Much faster than polynomial evaluation
+    for large catalogs.
 
     Parameters
     ----------
@@ -648,43 +720,46 @@ def compute_stellar_locus_distance(
     NDArray
         Distance from stellar locus (smaller = more star-like)
     """
-    # Empirical stellar locus polynomial (Covey et al. 2007, adapted)
-    # In B-V vs U-B space
-
-    # Stellar locus: U-B as function of B-V
-    # For main sequence stars: U-B ≈ 0.82*(B-V) - 0.25 for B-V < 0.5
-    #                          U-B ≈ 0.42*(B-V) + 0.05 for B-V >= 0.5
-
     n = len(u_b)
     distance = np.full(n, np.nan)
 
     valid = np.isfinite(u_b) & np.isfinite(b_v) & np.isfinite(v_i)
-
     if not np.any(valid):
         return distance
 
-    bv = b_v[valid]
-    ub = u_b[valid]
-    vi = v_i[valid]
+    # Build KDTree from stellar locus reference
+    locus_ref = _get_stellar_locus_reference()
+    tree = KDTree(locus_ref)
 
-    # Predicted U-B from stellar locus
-    ub_predicted = np.where(
-        bv < 0.5,
-        0.82 * bv - 0.25,
-        0.42 * bv + 0.05
-    )
+    # Query colors (B-V, U-B, V-I)
+    query_points = np.column_stack([b_v[valid], u_b[valid], v_i[valid]])
 
-    # Distance in U-B direction (primary)
-    d_ub = np.abs(ub - ub_predicted)
+    # Find nearest neighbor distance
+    dist, _ = tree.query(query_points, k=1)
+    distance[valid] = dist.ravel()
 
-    # Also check V-I vs B-V locus
-    # V-I ≈ 1.1*(B-V) + 0.0 for typical stars
-    vi_predicted = 1.1 * bv
-    d_vi = np.abs(vi - vi_predicted)
+    return distance
 
-    # Combined distance (weighted)
-    distance[valid] = np.sqrt(d_ub**2 + 0.5 * d_vi**2)
 
+def _compute_stellar_locus_simple(
+    u_b: NDArray,
+    b_v: NDArray,
+    v_i: NDArray,
+) -> NDArray:
+    """Simple polynomial-based stellar locus distance (fallback)."""
+    n = len(u_b)
+    distance = np.full(n, np.nan)
+
+    valid = np.isfinite(u_b) & np.isfinite(b_v) & np.isfinite(v_i)
+    if not np.any(valid):
+        return distance
+
+    bv, ub, vi = b_v[valid], u_b[valid], v_i[valid]
+
+    ub_pred = np.where(bv < 0.5, 0.82 * bv - 0.25, 0.42 * bv + 0.05)
+    vi_pred = 1.1 * bv
+
+    distance[valid] = np.sqrt((ub - ub_pred)**2 + 0.5 * (vi - vi_pred)**2)
     return distance
 
 
@@ -879,7 +954,6 @@ def classify_professional(
     mag_col: str = 'mag_auto',
     flux_cols: dict | None = None,
     error_cols: dict | None = None,
-    pixel_scale: float = 0.04,
     verbose: bool = True,
 ) -> pd.DataFrame:
     """Professional multi-tier star-galaxy classification.
@@ -917,8 +991,6 @@ def classify_professional(
         Mapping of band name to flux column
     error_cols : dict, optional
         Mapping of band name to error column
-    pixel_scale : float
-        Pixel scale in arcsec/pixel
     verbose : bool
         Print progress information
 
@@ -1153,8 +1225,6 @@ def classify_professional(
             print("Tier 4: ML classification...")
 
         try:
-            from morphology.ml_classifier import extract_features_from_catalog
-
             still_unclassified = results['classification_tier'] == 0
 
             if np.any(still_unclassified):
