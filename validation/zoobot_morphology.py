@@ -23,31 +23,15 @@ Installation:
 """
 
 import contextlib
-import warnings
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
-
-try:
-    from PIL import Image
-    HAS_PIL = True
-except ImportError:
-    HAS_PIL = False
-
-# Check for Zoobot availability
-try:
-    import torch
-    from zoobot.pytorch.predictions import predict_on_catalog
-    from zoobot.pytorch.training import finetune
-    HAS_ZOOBOT = True
-except ImportError:
-    HAS_ZOOBOT = False
-    warnings.warn(
-        "Zoobot not installed. Install with: pip install zoobot[pytorch]\n"
-        "For GPU support, ensure CUDA is installed first.", stacklevel=2
-    )
+import torch
+from PIL import Image
+from zoobot.pytorch.predictions import predict_on_catalog
+from zoobot.pytorch.training import finetune
 
 
 @dataclass
@@ -171,7 +155,7 @@ def extract_cutouts(
 
         # Save as PNG if requested
         file_path = None
-        if output_dir and HAS_PIL:
+        if output_dir:
             file_path = output_dir / f"galaxy_{idx:05d}.png"
             save_cutout_as_png(cutout, file_path)
 
@@ -216,10 +200,6 @@ def asinh_stretch(data: np.ndarray, scale: float = 0.1) -> np.ndarray:
 
 def save_cutout_as_png(cutout: np.ndarray, path: Path):
     """Save a cutout as a PNG image for Zoobot."""
-    if not HAS_PIL:
-        warnings.warn("PIL not installed. Cannot save PNG cutouts.", stacklevel=2)
-        return
-
     # Convert to RGB (Zoobot expects 3-channel images)
     rgb = np.stack([cutout, cutout, cutout], axis=-1) if cutout.ndim == 2 else cutout
 
@@ -252,11 +232,6 @@ def run_zoobot_predictions(
     pd.DataFrame
         Predictions with morphology probabilities
     """
-    if not HAS_ZOOBOT:
-        raise ImportError(
-            "Zoobot not installed. Install with: pip install zoobot[pytorch]"
-        )
-
     # Determine device
     if device == 'auto':
         device = 'cuda' if torch.cuda.is_available() else 'cpu'

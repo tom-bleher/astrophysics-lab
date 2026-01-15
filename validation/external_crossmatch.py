@@ -15,28 +15,13 @@ local HDF catalog to:
 2. Validate photometric redshifts against spectroscopic redshifts
 """
 
-import os
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
-
-# Optional imports - graceful fallback if not available
-try:
-    from astropy.coordinates import SkyCoord
-    from astropy import units as u
-    ASTROPY_AVAILABLE = True
-except ImportError:
-    ASTROPY_AVAILABLE = False
-    print("Warning: astropy not available. Cross-matching disabled.")
-
-try:
-    from astroquery.vizier import Vizier
-    ASTROQUERY_AVAILABLE = True
-except ImportError:
-    ASTROQUERY_AVAILABLE = False
-    print("Warning: astroquery not available. VizieR queries disabled.")
-
+from astropy import units as u
+from astropy.coordinates import SkyCoord
+from astroquery.vizier import Vizier
 
 # Constants
 VIZIER_3DHST_CATALOG = "J/ApJS/214/24"  # Skelton et al. 2014
@@ -65,12 +50,8 @@ def download_3dhst_goodsn(
     -------
     pd.DataFrame or None
         Catalog with columns: ra, dec, star_flag, class_star, z_spec, z_peak, use_phot
-        Returns None if download fails or dependencies missing
+        Returns None if download fails
     """
-    if not ASTROQUERY_AVAILABLE or not ASTROPY_AVAILABLE:
-        print("Error: astroquery and astropy required for VizieR queries")
-        print("Install with: pip install astroquery astropy")
-        return None
 
     cache_path = CACHE_DIR / cache_file
 
@@ -167,10 +148,6 @@ def crossmatch_with_3dhst(
         - z_peak_3dhst: EAZY photo-z from 3D-HST
         - sep_3dhst: Separation in arcsec to matched source
     """
-    if not ASTROPY_AVAILABLE:
-        print("Error: astropy required for cross-matching")
-        return catalog
-
     # Download or load 3D-HST catalog
     ref_catalog = download_3dhst_goodsn()
     if ref_catalog is None or len(ref_catalog) == 0:
@@ -438,6 +415,28 @@ def apply_spectroscopic_redshifts(
     # Track which redshifts are spectroscopic
     catalog['z_is_spectroscopic'] = False
     catalog.loc[has_specz, 'z_is_spectroscopic'] = True
+    catalog['has_specz'] = has_specz
+
+    # Update photo-z quality metrics for sources with spec-z
+    # Spectroscopic redshifts are trusted, so set ODDS=1.0 (excellent quality)
+    if 'photo_z_odds' in catalog.columns:
+        catalog.loc[has_specz, 'photo_z_odds'] = 1.0
+
+    # Set redshift errors to near-zero for spec-z (typical spec-z error ~0.001)
+    if 'redshift_err' in catalog.columns:
+        catalog.loc[has_specz, 'redshift_err'] = 0.001
+    if 'redshift_lo' in catalog.columns:
+        catalog.loc[has_specz, 'redshift_lo'] = catalog.loc[has_specz, z_col] - 0.001
+    if 'redshift_hi' in catalog.columns:
+        catalog.loc[has_specz, 'redshift_hi'] = catalog.loc[has_specz, z_col] + 0.001
+
+    # Clear bad photo-z related flags for sources with spec-z
+    if 'bimodal_flag' in catalog.columns:
+        catalog.loc[has_specz, 'bimodal_flag'] = False
+    if 'odds_flag' in catalog.columns:
+        catalog.loc[has_specz, 'odds_flag'] = 0
+    if 'chi2_flag' in catalog.columns:
+        catalog.loc[has_specz, 'chi2_flag'] = 0
 
     # Flag catastrophic outliers
     if flag_catastrophic:
@@ -459,30 +458,6 @@ def apply_spectroscopic_redshifts(
             print(f"    Source {idx}: z_phot={z_old:.2f} -> z_spec={z_new:.2f}")
 
     return catalog
-
-
-def flag_stars_from_3dhst(
-    catalog: pd.DataFrame,
-    match_radius_arcsec: float = 1.0
-) -> pd.DataFrame:
-    """Add star flags based on 3D-HST classification.
-
-    This is the main function to call to improve star classification.
-    It cross-matches with 3D-HST and flags sources they identify as stars.
-
-    Parameters
-    ----------
-    catalog : pd.DataFrame
-        Local catalog
-    match_radius_arcsec : float
-        Match radius in arcseconds
-
-    Returns
-    -------
-    pd.DataFrame
-        Catalog with 'star_3dhst' column added
-    """
-    return crossmatch_with_3dhst(catalog, match_radius_arcsec)
 
 
 # Main execution for testing

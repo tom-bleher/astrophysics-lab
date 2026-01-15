@@ -4,7 +4,7 @@ This module provides standard metrics for evaluating photometric
 redshift accuracy, following conventions from the literature.
 
 Key metrics:
-- NMAD: Normalized Median Absolute Deviation
+- NMAD: Normalized Median Absolute Deviation (via astropy.stats.mad_std)
 - Bias: Systematic offset
 - Outlier fraction: Fraction with |Δz/(1+z)| > threshold
 
@@ -14,7 +14,13 @@ References:
 - Dahlen et al. 2013 (CANDELS photo-z comparison)
 """
 
+from pathlib import Path
+
+import astropy.units as u
 import numpy as np
+import pandas as pd
+from astropy.coordinates import SkyCoord
+from astropy.stats import mad_std, sigma_clipped_stats
 from numpy.typing import ArrayLike
 
 
@@ -58,14 +64,15 @@ def photoz_metrics(
     dz = (z_phot - z_true) / (1 + z_true)
 
     # NMAD: Normalized Median Absolute Deviation
-    # sigma_NMAD = 1.48 * median(|dz - median(dz)|)
-    nmad = 1.48 * np.median(np.abs(dz - np.median(dz)))
+    # Using astropy.stats.mad_std which computes: 1.4826 * median(|x - median(x)|)
+    # This is the standard robust scatter estimator for photo-z literature
+    nmad = mad_std(dz)
 
     # Bias: systematic offset
     bias = np.median(dz)
 
-    # Standard deviation
-    sigma = np.std(dz)
+    # Standard deviation (using sigma-clipped for robustness)
+    _, _, sigma = sigma_clipped_stats(dz, sigma=3.0)
 
     # Outlier fraction
     outlier_mask = np.abs(dz) > outlier_threshold
@@ -460,139 +467,6 @@ def confusion_matrix_star_galaxy(
     }
 
 
-def binned_metrics_2d(
-    z_phot: ArrayLike,
-    z_true: ArrayLike,
-    magnitude: ArrayLike,
-    z_bins: ArrayLike | None = None,
-    mag_bins: ArrayLike | None = None,
-) -> list[dict]:
-    """Compute photo-z metrics in 2D bins of redshift and magnitude.
-
-    This allows assessing photo-z performance as a function of both
-    redshift and brightness simultaneously.
-
-    Parameters
-    ----------
-    z_phot : array-like
-        Photometric redshifts
-    z_true : array-like
-        True redshifts
-    magnitude : array-like
-        Source magnitudes
-    z_bins : array-like, optional
-        Redshift bin edges (default: [0, 0.5, 1.0, 1.5, 2.0, 3.0])
-    mag_bins : array-like, optional
-        Magnitude bin edges (default: [18, 22, 24, 26, 28, 30])
-
-    Returns
-    -------
-    list[dict]
-        List of metrics dictionaries for each 2D bin
-    """
-    z_phot = np.asarray(z_phot)
-    z_true = np.asarray(z_true)
-    magnitude = np.asarray(magnitude)
-
-    z_bins = np.array([0, 0.5, 1.0, 1.5, 2.0, 3.0]) if z_bins is None else np.asarray(z_bins)
-
-    mag_bins = np.array([18, 22, 24, 26, 28, 30]) if mag_bins is None else np.asarray(mag_bins)
-
-    # Filter valid values
-    valid = (
-        (z_phot > 0)
-        & (z_true > 0)
-        & np.isfinite(z_phot)
-        & np.isfinite(z_true)
-        & np.isfinite(magnitude)
-    )
-
-    z_phot = z_phot[valid]
-    z_true = z_true[valid]
-    magnitude = magnitude[valid]
-
-    results = []
-
-    for i in range(len(z_bins) - 1):
-        for j in range(len(mag_bins) - 1):
-            mask = (
-                (z_true >= z_bins[i])
-                & (z_true < z_bins[i + 1])
-                & (magnitude >= mag_bins[j])
-                & (magnitude < mag_bins[j + 1])
-            )
-
-            n = mask.sum()
-            if n < 5:
-                continue
-
-            metrics = photoz_metrics(z_phot[mask], z_true[mask])
-
-            # Add bin information
-            metrics["z_min"] = z_bins[i]
-            metrics["z_max"] = z_bins[i + 1]
-            metrics["z_center"] = (z_bins[i] + z_bins[i + 1]) / 2
-            metrics["mag_min"] = mag_bins[j]
-            metrics["mag_max"] = mag_bins[j + 1]
-            metrics["mag_center"] = (mag_bins[j] + mag_bins[j + 1]) / 2
-            metrics["n_sources"] = n
-
-            results.append(metrics)
-
-    return results
-
-
-def format_confusion_matrix(cm_dict: dict) -> str:
-    """Format confusion matrix for display.
-
-    Parameters
-    ----------
-    cm_dict : dict
-        Output from confusion_matrix_star_galaxy()
-
-    Returns
-    -------
-    str
-        Formatted string representation
-    """
-    cm = cm_dict["confusion_matrix"]
-    labels = cm_dict["labels"]
-
-    lines = [
-        "=" * 60,
-        "Star-Galaxy Classification Confusion Matrix",
-        "=" * 60,
-        "",
-        f"{'':20} Predicted {labels[0]:>10}  Predicted {labels[1]:>10}",
-        f"Actual {labels[0]:>12}     {cm[0,0]:>10}        {cm[0,1]:>10}",
-        f"Actual {labels[1]:>12}     {cm[1,0]:>10}        {cm[1,1]:>10}",
-        "",
-        f"Total samples: {cm_dict['n_total']}",
-        f"True galaxies: {cm_dict['n_galaxies_true']}",
-        f"True stars:    {cm_dict['n_stars_true']}",
-        "",
-        "Performance Metrics:",
-        f"  Accuracy:            {cm_dict['accuracy']:.4f}",
-        "",
-        f"  Galaxy Precision:    {cm_dict['precision_galaxy']:.4f}",
-        f"  Galaxy Recall:       {cm_dict['recall_galaxy']:.4f}",
-        f"  Galaxy F1:           {cm_dict['f1_galaxy']:.4f}",
-        "",
-        f"  Star Precision:      {cm_dict['precision_star']:.4f}",
-        f"  Star Recall:         {cm_dict['recall_star']:.4f}",
-        f"  Star F1:             {cm_dict['f1_star']:.4f}",
-        "",
-        "Contamination & Completeness:",
-        f"  Galaxy sample contamination (stars in galaxy sample): {cm_dict['galaxy_contamination']:.1%}",
-        f"  Star sample contamination (galaxies in star sample):  {cm_dict['star_contamination']:.1%}",
-        f"  Galaxy completeness (recovered fraction):             {cm_dict['galaxy_completeness']:.1%}",
-        f"  Star completeness (recovered fraction):               {cm_dict['star_completeness']:.1%}",
-        "=" * 60,
-    ]
-
-    return "\n".join(lines)
-
-
 def load_fernandez_soto_catalog(
     catalog_path: str = "data/external/fernandez_soto_1999.csv",
 ) -> dict:
@@ -608,9 +482,6 @@ def load_fernandez_soto_catalog(
     dict
         Catalog with RA, Dec, z_spec, z_phot columns
     """
-    import pandas as pd
-    from pathlib import Path
-
     path = Path(catalog_path)
     if not path.exists():
         print(f"Catalog not found: {catalog_path}")
@@ -655,7 +526,10 @@ def cross_match_catalogs(
     dec2: ArrayLike,
     max_sep_arcsec: float = 1.0,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Cross-match two catalogs by position.
+    """Cross-match two catalogs by position using proper spherical matching.
+
+    Uses astropy.coordinates.SkyCoord for accurate great-circle matching,
+    which handles coordinate wrapping and spherical geometry correctly.
 
     Parameters
     ----------
@@ -673,39 +547,26 @@ def cross_match_catalogs(
     sep_arcsec : ndarray
         Separation of each match in arcseconds
     """
-    from scipy.spatial import cKDTree
-
     ra1 = np.asarray(ra1)
     dec1 = np.asarray(dec1)
     ra2 = np.asarray(ra2)
     dec2 = np.asarray(dec2)
 
-    # Convert to Cartesian for faster matching
-    # Approximate flat-sky projection (valid for small fields)
-    cos_dec1 = np.cos(np.radians(dec1))
-    cos_dec2 = np.cos(np.radians(dec2))
+    # Create SkyCoord objects for proper spherical matching
+    coords1 = SkyCoord(ra=ra1 * u.deg, dec=dec1 * u.deg, frame='icrs')
+    coords2 = SkyCoord(ra=ra2 * u.deg, dec=dec2 * u.deg, frame='icrs')
 
-    x1 = ra1 * cos_dec1
-    y1 = dec1
-    x2 = ra2 * cos_dec2
-    y2 = dec2
+    # Use astropy's match_to_catalog_sky for efficient matching
+    idx2, sep2d, _ = coords1.match_to_catalog_sky(coords2)
 
-    # Build KD-tree from second catalog
-    tree = cKDTree(np.column_stack([x2, y2]))
+    # Convert separations to arcseconds
+    sep_arcsec = sep2d.arcsec
 
-    # Query nearest neighbors
-    max_sep_deg = max_sep_arcsec / 3600.0
-    distances, indices = tree.query(
-        np.column_stack([x1, y1]),
-        k=1,
-        distance_upper_bound=max_sep_deg,
-    )
-
-    # Filter valid matches
-    valid = np.isfinite(distances)
+    # Filter by maximum separation
+    valid = sep_arcsec <= max_sep_arcsec
     idx1 = np.where(valid)[0]
-    idx2 = indices[valid]
-    sep_arcsec = distances[valid] * 3600.0
+    idx2 = idx2[valid]
+    sep_arcsec = sep_arcsec[valid]
 
     return idx1, idx2, sep_arcsec
 

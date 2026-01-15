@@ -8,8 +8,14 @@ Reference: Bacon et al. 2017, A&A, 608, A1
 VizieR: J/A+A/608/A1
 """
 
+from pathlib import Path
+
+import astropy.units as u
 import numpy as np
 import pandas as pd
+from astropy.coordinates import SkyCoord, match_coordinates_sky
+from astropy.io import fits
+from astroquery.vizier import Vizier
 
 
 def load_muse_catalog(
@@ -44,12 +50,16 @@ def load_muse_catalog(
     return df
 
 
+def _find_column(colnames: list, candidates: list) -> str | None:
+    """Find first matching column name from candidates."""
+    for col in candidates:
+        if col in colnames:
+            return col
+    return None
+
+
 def _load_muse_local(local_path: str) -> pd.DataFrame:
     """Load MUSE catalog from local FITS file."""
-    from pathlib import Path
-
-    from astropy.io import fits
-
     path = Path(local_path)
 
     if not path.exists():
@@ -59,33 +69,22 @@ def _load_muse_local(local_path: str) -> pd.DataFrame:
     try:
         with fits.open(path) as hdul:
             data = hdul[1].data
-            colnames = data.names
+            colnames = list(data.names)
+
+        # Column name mappings (output_name -> candidate_names)
+        column_mappings = {
+            "ra": ["RAJ2000", "RA", "ra"],
+            "dec": ["DEJ2000", "DEC", "Dec", "dec"],
+            "z_spec": ["zMUSE", "z", "Z", "REDSHIFT", "z_spec"],
+            "confidence": ["Conf", "CONF", "confidence", "Quality"],
+        }
 
         # Build DataFrame
         df = pd.DataFrame()
-
-        # Coordinates
-        for ra_col in ["RAJ2000", "RA", "ra"]:
-            if ra_col in colnames:
-                df["ra"] = data[ra_col]
-                break
-
-        for dec_col in ["DEJ2000", "DEC", "Dec", "dec"]:
-            if dec_col in colnames:
-                df["dec"] = data[dec_col]
-                break
-
-        # Redshift
-        for z_col in ["zMUSE", "z", "Z", "REDSHIFT", "z_spec"]:
-            if z_col in colnames:
-                df["z_spec"] = data[z_col]
-                break
-
-        # Confidence
-        for conf_col in ["Conf", "CONF", "confidence", "Quality"]:
-            if conf_col in colnames:
-                df["confidence"] = data[conf_col]
-                break
+        for output_col, candidates in column_mappings.items():
+            source_col = _find_column(colnames, candidates)
+            if source_col:
+                df[output_col] = data[source_col]
 
         print(f"Loaded MUSE catalog: {len(df)} sources")
         return df
@@ -97,12 +96,6 @@ def _load_muse_local(local_path: str) -> pd.DataFrame:
 
 def _query_muse_vizier() -> pd.DataFrame:
     """Query MUSE catalog from VizieR."""
-    try:
-        from astroquery.vizier import Vizier
-    except ImportError:
-        print("astroquery not installed")
-        return pd.DataFrame()
-
     print("Querying MUSE HUDF catalog from VizieR (J/A+A/608/A1)...")
 
     try:
@@ -165,9 +158,6 @@ def validate_with_specz(
         - metrics: Photo-z quality metrics
         - outliers: Sources with |Δz/(1+z)| > 0.15
     """
-    import astropy.units as u
-    from astropy.coordinates import SkyCoord, match_coordinates_sky
-
     # Check required columns
     if our_z_col not in our_catalog.columns:
         return {"error": f"Column '{our_z_col}' not found in our catalog"}
