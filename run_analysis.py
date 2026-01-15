@@ -68,10 +68,12 @@ from classify import (
 )
 from generate_filtered_binning import (
     MIN_GALAXIES_PER_TYPE,
+    MIN_GALAXIES_PER_TYPE_BINNING,
     generate_angular_size_plot,
     generate_binning_plot,
     generate_galaxy_type_histogram,
     generate_overlay_plot,
+    generate_per_type_binning_comparison,
     generate_per_type_fit_plot,
     generate_redshift_histogram,
     generate_size_distribution_by_type,
@@ -3834,5 +3836,14 @@ Resource Profiles:
                     generate_per_type_fit_plot(output_dir, output_dir, dataset_name, gtype)
             else:
                 print("  No galaxy types have enough statistics for per-type analysis.")
+
+            # Per-type binning comparison plots (lower threshold for more types)
+            types_for_binning = get_types_with_enough_statistics(type_catalog, min_count=MIN_GALAXIES_PER_TYPE_BINNING)
+            print(f"\n--- Per-Type Binning Comparisons ({dataset_name}) ---")
+            print(f"  Galaxy types with N >= {MIN_GALAXIES_PER_TYPE_BINNING}: {types_for_binning}")
+            if len(types_for_binning) > 0:
+                print(f"  Generating binning comparison plots for {len(types_for_binning)} types...")
+                for gtype in types_for_binning:
+                    generate_per_type_binning_comparison(output_dir, output_dir, dataset_name, gtype)
 
         print(f"\nPlots saved to: {output_dir}/")
