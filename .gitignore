@@ -3,3 +3,6 @@ files/
 __pycache__/
 *.pyc
 snippets.py
+.template_cache/
+output/
+=2.0
