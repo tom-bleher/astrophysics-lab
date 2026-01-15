@@ -22,22 +22,13 @@ Installation:
     pip install zoobot[pytorch]
 """
 
+import contextlib
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Union
-import tempfile
 
 import numpy as np
 import pandas as pd
-
-try:
-    from astropy.io import fits
-    from astropy.nddata import Cutout2D
-    from astropy.wcs import WCS
-    HAS_ASTROPY = True
-except ImportError:
-    HAS_ASTROPY = False
 
 try:
     from PIL import Image
@@ -48,14 +39,14 @@ except ImportError:
 # Check for Zoobot availability
 try:
     import torch
-    from zoobot.pytorch.training import finetune
     from zoobot.pytorch.predictions import predict_on_catalog
+    from zoobot.pytorch.training import finetune
     HAS_ZOOBOT = True
 except ImportError:
     HAS_ZOOBOT = False
     warnings.warn(
         "Zoobot not installed. Install with: pip install zoobot[pytorch]\n"
-        "For GPU support, ensure CUDA is installed first."
+        "For GPU support, ensure CUDA is installed first.", stacklevel=2
     )
 
 
@@ -116,9 +107,9 @@ def extract_cutouts(
     size: int = 128,
     x_col: str = 'xcentroid',
     y_col: str = 'ycentroid',
-    output_dir: Optional[Path] = None,
+    output_dir: Path | None = None,
     normalize: bool = True,
-) -> list[tuple[int, np.ndarray, Optional[Path]]]:
+) -> list[tuple[int, np.ndarray, Path | None]]:
     """
     Extract square cutouts centered on each source for Zoobot.
 
@@ -150,17 +141,21 @@ def extract_cutouts(
     half_size = size // 2
     ny, nx = image_data.shape
 
-    for idx, row in catalog.iterrows():
-        x, y = int(row[x_col]), int(row[y_col])
+    # Vectorized coordinate extraction and boundary calculation
+    x_coords = catalog[x_col].values.astype(int)
+    y_coords = catalog[y_col].values.astype(int)
+    indices = catalog.index.values
 
-        # Check boundaries
-        x_lo = max(0, x - half_size)
-        x_hi = min(nx, x + half_size)
-        y_lo = max(0, y - half_size)
-        y_hi = min(ny, y + half_size)
+    # Vectorized boundary calculation
+    x_lo = np.maximum(0, x_coords - half_size)
+    x_hi = np.minimum(nx, x_coords + half_size)
+    y_lo = np.maximum(0, y_coords - half_size)
+    y_hi = np.minimum(ny, y_coords + half_size)
 
-        # Extract cutout
-        cutout = image_data[y_lo:y_hi, x_lo:x_hi].copy()
+    # Process cutouts (extraction still requires loop but boundary calc is vectorized)
+    for i, idx in enumerate(indices):
+        # Extract cutout using pre-computed boundaries
+        cutout = image_data[y_lo[i]:y_hi[i], x_lo[i]:x_hi[i]].copy()
 
         # Pad if necessary to get exact size
         if cutout.shape != (size, size):
@@ -222,14 +217,11 @@ def asinh_stretch(data: np.ndarray, scale: float = 0.1) -> np.ndarray:
 def save_cutout_as_png(cutout: np.ndarray, path: Path):
     """Save a cutout as a PNG image for Zoobot."""
     if not HAS_PIL:
-        warnings.warn("PIL not installed. Cannot save PNG cutouts.")
+        warnings.warn("PIL not installed. Cannot save PNG cutouts.", stacklevel=2)
         return
 
     # Convert to RGB (Zoobot expects 3-channel images)
-    if cutout.ndim == 2:
-        rgb = np.stack([cutout, cutout, cutout], axis=-1)
-    else:
-        rgb = cutout
+    rgb = np.stack([cutout, cutout, cutout], axis=-1) if cutout.ndim == 2 else cutout
 
     img = Image.fromarray(rgb.astype(np.uint8))
     img.save(path)
@@ -310,47 +302,58 @@ def interpret_zoobot_predictions(predictions: pd.DataFrame) -> list[MorphologyPr
     -------
     list of MorphologyPrediction
     """
+    n_sources = len(predictions)
+
+    # Helper to safely get column values with default
+    def get_col(col_name: str, default: float = 0.0) -> np.ndarray:
+        if col_name in predictions.columns:
+            return predictions[col_name].values
+        return np.full(n_sources, default)
+
+    # Vectorized extraction of all morphology features
+    smooth = get_col('smooth-or-featured_smooth', 0.5)
+    featured = get_col('smooth-or-featured_featured-or-disk', 0.5)
+    artifact = get_col('smooth-or-featured_artifact', 0.0)
+
+    edge_on = get_col('disk-edge-on_yes', 0.0)
+    has_spiral = get_col('has-spiral-arms_yes', 0.0)
+    bar_strong = get_col('bar_strong', 0.0)
+    bar_weak = get_col('bar_weak', 0.0)
+    has_bar = bar_strong + bar_weak
+
+    bulge_dom = get_col('bulge-size_dominant', 0.0)
+    merger_main = get_col('merging_merger', 0.0)
+    merger_major = get_col('merging_major-disturbance', 0.0)
+    merger = merger_main + merger_major
+
+    # Extract source IDs
+    indices = predictions.index.values
+    id_strs = predictions['id_str'].values if 'id_str' in predictions.columns else None
+
+    # Build results list
     results = []
-
-    for idx, row in predictions.iterrows():
-        # Extract main morphology
-        # Column names depend on the schema, typical format:
-        # smooth-or-featured_smooth, smooth-or-featured_featured-or-disk, etc.
-
-        smooth = row.get('smooth-or-featured_smooth', 0.5)
-        featured = row.get('smooth-or-featured_featured-or-disk', 0.5)
-        artifact = row.get('smooth-or-featured_artifact', 0.0)
-
-        edge_on = row.get('disk-edge-on_yes', 0.0)
-        has_spiral = row.get('has-spiral-arms_yes', 0.0)
-        has_bar = row.get('bar_strong', 0.0) + row.get('bar_weak', 0.0)
-
-        bulge_dom = row.get('bulge-size_dominant', 0.0)
-        merger = row.get('merging_merger', 0.0) + row.get('merging_major-disturbance', 0.0)
-
+    for i in range(n_sources):
         # Derive classification
         morph_class, confidence = derive_morphology_class(
-            smooth, featured, edge_on, has_spiral, has_bar, bulge_dom
+            smooth[i], featured[i], edge_on[i], has_spiral[i], has_bar[i], bulge_dom[i]
         )
 
         # Extract source ID from filename if available
-        source_id = idx
-        if 'id_str' in row:
-            try:
-                source_id = int(row['id_str'].replace('galaxy_', ''))
-            except (ValueError, AttributeError):
-                pass
+        source_id = indices[i]
+        if id_strs is not None:
+            with contextlib.suppress(ValueError, AttributeError):
+                source_id = int(str(id_strs[i]).replace('galaxy_', ''))
 
         results.append(MorphologyPrediction(
             source_id=source_id,
-            smooth=smooth,
-            featured=featured,
-            artifact=artifact,
-            edge_on=edge_on,
-            has_spiral=has_spiral,
-            has_bar=has_bar,
-            bulge_dominant=bulge_dom,
-            merger=merger,
+            smooth=float(smooth[i]),
+            featured=float(featured[i]),
+            artifact=float(artifact[i]),
+            edge_on=float(edge_on[i]),
+            has_spiral=float(has_spiral[i]),
+            has_bar=float(has_bar[i]),
+            bulge_dominant=float(bulge_dom[i]),
+            merger=float(merger[i]),
             morphology_class=morph_class,
             confidence=confidence,
         ))
@@ -450,34 +453,30 @@ def validate_morphology_with_zoobot(
     -------
     ZoobotValidationReport
     """
-    # Build lookup from Zoobot predictions
-    zoobot_lookup = {p.source_id: p for p in zoobot_predictions}
+    # Convert Zoobot predictions to DataFrame for vectorized merge
+    zoobot_df = pd.DataFrame([
+        {
+            'source_id': p.source_id,
+            'zoobot_class': p.morphology_class,
+            'zoobot_smooth': p.smooth,
+            'zoobot_featured': p.featured,
+            'zoobot_spiral': p.has_spiral,
+            'zoobot_confidence': p.confidence,
+        }
+        for p in zoobot_predictions
+    ]).set_index('source_id')
 
-    # Track agreements
-    comparisons = []
+    # Vectorized merge instead of iterrows + lookup
+    sed_subset = sed_catalog[[type_col]].copy()
+    sed_subset['sed_type'] = sed_catalog[type_col]
 
-    for idx, row in sed_catalog.iterrows():
-        if idx not in zoobot_lookup:
-            continue
+    # Vectorized SED class mapping
+    sed_subset['sed_class'] = sed_subset['sed_type'].apply(sed_to_morphology_class)
 
-        sed_type = row[type_col]
-        zoobot_pred = zoobot_lookup[idx]
+    # Merge using pandas (much faster than iterrows + lookup)
+    comp_df = sed_subset.join(zoobot_df, how='inner')
 
-        sed_class = sed_to_morphology_class(sed_type)
-        zoobot_class = zoobot_pred.morphology_class
-
-        comparisons.append({
-            'source_id': idx,
-            'sed_type': sed_type,
-            'sed_class': sed_class,
-            'zoobot_class': zoobot_class,
-            'zoobot_smooth': zoobot_pred.smooth,
-            'zoobot_featured': zoobot_pred.featured,
-            'zoobot_spiral': zoobot_pred.has_spiral,
-            'zoobot_confidence': zoobot_pred.confidence,
-        })
-
-    if not comparisons:
+    if len(comp_df) == 0:
         return ZoobotValidationReport(
             n_compared=0,
             agreement_fraction=0.0,
@@ -487,7 +486,9 @@ def validate_morphology_with_zoobot(
             starburst_agreement=0.0,
         )
 
-    comp_df = pd.DataFrame(comparisons)
+    # Add source_id column from index
+    comp_df = comp_df.reset_index()
+    comp_df = comp_df.rename(columns={'index': 'source_id'})
 
     # Calculate agreements
     # Elliptical: SED elliptical should be Zoobot smooth
@@ -525,9 +526,7 @@ def validate_morphology_with_zoobot(
     def simple_match(row):
         if row['sed_class'] == 'E' and row['zoobot_smooth'] > 0.5:
             return True
-        if row['sed_class'] in ['Spiral', 'S0', 'Starburst'] and row['zoobot_featured'] > 0.5:
-            return True
-        return False
+        return bool(row['sed_class'] in ['Spiral', 'S0', 'Starburst'] and row['zoobot_featured'] > 0.5)
 
     agreement_frac = comp_df.apply(simple_match, axis=1).mean()
 

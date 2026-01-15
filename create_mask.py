@@ -19,15 +19,15 @@ References:
 - HST ACS PSF: https://hst-docs.stsci.edu/acsihb/chapter-5-imaging/5-6-acs-point-spread-functions
 """
 
-import numpy as np
 from pathlib import Path
+
+import numpy as np
+from astropy.convolution import convolve
 from astropy.io import fits
 from astropy.wcs import WCS
-from astropy.convolution import convolve
-from scipy.ndimage import binary_dilation, label, maximum
 from photutils.background import Background2D, MedianBackground
 from photutils.segmentation import SourceCatalog, SourceFinder, make_2dgaussian_kernel
-
+from scipy.ndimage import binary_dilation, maximum
 
 # Configuration
 PIXEL_SCALE = 0.04  # arcsec/pixel
@@ -258,7 +258,7 @@ def detect_stars_morphology(
     # Minimum pixels for detection
     npixels = max(5, int(np.pi * (PSF_FWHM_PIX / 2) ** 2 * 2))
 
-    print(f"    Detection threshold: {detection_sigma}σ, npixels >= {npixels}")
+    print(f"    Detection threshold: {detection_sigma}-sigma, npixels >= {npixels}")
 
     finder = SourceFinder(npixels=npixels, progress_bar=False)
     segm = finder(convolved, threshold)

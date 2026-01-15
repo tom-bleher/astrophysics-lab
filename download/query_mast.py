@@ -14,6 +14,8 @@ Usage:
 
 from pathlib import Path
 
+import pandas as pd
+
 
 def search_hdf_observations(
     target: str = "HDF",
@@ -96,9 +98,9 @@ def search_hdf_region(
     import pandas as pd
 
     try:
-        from astroquery.mast import Observations
-        from astropy.coordinates import SkyCoord
         import astropy.units as u
+        from astropy.coordinates import SkyCoord
+        from astroquery.mast import Observations
     except ImportError:
         print("astroquery/astropy not installed")
         return pd.DataFrame()

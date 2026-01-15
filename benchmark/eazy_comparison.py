@@ -13,7 +13,6 @@ References:
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -44,7 +43,7 @@ class EazyBenchmarkResult:
     n_sources: int
     our_photoz: np.ndarray
     eazy_photoz: np.ndarray
-    spec_z: Optional[np.ndarray]
+    spec_z: np.ndarray | None
     our_metrics: dict
     eazy_metrics: dict
     comparison_metrics: dict
@@ -52,11 +51,8 @@ class EazyBenchmarkResult:
 
 def check_eazy_available() -> bool:
     """Check if EAZY is available."""
-    try:
-        import eazy
-        return True
-    except ImportError:
-        return False
+    import importlib.util
+    return importlib.util.find_spec("eazy") is not None
 
 
 def prepare_eazy_catalog(
@@ -99,8 +95,8 @@ def prepare_eazy_catalog(
     eazy_cat = pd.DataFrame()
     eazy_cat["id"] = catalog[id_col] if id_col in catalog.columns else range(len(catalog))
 
-    for i, (flux_col, err_col, filt) in enumerate(
-        zip(flux_cols, error_cols, filter_names)
+    for i, (flux_col, err_col, _filt) in enumerate(
+        zip(flux_cols, error_cols, filter_names, strict=False)
     ):
         # EAZY expects columns named F{n} and E{n}
         eazy_cat[f"F{i+1}"] = catalog[flux_col]
@@ -213,23 +209,23 @@ def run_eazy_photoz(
 def _mock_eazy_results(catalog: pd.DataFrame) -> pd.DataFrame:
     """Generate mock EAZY results for testing without EAZY installed."""
     n = len(catalog)
-    np.random.seed(42)
+    rng = np.random.default_rng(42)
 
     # If catalog has redshifts, perturb them slightly
     if "redshift" in catalog.columns:
         z_base = catalog["redshift"].values
         # Add noise consistent with typical photo-z scatter
-        z_eazy = z_base * (1 + 0.05 * np.random.randn(n))
+        z_eazy = z_base * (1 + 0.05 * rng.standard_normal(n))
         z_eazy = np.clip(z_eazy, 0.01, 4.0)
     else:
-        z_eazy = np.random.uniform(0.1, 2.0, n)
+        z_eazy = rng.uniform(0.1, 2.0, n)
 
     return pd.DataFrame({
         "id": np.arange(n),
         "z_eazy": z_eazy,
         "z_eazy_lo": z_eazy * 0.9,
         "z_eazy_hi": z_eazy * 1.1,
-        "chi2_best": np.random.exponential(5, n),
+        "chi2_best": rng.exponential(5, n),
     })
 
 
@@ -321,7 +317,7 @@ def print_benchmark_summary(result: EazyBenchmarkResult) -> None:
     cm = result.comparison_metrics
     print(f"NMAD (vs EAZY):     {cm['nmad_vs_eazy']:.4f}")
     print(f"Bias (vs EAZY):     {cm['bias_vs_eazy']:+.4f}")
-    print(f"σ (vs EAZY):        {cm['sigma_vs_eazy']:.4f}")
+    print(f"sigma (vs EAZY):        {cm['sigma_vs_eazy']:.4f}")
     print(f"Outliers (vs EAZY): {cm['outlier_frac_vs_eazy']:.1%}")
 
     if result.spec_z is not None and result.our_metrics:
@@ -376,7 +372,12 @@ def plot_eazy_comparison(
     # Left panel: our z vs EAZY z
     ax1 = axes[0]
     valid = (result.our_photoz > 0) & (result.eazy_photoz > 0)
-    z_max = max(result.our_photoz[valid].max(), result.eazy_photoz[valid].max()) * 1.1
+    # Dynamic limits with epsilon padding
+    z_min = min(result.our_photoz[valid].min(), result.eazy_photoz[valid].min())
+    z_max = max(result.our_photoz[valid].max(), result.eazy_photoz[valid].max())
+    z_padding = (z_max - z_min) * 0.08
+    z_lo = max(0, z_min - z_padding)
+    z_hi = z_max + z_padding
 
     ax1.scatter(
         result.eazy_photoz[valid],
@@ -385,13 +386,13 @@ def plot_eazy_comparison(
         s=10,
         c="steelblue",
     )
-    ax1.plot([0, z_max], [0, z_max], "k--", lw=1.5)
+    ax1.plot([z_lo, z_hi], [z_lo, z_hi], "k--", lw=1.5)
 
     ax1.set_xlabel("EAZY Photo-z")
     ax1.set_ylabel("Our Photo-z")
     ax1.set_title("Method Comparison")
-    ax1.set_xlim([0, z_max])
-    ax1.set_ylim([0, z_max])
+    ax1.set_xlim([z_lo, z_hi])
+    ax1.set_ylim([z_lo, z_hi])
     ax1.set_aspect("equal")
     ax1.grid(True, alpha=0.3)
 
@@ -418,23 +419,34 @@ def plot_eazy_comparison(
             label="EAZY",
         )
 
-        z_max = result.spec_z[spec_valid].max() * 1.1
-        ax2.plot([0, z_max], [0, z_max], "k--", lw=1.5)
+        # Dynamic limits for spec-z validation
+        spec_z_min = result.spec_z[spec_valid].min()
+        spec_z_max = result.spec_z[spec_valid].max()
+        spec_padding = (spec_z_max - spec_z_min) * 0.08
+        spec_lo = max(0, spec_z_min - spec_padding)
+        spec_hi = spec_z_max + spec_padding
+        ax2.plot([spec_lo, spec_hi], [spec_lo, spec_hi], "k--", lw=1.5)
+        ax2.set_xlim([spec_lo, spec_hi])
+        ax2.set_ylim([spec_lo, spec_hi])
 
         ax2.set_xlabel("Spectroscopic z")
         ax2.set_ylabel("Photo-z")
         ax2.set_title("Validation vs Spec-z")
         ax2.legend()
     else:
-        # Show histogram of differences
+        # Show histogram of differences with dynamic range
         dz = (result.our_photoz[valid] - result.eazy_photoz[valid]) / (
             1 + result.eazy_photoz[valid]
         )
-        ax2.hist(dz, bins=50, range=(-0.5, 0.5), color="steelblue", alpha=0.7)
+        dz_min, dz_max = np.min(dz), np.max(dz)
+        dz_padding = (dz_max - dz_min) * 0.1
+        dz_range = (max(-0.5, dz_min - dz_padding), min(0.5, dz_max + dz_padding))
+        ax2.hist(dz, bins=50, range=dz_range, color="steelblue", alpha=0.7)
         ax2.axvline(0, color="k", linestyle="--")
         ax2.set_xlabel("Δz / (1+z_EAZY)")
         ax2.set_ylabel("Count")
         ax2.set_title("Our z - EAZY z")
+        ax2.set_xlim(dz_range)
 
     ax2.grid(True, alpha=0.3)
 

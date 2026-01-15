@@ -7,10 +7,10 @@ This module provides publication-quality plots for:
 - Outlier visualization
 """
 
-import numpy as np
-from numpy.typing import ArrayLike
 import matplotlib.pyplot as plt
+import numpy as np
 from matplotlib.figure import Figure
+from numpy.typing import ArrayLike
 
 
 def plot_photoz_vs_specz(
@@ -61,9 +61,11 @@ def plot_photoz_vs_specz(
 
     fig, ax = plt.subplots(figsize=figsize)
 
-    # Determine plot range
-    z_max = max(z_spec.max(), z_phot.max()) * 1.1
-    z_range = [0, z_max]
+    # Determine plot range with dynamic epsilon padding
+    z_min = min(z_spec.min(), z_phot.min())
+    z_max = max(z_spec.max(), z_phot.max())
+    z_padding = (z_max - z_min) * 0.08
+    z_range = [max(0, z_min - z_padding), z_max + z_padding]
 
     # Plot data points
     if z_err_lo is not None and z_err_hi is not None:
@@ -116,7 +118,7 @@ def plot_photoz_vs_specz(
             transform=ax.transAxes,
             fontsize=10,
             verticalalignment="top",
-            bbox=dict(boxstyle="round", facecolor="white", alpha=0.8),
+            bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.8},
         )
 
     ax.set_xlabel("Spectroscopic Redshift", fontsize=12)
@@ -174,11 +176,16 @@ def plot_delta_z_histogram(
 
     fig, ax = plt.subplots(figsize=figsize)
 
+    # Dynamic histogram range with epsilon padding
+    dz_min, dz_max = np.min(dz), np.max(dz)
+    dz_padding = (dz_max - dz_min) * 0.1
+    dz_range = (max(-range_sigma, dz_min - dz_padding), min(range_sigma, dz_max + dz_padding))
+
     # Histogram
     ax.hist(
         dz,
         bins=bins,
-        range=(-range_sigma, range_sigma),
+        range=dz_range,
         color="steelblue",
         alpha=0.7,
         edgecolor="white",
@@ -212,13 +219,14 @@ def plot_delta_z_histogram(
         fontsize=10,
         verticalalignment="top",
         horizontalalignment="right",
-        bbox=dict(boxstyle="round", facecolor="white", alpha=0.8),
+        bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.8},
     )
 
     ax.set_xlabel("Δz / (1+z)", fontsize=12)
     ax.set_ylabel("Count", fontsize=12)
     ax.set_title(title, fontsize=14)
     ax.legend(loc="upper left")
+    ax.set_xlim(dz_range)
     ax.grid(True, alpha=0.3, axis="y")
 
     plt.tight_layout()
@@ -272,14 +280,18 @@ def plot_validation_panel(
 
     fig, axes = plt.subplots(1, 2, figsize=figsize)
 
-    # Left panel: z_phot vs z_spec
+    # Left panel: z_phot vs z_spec with dynamic limits
     ax1 = axes[0]
-    z_max = max(z_spec_v.max(), z_phot_v.max()) * 1.1
+    z_min = min(z_spec_v.min(), z_phot_v.min())
+    z_max = max(z_spec_v.max(), z_phot_v.max())
+    z_padding = (z_max - z_min) * 0.08
+    z_lo = max(0, z_min - z_padding)
+    z_hi = z_max + z_padding
 
     ax1.scatter(z_spec_v, z_phot_v, alpha=0.5, s=20, c="steelblue")
-    ax1.plot([0, z_max], [0, z_max], "k--", lw=1.5, label="1:1")
+    ax1.plot([z_lo, z_hi], [z_lo, z_hi], "k--", lw=1.5, label="1:1")
 
-    z_arr = np.linspace(0, z_max, 100)
+    z_arr = np.linspace(z_lo, z_hi, 100)
     ax1.fill_between(
         z_arr,
         z_arr - 0.15 * (1 + z_arr),
@@ -293,17 +305,22 @@ def plot_validation_panel(
     ax1.set_ylabel("Photometric Redshift")
     ax1.set_title("z_phot vs z_spec")
     ax1.legend(loc="lower right")
-    ax1.set_xlim([0, z_max])
-    ax1.set_ylim([0, z_max])
+    ax1.set_xlim([z_lo, z_hi])
+    ax1.set_ylim([z_lo, z_hi])
     ax1.set_aspect("equal")
     ax1.grid(True, alpha=0.3)
 
-    # Right panel: histogram
+    # Right panel: histogram with dynamic range
     ax2 = axes[1]
     dz = (z_phot_v - z_spec_v) / (1 + z_spec_v)
 
+    # Dynamic histogram range with epsilon padding
+    dz_min, dz_max = np.min(dz), np.max(dz)
+    dz_padding = (dz_max - dz_min) * 0.1
+    dz_range = (max(-0.5, dz_min - dz_padding), min(0.5, dz_max + dz_padding))
+
     ax2.hist(
-        dz, bins=50, range=(-0.5, 0.5), color="steelblue", alpha=0.7, edgecolor="white"
+        dz, bins=50, range=dz_range, color="steelblue", alpha=0.7, edgecolor="white"
     )
 
     nmad = 1.48 * np.median(np.abs(dz - np.median(dz)))
@@ -324,13 +341,14 @@ def plot_validation_panel(
         fontsize=10,
         verticalalignment="top",
         horizontalalignment="right",
-        bbox=dict(boxstyle="round", facecolor="white", alpha=0.8),
+        bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.8},
     )
 
     ax2.set_xlabel("Δz / (1+z)")
     ax2.set_ylabel("Count")
     ax2.set_title("Residual Distribution")
     ax2.legend(loc="upper left")
+    ax2.set_xlim(dz_range)
     ax2.grid(True, alpha=0.3, axis="y")
 
     fig.suptitle(title, fontsize=14, y=1.02)
@@ -396,7 +414,7 @@ def plot_binned_metrics(
 
     # Add horizontal bars for bin widths
     if x_lo is not None and x_hi is not None:
-        for x, y, lo, hi in zip(x_values, y_values, x_lo, x_hi):
+        for _x, y, lo, hi in zip(x_values, y_values, x_lo, x_hi, strict=False):
             if np.isfinite(y):
                 ax.hlines(y, lo, hi, color="steelblue", alpha=0.3, linewidth=2)
 
@@ -412,6 +430,18 @@ def plot_binned_metrics(
     ax.set_ylabel(metric_labels.get(metric, metric), fontsize=12)
     ax.set_title(f"{metric_labels.get(metric, metric)} vs {x_label}", fontsize=14)
     ax.grid(True, alpha=0.3)
+
+    # Dynamic axis limits with epsilon padding
+    x_vals_finite = [x for x in x_values if np.isfinite(x)]
+    y_vals_finite = [y for y in y_values if np.isfinite(y)]
+    if x_vals_finite:
+        x_min, x_max = min(x_vals_finite), max(x_vals_finite)
+        x_padding = (x_max - x_min) * 0.1 if x_max > x_min else 0.1
+        ax.set_xlim(x_min - x_padding, x_max + x_padding)
+    if y_vals_finite:
+        y_min, y_max = min(y_vals_finite), max(y_vals_finite)
+        y_padding = (y_max - y_min) * 0.1 if y_max > y_min else abs(y_min) * 0.1 + 0.01
+        ax.set_ylim(y_min - y_padding, y_max + y_padding)
 
     plt.tight_layout()
     return fig

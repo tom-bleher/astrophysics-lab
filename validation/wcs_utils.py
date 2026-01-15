@@ -6,7 +6,6 @@ the cropping/flipping applied to HDF images.
 
 import numpy as np
 from astropy.wcs import WCS
-from astropy.io import fits
 
 
 def get_wcs_from_header(header) -> WCS:
@@ -49,10 +48,10 @@ def pixel_to_sky(
 
     # Get original image dimensions from WCS
     if hasattr(wcs, 'pixel_shape') and wcs.pixel_shape is not None:
-        orig_nx, orig_ny = wcs.pixel_shape
+        orig_nx = wcs.pixel_shape[0]
     else:
         # Fallback: estimate from common HDF dimensions
-        orig_nx, orig_ny = 4096, 4096
+        orig_nx = 4096
 
     # Reverse the transformations applied in adjust_data()
     # Original code: data = data[120:, 90:]  -> y offset 120, x offset 90
@@ -78,6 +77,64 @@ def pixel_to_sky(
     except Exception as e:
         print(f"WCS conversion failed: {e}")
         return np.full_like(x, np.nan), np.full_like(y, np.nan)
+
+
+def sky_to_pixel(
+    ra: np.ndarray,
+    dec: np.ndarray,
+    wcs: WCS,
+    crop_offset: tuple = (90, 120),
+    flip_x: bool = True,
+    image_width: int | None = None
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Convert RA/Dec to pixel coordinates, accounting for cropping/flipping.
+
+    This is the inverse of pixel_to_sky().
+
+    Parameters
+    ----------
+    ra, dec : array-like
+        Sky coordinates in degrees
+    wcs : WCS
+        WCS object from original FITS header
+    crop_offset : tuple
+        (x_offset, y_offset) applied during image cropping
+    flip_x : bool
+        Whether the image was flipped in x
+    image_width : int, optional
+        Width of the processed image (after cropping). If None, estimated from WCS.
+
+    Returns
+    -------
+    x, y : np.ndarray
+        Pixel coordinates in the processed (cropped/flipped) image
+    """
+    ra = np.atleast_1d(ra)
+    dec = np.atleast_1d(dec)
+
+    # Convert sky to pixel coordinates in original image frame
+    try:
+        x_full, y_full = wcs.all_world2pix(ra, dec, 0)
+    except Exception as e:
+        print(f"WCS conversion failed: {e}")
+        return np.full_like(ra, np.nan, dtype=float), np.full_like(dec, np.nan, dtype=float)
+
+    # Subtract crop offsets
+    x_cropped = x_full - crop_offset[0]
+    y_cropped = y_full - crop_offset[1]
+
+    # Apply x-flip if needed
+    if flip_x:
+        if image_width is not None:
+            cropped_nx = image_width
+        elif hasattr(wcs, 'pixel_shape') and wcs.pixel_shape is not None:
+            cropped_nx = wcs.pixel_shape[0] - crop_offset[0]
+        else:
+            cropped_nx = 4096 - crop_offset[0]
+        x_cropped = cropped_nx - 1 - x_cropped
+
+    return x_cropped, y_cropped
 
 
 def add_sky_coordinates(
@@ -127,7 +184,7 @@ def add_sky_coordinates(
     catalog['ra'] = ra
     catalog['dec'] = dec
 
-    print(f"Added RA/Dec coordinates to catalog")
+    print("Added RA/Dec coordinates to catalog")
     print(f"  RA range: {ra.min():.4f} to {ra.max():.4f} deg")
     print(f"  Dec range: {dec.min():.4f} to {dec.max():.4f} deg")
 

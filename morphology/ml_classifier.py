@@ -20,7 +20,7 @@ References:
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import ClassVar
 
 import numpy as np
 import pandas as pd
@@ -28,7 +28,7 @@ from numpy.typing import NDArray
 
 # Optional sklearn import with graceful fallback
 try:
-    from sklearn.calibration import CalibratedClassifierCV
+    import joblib
     from sklearn.ensemble import RandomForestClassifier
     from sklearn.metrics import (
         classification_report,
@@ -41,8 +41,6 @@ try:
         train_test_split,
     )
     from sklearn.preprocessing import StandardScaler
-
-    import joblib
 
     HAS_SKLEARN = True
 except ImportError:
@@ -147,7 +145,7 @@ class MLStarGalaxyClassifier:
     """
 
     # Default feature set following miniJPAS approach
-    DEFAULT_FEATURES = [
+    DEFAULT_FEATURES: ClassVar[list[str]] = [
         # Fluxes (4)
         "flux_u",
         "flux_b",
@@ -221,7 +219,7 @@ class MLStarGalaxyClassifier:
         self.scaler = StandardScaler()
         self.feature_names = self.DEFAULT_FEATURES.copy()
         self.is_fitted = False
-        self.metrics: Optional[ClassifierMetrics] = None
+        self.metrics: ClassifierMetrics | None = None
         self._calibrated_model = None
 
     def fit(
@@ -317,7 +315,7 @@ class MLStarGalaxyClassifier:
         report = classification_report(y_test, y_pred, output_dict=True)
 
         # Feature importances
-        importances = dict(zip(self.feature_names, self.model.feature_importances_))
+        importances = dict(zip(self.feature_names, self.model.feature_importances_, strict=False))
 
         self.metrics = ClassifierMetrics(
             auc_roc=auc,
@@ -369,7 +367,7 @@ class MLStarGalaxyClassifier:
         predictions = probabilities > 0.5
 
         results = []
-        for is_gal, prob in zip(predictions, probabilities):
+        for is_gal, prob in zip(predictions, probabilities, strict=False):
             results.append(
                 ClassificationResult(
                     is_galaxy=bool(is_gal),
@@ -490,6 +488,13 @@ class MLStarGalaxyClassifier:
         print("=" * 50)
 
 
+def _safe_color_vectorized(f1: NDArray, f2: NDArray) -> NDArray:
+    """Vectorized safe color computation."""
+    with np.errstate(divide='ignore', invalid='ignore'):
+        result = np.where((f1 > 0) & (f2 > 0), -2.5 * np.log10(f1 / f2), np.nan)
+    return result
+
+
 def extract_features_from_catalog(
     catalog: pd.DataFrame,
     image: NDArray,
@@ -520,9 +525,8 @@ def extract_features_from_catalog(
     """
     from morphology.concentration import (
         asymmetry_index,
-        calculate_concentration_c,
+        compute_morphology_batch,
         gini_coefficient,
-        half_light_radius,
         m20_statistic,
     )
 
@@ -537,36 +541,40 @@ def extract_features_from_catalog(
             "i": "flux_i_err",
         }
 
-    features = []
+    n_sources = len(catalog)
 
-    for idx, row in catalog.iterrows():
-        x, y = row[x_col], row[y_col]
+    # Extract coordinates as arrays
+    x_coords = catalog[x_col].values
+    y_coords = catalog[y_col].values
 
-        # Photometric features
-        f_u = row.get(flux_cols.get("u", "flux_u"), np.nan)
-        f_b = row.get(flux_cols.get("b", "flux_b"), np.nan)
-        f_v = row.get(flux_cols.get("v", "flux_v"), np.nan)
-        f_i = row.get(flux_cols.get("i", "flux_i"), np.nan)
+    # Vectorized photometric feature extraction
+    f_u = catalog[flux_cols.get("u", "flux_u")].values if flux_cols.get("u", "flux_u") in catalog.columns else np.full(n_sources, np.nan)
+    f_b = catalog[flux_cols.get("b", "flux_b")].values if flux_cols.get("b", "flux_b") in catalog.columns else np.full(n_sources, np.nan)
+    f_v = catalog[flux_cols.get("v", "flux_v")].values if flux_cols.get("v", "flux_v") in catalog.columns else np.full(n_sources, np.nan)
+    f_i = catalog[flux_cols.get("i", "flux_i")].values if flux_cols.get("i", "flux_i") in catalog.columns else np.full(n_sources, np.nan)
 
-        # Colors (magnitude differences)
-        def safe_color(f1, f2):
-            if f1 > 0 and f2 > 0:
-                return -2.5 * np.log10(f1 / f2)
-            return np.nan
+    # Vectorized color computation
+    color_ub = _safe_color_vectorized(f_u, f_b)
+    color_bv = _safe_color_vectorized(f_b, f_v)
+    color_vi = _safe_color_vectorized(f_v, f_i)
 
-        color_ub = safe_color(f_u, f_b)
-        color_bv = safe_color(f_b, f_v)
-        color_vi = safe_color(f_v, f_i)
+    # Vectorized magnitude
+    with np.errstate(divide='ignore', invalid='ignore'):
+        mag_i = np.where(f_i > 0, -2.5 * np.log10(f_i), np.nan)
 
-        # Magnitude
-        mag_i = -2.5 * np.log10(f_i) if f_i > 0 else np.nan
+    # Batch morphological features (concentration_c, half_light_radius)
+    morphology = compute_morphology_batch(image, x_coords, y_coords)
+    c_values = morphology['concentration_c']
+    r_half_values = morphology['half_light_radius']
 
-        # Morphological features from image
-        c = calculate_concentration_c(image, x, y)
-        r_half = half_light_radius(image, x, y)
+    # Gini, M20, and asymmetry still need per-source computation (cutouts)
+    gini_values = np.full(n_sources, np.nan)
+    m20_values = np.full(n_sources, np.nan)
+    asym_values = np.full(n_sources, np.nan)
 
-        # Gini and M20 require cutout
-        cutout_size = 30
+    cutout_size = 30
+    for i in range(n_sources):
+        x, y = x_coords[i], y_coords[i]
         x_int, y_int = int(x), int(y)
         y_lo = max(0, y_int - cutout_size)
         y_hi = min(image.shape[0], y_int + cutout_size)
@@ -574,44 +582,44 @@ def extract_features_from_catalog(
         x_hi = min(image.shape[1], x_int + cutout_size)
         cutout = image[y_lo:y_hi, x_lo:x_hi]
 
-        gini = gini_coefficient(cutout)
-        m20 = m20_statistic(cutout, cutout_size, cutout_size)
-        asym = asymmetry_index(image, x, y)
+        gini_values[i] = gini_coefficient(cutout)
+        m20_values[i] = m20_statistic(cutout, cutout_size, cutout_size)
+        asym_values[i] = asymmetry_index(image, x, y)
 
-        # Errors
-        e_u = row.get(error_cols.get("u", "flux_u_err"), np.nan)
-        e_b = row.get(error_cols.get("b", "flux_b_err"), np.nan)
-        e_v = row.get(error_cols.get("v", "flux_v_err"), np.nan)
-        e_i = row.get(error_cols.get("i", "flux_i_err"), np.nan)
+    # Vectorized error extraction
+    e_u = catalog[error_cols.get("u", "flux_u_err")].values if error_cols.get("u", "flux_u_err") in catalog.columns else np.full(n_sources, np.nan)
+    e_b = catalog[error_cols.get("b", "flux_b_err")].values if error_cols.get("b", "flux_b_err") in catalog.columns else np.full(n_sources, np.nan)
+    e_v = catalog[error_cols.get("v", "flux_v_err")].values if error_cols.get("v", "flux_v_err") in catalog.columns else np.full(n_sources, np.nan)
+    e_i = catalog[error_cols.get("i", "flux_i_err")].values if error_cols.get("i", "flux_i_err") in catalog.columns else np.full(n_sources, np.nan)
 
-        # Radius error estimate (from SNR)
-        snr = f_i / e_i if e_i > 0 else np.nan
-        radius_err = r_half / snr if snr > 0 else np.nan
+    # Vectorized radius error estimate
+    with np.errstate(divide='ignore', invalid='ignore'):
+        snr = np.where(e_i > 0, f_i / e_i, np.nan)
+        radius_err = np.where(snr > 0, r_half_values / snr, np.nan)
 
-        features.append(
-            {
-                "flux_u": f_u,
-                "flux_b": f_b,
-                "flux_v": f_v,
-                "flux_i": f_i,
-                "color_ub": color_ub,
-                "color_bv": color_bv,
-                "color_vi": color_vi,
-                "mag_i": mag_i,
-                "concentration_c": c,
-                "half_light_radius": r_half,
-                "gini": gini,
-                "m20": m20,
-                "asymmetry": asym,
-                "flux_u_err": e_u,
-                "flux_b_err": e_b,
-                "flux_v_err": e_v,
-                "flux_i_err": e_i,
-                "radius_err": radius_err,
-            }
-        )
+    # Build DataFrame directly (much faster than appending dicts)
+    features_df = pd.DataFrame({
+        "flux_u": f_u,
+        "flux_b": f_b,
+        "flux_v": f_v,
+        "flux_i": f_i,
+        "color_ub": color_ub,
+        "color_bv": color_bv,
+        "color_vi": color_vi,
+        "mag_i": mag_i,
+        "concentration_c": c_values,
+        "half_light_radius": r_half_values,
+        "gini": gini_values,
+        "m20": m20_values,
+        "asymmetry": asym_values,
+        "flux_u_err": e_u,
+        "flux_b_err": e_b,
+        "flux_v_err": e_v,
+        "flux_i_err": e_i,
+        "radius_err": radius_err,
+    }, index=catalog.index)
 
-    return pd.DataFrame(features, index=catalog.index)
+    return features_df
 
 
 def extract_features_from_photometry(
@@ -661,214 +669,69 @@ def extract_features_from_photometry(
             "asymmetry": "asymmetry",
         }
 
-    features = []
+    n_sources = len(catalog)
 
-    for idx, row in catalog.iterrows():
-        # Photometric features
-        f_u = row.get(flux_cols.get("u", "flux_u"), np.nan)
-        f_b = row.get(flux_cols.get("b", "flux_b"), np.nan)
-        f_v = row.get(flux_cols.get("v", "flux_v"), np.nan)
-        f_i = row.get(flux_cols.get("i", "flux_i"), np.nan)
+    # Helper to safely get column values
+    def get_col(col_name: str) -> NDArray:
+        if col_name in catalog.columns:
+            return catalog[col_name].values
+        return np.full(n_sources, np.nan)
 
-        # Colors
-        def safe_color(f1, f2):
-            if f1 > 0 and f2 > 0:
-                return -2.5 * np.log10(f1 / f2)
-            return np.nan
+    # Vectorized photometric feature extraction
+    f_u = get_col(flux_cols.get("u", "flux_u"))
+    f_b = get_col(flux_cols.get("b", "flux_b"))
+    f_v = get_col(flux_cols.get("v", "flux_v"))
+    f_i = get_col(flux_cols.get("i", "flux_i"))
 
-        color_ub = safe_color(f_u, f_b)
-        color_bv = safe_color(f_b, f_v)
-        color_vi = safe_color(f_v, f_i)
+    # Vectorized color computation
+    color_ub = _safe_color_vectorized(f_u, f_b)
+    color_bv = _safe_color_vectorized(f_b, f_v)
+    color_vi = _safe_color_vectorized(f_v, f_i)
 
-        # Magnitude
-        mag_i = -2.5 * np.log10(f_i) if f_i > 0 else np.nan
+    # Vectorized magnitude
+    with np.errstate(divide='ignore', invalid='ignore'):
+        mag_i = np.where(f_i > 0, -2.5 * np.log10(f_i), np.nan)
 
-        # Morphological features from columns
-        c = row.get(morphology_cols.get("concentration_c", "concentration_c"), np.nan)
-        r_half = row.get(
-            morphology_cols.get("half_light_radius", "half_light_radius"), np.nan
-        )
-        gini = row.get(morphology_cols.get("gini", "gini"), np.nan)
-        m20 = row.get(morphology_cols.get("m20", "m20"), np.nan)
-        asym = row.get(morphology_cols.get("asymmetry", "asymmetry"), np.nan)
+    # Vectorized morphological feature extraction from columns
+    c = get_col(morphology_cols.get("concentration_c", "concentration_c"))
+    r_half = get_col(morphology_cols.get("half_light_radius", "half_light_radius"))
+    gini = get_col(morphology_cols.get("gini", "gini"))
+    m20 = get_col(morphology_cols.get("m20", "m20"))
+    asym = get_col(morphology_cols.get("asymmetry", "asymmetry"))
 
-        # Errors
-        e_u = row.get(error_cols.get("u", "flux_u_err"), np.nan)
-        e_b = row.get(error_cols.get("b", "flux_b_err"), np.nan)
-        e_v = row.get(error_cols.get("v", "flux_v_err"), np.nan)
-        e_i = row.get(error_cols.get("i", "flux_i_err"), np.nan)
+    # Vectorized error extraction
+    e_u = get_col(error_cols.get("u", "flux_u_err"))
+    e_b = get_col(error_cols.get("b", "flux_b_err"))
+    e_v = get_col(error_cols.get("v", "flux_v_err"))
+    e_i = get_col(error_cols.get("i", "flux_i_err"))
 
-        # Radius error estimate
-        snr = f_i / e_i if e_i > 0 else np.nan
-        radius_err = r_half / snr if snr > 0 else np.nan
+    # Vectorized radius error estimate
+    with np.errstate(divide='ignore', invalid='ignore'):
+        snr = np.where(e_i > 0, f_i / e_i, np.nan)
+        radius_err = np.where(snr > 0, r_half / snr, np.nan)
 
-        features.append(
-            {
-                "flux_u": f_u,
-                "flux_b": f_b,
-                "flux_v": f_v,
-                "flux_i": f_i,
-                "color_ub": color_ub,
-                "color_bv": color_bv,
-                "color_vi": color_vi,
-                "mag_i": mag_i,
-                "concentration_c": c,
-                "half_light_radius": r_half,
-                "gini": gini,
-                "m20": m20,
-                "asymmetry": asym,
-                "flux_u_err": e_u,
-                "flux_b_err": e_b,
-                "flux_v_err": e_v,
-                "flux_i_err": e_i,
-                "radius_err": radius_err,
-            }
-        )
+    # Build DataFrame directly (much faster than appending dicts)
+    features_df = pd.DataFrame({
+        "flux_u": f_u,
+        "flux_b": f_b,
+        "flux_v": f_v,
+        "flux_i": f_i,
+        "color_ub": color_ub,
+        "color_bv": color_bv,
+        "color_vi": color_vi,
+        "mag_i": mag_i,
+        "concentration_c": c,
+        "half_light_radius": r_half,
+        "gini": gini,
+        "m20": m20,
+        "asymmetry": asym,
+        "flux_u_err": e_u,
+        "flux_b_err": e_b,
+        "flux_v_err": e_v,
+        "flux_i_err": e_i,
+        "radius_err": radius_err,
+    }, index=catalog.index)
 
-    return pd.DataFrame(features, index=catalog.index)
+    return features_df
 
 
-def train_from_external_catalogs(
-    our_catalog: pd.DataFrame,
-    our_image: NDArray | None = None,
-    hlf_catalog: pd.DataFrame | None = None,
-    match_radius_arcsec: float = 1.0,
-    output_model_path: Path | str | None = None,
-    flux_cols: dict[str, str] | None = None,
-    error_cols: dict[str, str] | None = None,
-    star_flag_col: str = "CLASS_STAR",
-    star_threshold: float = 0.9,
-    verbose: bool = True,
-) -> MLStarGalaxyClassifier:
-    """Train classifier using external reference catalogs.
-
-    This function cross-matches your catalog with HLF or similar reference
-    catalogs to obtain ground-truth star/galaxy labels for training.
-
-    Parameters
-    ----------
-    our_catalog : pd.DataFrame
-        Your source catalog with RA, DEC and photometry
-    our_image : NDArray, optional
-        Image for morphological feature extraction
-    hlf_catalog : pd.DataFrame, optional
-        Reference catalog with star/galaxy classification
-    match_radius_arcsec : float
-        Maximum match radius in arcseconds (default: 1.0)
-    output_model_path : Path, optional
-        Save trained model to this path
-    flux_cols : dict
-        Flux column name mapping
-    error_cols : dict
-        Error column name mapping
-    star_flag_col : str
-        Column name for star probability in reference catalog
-    star_threshold : float
-        Threshold above which sources are classified as stars
-    verbose : bool
-        Print progress information
-
-    Returns
-    -------
-    MLStarGalaxyClassifier
-        Trained classifier
-    """
-    from astropy import units as u
-    from astropy.coordinates import SkyCoord, match_coordinates_sky
-
-    if verbose:
-        print("Training ML Star-Galaxy Classifier from external catalogs...")
-
-    # Load HLF catalog if not provided
-    if hlf_catalog is None:
-        try:
-            from validation.external_catalogs import load_hlf_catalog
-
-            if verbose:
-                print("Loading HLF reference catalog...")
-            hlf_catalog = load_hlf_catalog()
-        except Exception as e:
-            raise ValueError(
-                f"Could not load HLF catalog: {e}. "
-                "Please provide hlf_catalog parameter."
-            ) from e
-
-    # Cross-match catalogs
-    if verbose:
-        print(f"Cross-matching {len(our_catalog)} sources with {len(hlf_catalog)} reference sources...")
-
-    our_coords = SkyCoord(
-        ra=our_catalog["ra"].values * u.deg,
-        dec=our_catalog["dec"].values * u.deg,
-    )
-    ref_coords = SkyCoord(
-        ra=hlf_catalog["ra"].values * u.deg,
-        dec=hlf_catalog["dec"].values * u.deg,
-    )
-
-    idx, sep, _ = match_coordinates_sky(our_coords, ref_coords)
-    matched_mask = sep.arcsec < match_radius_arcsec
-
-    if matched_mask.sum() < 50:
-        raise ValueError(
-            f"Only {matched_mask.sum()} matches found. "
-            "Check coordinate systems or increase match_radius_arcsec."
-        )
-
-    if verbose:
-        print(f"Found {matched_mask.sum()} matches within {match_radius_arcsec} arcsec")
-
-    # Get matched sources
-    matched_our = our_catalog[matched_mask].copy()
-    matched_ref = hlf_catalog.iloc[idx[matched_mask]].copy()
-
-    # Extract labels from reference catalog
-    if star_flag_col in matched_ref.columns:
-        # CLASS_STAR > threshold means star
-        labels = (matched_ref[star_flag_col].values < star_threshold).astype(int)
-    else:
-        raise ValueError(
-            f"Star flag column '{star_flag_col}' not found in reference catalog. "
-            f"Available columns: {list(matched_ref.columns)}"
-        )
-
-    n_galaxies = labels.sum()
-    n_stars = len(labels) - n_galaxies
-    if verbose:
-        print(f"Training set: {n_galaxies} galaxies, {n_stars} stars")
-
-    # Extract features
-    if verbose:
-        print("Extracting features...")
-
-    if our_image is not None:
-        features = extract_features_from_catalog(
-            matched_our,
-            our_image,
-            flux_cols=flux_cols,
-            error_cols=error_cols,
-        )
-    else:
-        features = extract_features_from_photometry(
-            matched_our,
-            flux_cols=flux_cols,
-            error_cols=error_cols,
-        )
-
-    # Train classifier
-    if verbose:
-        print("Training Random Forest classifier...")
-
-    clf = MLStarGalaxyClassifier()
-    metrics = clf.fit(features, labels)
-
-    if verbose:
-        clf.print_metrics()
-
-    # Save model if path provided
-    if output_model_path is not None:
-        clf.save(output_model_path)
-        if verbose:
-            print(f"Model saved to: {output_model_path}")
-
-    return clf

@@ -3,9 +3,10 @@
 Verify that the transformed star mask aligns with bright stars in the mosaic.
 """
 
+import matplotlib
 import numpy as np
 from astropy.io import fits
-import matplotlib
+
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
@@ -20,7 +21,8 @@ with fits.open("data/star_mask_mosaic.fits") as hdul:
     mask = hdul[0].data.astype(bool)
 
 # Find mask regions
-from scipy import ndimage
+from scipy import ndimage  # noqa: E402
+
 labeled, num_features = ndimage.label(mask)
 print(f"Found {num_features} mask regions")
 

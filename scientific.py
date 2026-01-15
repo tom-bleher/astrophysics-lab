@@ -6,6 +6,7 @@ Performance notes:
 - References: astropy.cosmology documentation, scipy.integrate.quad_vec
 """
 
+from dataclasses import dataclass
 from functools import lru_cache
 from typing import Literal
 
@@ -13,6 +14,7 @@ import numpy as np
 from numpy.typing import ArrayLike, NDArray
 from scipy.integrate import quad
 from scipy.optimize import curve_fit
+from scipy.stats import chi2 as chi2_dist
 
 # Physical constants
 c: float = 299792.458  # speed of light [km/s]
@@ -23,14 +25,119 @@ ARCSEC_TO_RAD: float = np.pi / (180.0 * 3600.0)  # ~4.848e-6 rad/arcsec
 _COSMO_CACHE: dict = {}
 
 
+@dataclass
+class CosmologyFitResult:
+    """Results from flat LCDM cosmological fit.
+
+    Attributes
+    ----------
+    R_mpc : float
+        Best-fit galaxy size in Mpc
+    Omega_L : float
+        Best-fit dark energy density parameter
+    R_err : float
+        1-sigma uncertainty on R
+    Omega_L_err : float
+        1-sigma uncertainty on Omega_L
+    chi2_reduced : float
+        Reduced chi-squared (chi2 / dof)
+    p_value : float
+        p-value for goodness of fit (probability of observing
+        chi2 >= observed if model is correct)
+    n_points : int
+        Number of data points used in fit
+    """
+
+    R_mpc: float
+    Omega_L: float
+    R_err: float
+    Omega_L_err: float
+    chi2_reduced: float
+    p_value: float
+    n_points: int
+
+    @property
+    def Omega_m(self) -> float:
+        """Matter density (flat universe: Omega_m = 1 - Omega_L)."""
+        return 1.0 - self.Omega_L
+
+    @property
+    def Omega_m_err(self) -> float:
+        """Uncertainty on Omega_m (same as Omega_L for flat universe)."""
+        return self.Omega_L_err
+
+    @property
+    def R_kpc(self) -> float:
+        """Best-fit radius in kpc."""
+        return self.R_mpc * 1000
+
+    @property
+    def R_kpc_err(self) -> float:
+        """Uncertainty on R in kpc."""
+        return self.R_err * 1000
+
+
+def compute_chi2_stats(
+    z_data: ArrayLike,
+    theta_data: ArrayLike,
+    theta_err: ArrayLike,
+    model_func: callable,
+    n_params: int = 1,
+) -> dict:
+    """Compute χ²/ndf and p-value for a model fit.
+
+    Parameters
+    ----------
+    z_data : array-like
+        Redshift values of binned data.
+    theta_data : array-like
+        Observed angular sizes (arcsec).
+    theta_err : array-like
+        Uncertainties on angular sizes (arcsec).
+    model_func : callable
+        Function that takes z and returns model θ in arcsec.
+    n_params : int
+        Number of fitted parameters (for degrees of freedom).
+
+    Returns
+    -------
+    dict
+        Contains 'chi2', 'ndf', 'chi2_ndf', 'p_value'
+    """
+    theta_model = model_func(np.asarray(z_data))
+
+    # Chi-squared
+    residuals = (np.asarray(theta_data) - theta_model) / np.asarray(theta_err)
+    chi2 = float(np.sum(residuals**2))
+
+    # Degrees of freedom
+    ndf = len(z_data) - n_params
+
+    if ndf <= 0:
+        return {"chi2": chi2, "ndf": ndf, "chi2_ndf": np.nan, "p_value": np.nan}
+
+    chi2_ndf = chi2 / ndf
+
+    # P-value: probability of getting χ² this large or larger by chance
+    # if the model is correct
+    p_value = float(1.0 - chi2_dist.cdf(chi2, ndf))
+
+    return {
+        "chi2": chi2,
+        "ndf": ndf,
+        "chi2_ndf": chi2_ndf,
+        "p_value": p_value,
+    }
+
+
 def _get_cosmology(Omega_m: float, Omega_L: float):
     """Get or create a cached astropy FlatLambdaCDM cosmology object.
 
     Astropy's cosmology module provides highly optimized, vectorized
     distance calculations that are 10-50x faster than scipy.integrate.quad.
     """
-    from astropy.cosmology import FlatLambdaCDM
     import astropy.units as u
+    from astropy.cosmology import FlatLambdaCDM
 
     key = (round(Omega_m, 6), round(Omega_L, 6))
     if key not in _COSMO_CACHE:
@@ -105,6 +212,182 @@ def theta_lcdm_flat(z: ArrayLike, R: float, Omega_m: float) -> NDArray[np.floati
     """
     Omega_L = 1.0 - Omega_m
     return theta_lcdm(z, R, Omega_m, Omega_L)
+
+
+def _theta_flat_for_fit(z: ArrayLike, R: float, Omega_L: float) -> NDArray[np.floating]:
+    """Angular size model for curve_fit (fits Omega_L, not Omega_m).
+
+    Returns angular size in arcseconds (not radians) for direct comparison
+    with observed data.
+    """
+    Omega_m = 1.0 - Omega_L
+    theta_rad = theta_lcdm(z, R, Omega_m, Omega_L)
+    return theta_rad / ARCSEC_TO_RAD  # Convert to arcseconds
+
+
+def fit_flat_lcdm(
+    z: ArrayLike,
+    theta_arcsec: ArrayLike,
+    theta_error_arcsec: ArrayLike,
+    *,
+    z_error: ArrayLike | None = None,
+    Omega_L_init: float = 0.7,
+    maxfev: int = 8000,
+) -> CosmologyFitResult:
+    """Fit R and Ω_Λ under a flat-universe assumption (Ω_m + Ω_Λ = 1).
+
+    Fits a 2-parameter model to angular-size data:
+
+        θ(z) = R / D_A(z; Ω_m, Ω_Λ)
+
+    with the flatness constraint Ω_m = 1 - Ω_Λ.
+
+    Parameters
+    ----------
+    z : array-like
+        Redshift values
+    theta_arcsec : array-like
+        Observed angular sizes in arcseconds
+    theta_error_arcsec : array-like
+        1σ uncertainties on angular sizes in arcseconds
+    z_error : array-like, optional
+        Redshift uncertainties (propagated into total θ uncertainty)
+    Omega_L_init : float
+        Initial guess for Ω_Λ (default 0.7)
+    maxfev : int
+        Maximum function evaluations for curve_fit
+
+    Returns
+    -------
+    CosmologyFitResult
+        Dataclass with R_mpc, Omega_L, uncertainties, and fit quality metrics
+
+    Notes
+    -----
+    Uses vectorized astropy cosmology calculations (10-50x faster than
+    scipy.integrate.quad loops).
+
+    If z_error is provided, it is propagated into total uncertainty using:
+        σ_total² = σ_θ² + (dθ/dz)² × σ_z²
+    where dθ/dz ≈ -θ/z is a simplified approximation valid for most cosmologies.
+    """
+    z = np.asarray(z, dtype=float)
+    theta_arcsec = np.asarray(theta_arcsec, dtype=float)
+    theta_error_arcsec = np.asarray(theta_error_arcsec, dtype=float)
+
+    if z_error is not None:
+        z_error = np.asarray(z_error, dtype=float)
+    else:
+        z_error = np.zeros_like(z)
+
+    # Filter valid data points
+    mask = (
+        np.isfinite(z)
+        & np.isfinite(theta_arcsec)
+        & np.isfinite(theta_error_arcsec)
+        & np.isfinite(z_error)
+        & (z > 0)
+        & (theta_error_arcsec > 0)
+    )
+    if mask.sum() < 3:
+        return CosmologyFitResult(
+            R_mpc=np.nan,
+            Omega_L=np.nan,
+            R_err=np.nan,
+            Omega_L_err=np.nan,
+            chi2_reduced=np.nan,
+            p_value=np.nan,
+            n_points=int(mask.sum()),
+        )
+
+    z = z[mask]
+    theta_arcsec = theta_arcsec[mask]
+    theta_error_arcsec = theta_error_arcsec[mask]
+    z_error = z_error[mask]
+
+    # Avoid z=0 which breaks angular-diameter distance
+    z = np.clip(z, 1e-6, None)
+
+    # Numerical stability: ensure non-zero errors
+    min_err = np.nanmax(theta_error_arcsec) * 1e-6 + 1e-12
+    theta_error_arcsec = np.maximum(theta_error_arcsec, min_err)
+
+    # Propagate z_error into total theta error
+    # Error propagation: σ_total² = σ_θ² + (dθ/dz)² × σ_z²
+    # Approximate: dθ/dz ≈ -θ/z (angular size decreases with redshift)
+    if np.any(z_error > 0):
+        dtheta_dz = np.abs(theta_arcsec / z)
+        theta_error_total = np.sqrt(
+            theta_error_arcsec**2 + (dtheta_dz * z_error) ** 2
+        )
+    else:
+        theta_error_total = theta_error_arcsec
+
+    # Initial guess for R using LCDM D_A with initial Omega_L guess
+    Omega_m_init = 1.0 - Omega_L_init
+    D_A_init = D_A_LCDM_vectorized(z, Omega_m_init, Omega_L_init)
+    theta_rad = theta_arcsec * ARCSEC_TO_RAD
+    R_estimates = theta_rad * D_A_init
+    R_init = float(np.nanmedian(R_estimates))
+    if not np.isfinite(R_init) or R_init <= 0:
+        R_init = 0.01  # fallback ~10 kpc
+
+    # Ensure R_init is within bounds
+    R_init = max(R_init, 1e-7)  # Ensure above lower bound
+
+    # Fit using curve_fit
+    try:
+        popt, pcov = curve_fit(
+            _theta_flat_for_fit,
+            z,
+            theta_arcsec,
+            sigma=theta_error_total,
+            absolute_sigma=True,
+            maxfev=maxfev,
+            p0=[R_init, Omega_L_init],
+            bounds=([1e-8, 0.0], [np.inf, 1.0]),
+        )
+    except (RuntimeError, ValueError) as e:
+        # Fitting failed to converge or initial guess outside bounds
+        return CosmologyFitResult(
+            R_mpc=np.nan,
+            Omega_L=np.nan,
+            R_err=np.nan,
+            Omega_L_err=np.nan,
+            chi2_reduced=np.nan,
+            p_value=np.nan,
+            n_points=len(z),
+        )
+
+    R_fit = float(popt[0])
+    Omega_L_fit = float(popt[1])
+
+    # Extract uncertainties from covariance matrix
+    if np.all(np.isfinite(pcov)):
+        perr = np.sqrt(np.diag(pcov))
+        R_err = float(perr[0])
+        Omega_L_err = float(perr[1])
+    else:
+        R_err = np.nan
+        Omega_L_err = np.nan
+
+    # Calculate goodness-of-fit metrics
+    theta_model = _theta_flat_for_fit(z, R_fit, Omega_L_fit)
+    residuals = theta_arcsec - theta_model
+    chi_squared = np.sum((residuals / theta_error_total) ** 2)
+    dof = len(z) - 2  # two fitted parameters
+    chi2_reduced = chi_squared / dof if dof > 0 else np.nan
+    p_value = float(chi2_dist.sf(chi_squared, df=dof)) if dof > 0 else np.nan
+
+    return CosmologyFitResult(
+        R_mpc=R_fit,
+        Omega_L=Omega_L_fit,
+        R_err=R_err,
+        Omega_L_err=Omega_L_err,
+        chi2_reduced=chi2_reduced,
+        p_value=p_value,
+        n_points=len(z),
+    )
 
 
 def choose_redshift_bin_edges(
@@ -261,14 +544,17 @@ def get_radius_and_omega(
     z: ArrayLike,
     theta_arcsec: ArrayLike,
     theta_error: ArrayLike,
-) -> tuple[float, float]:
+    *,
+    z_error: ArrayLike | None = None,
+    full_output: bool = False,
+) -> tuple[float, float] | CosmologyFitResult:
     """
-    Fit both physical radius R and matter density Omega_m for flat LCDM cosmology.
+    Fit both physical radius R and Omega_L for flat LCDM cosmology.
 
-    Uses grid search over Omega_m, computing R directly for each trial value,
-    then minimizes chi-squared to find best-fit parameters.
+    Uses scipy curve_fit for joint parameter estimation with proper
+    uncertainty propagation.
 
-    Enforces flat universe: Omega_Lambda = 1 - Omega_m
+    Enforces flat universe: Omega_m = 1 - Omega_L
 
     Parameters
     ----------
@@ -278,53 +564,28 @@ def get_radius_and_omega(
         Angular sizes in arcseconds.
     theta_error : array-like
         Uncertainties on angular sizes in arcseconds.
+    z_error : array-like, optional
+        Redshift uncertainties (propagated into total theta uncertainty).
+    full_output : bool
+        If True, return full CosmologyFitResult with uncertainties and
+        goodness-of-fit metrics. If False (default), return simple tuple
+        (R_fit, Omega_m_fit) for backwards compatibility.
 
     Returns
     -------
-    tuple[float, float]
-        (R_fit, Omega_m_fit) - Best-fit physical radius [Mpc] and matter density.
+    tuple[float, float] or CosmologyFitResult
+        If full_output=False: (R_fit, Omega_m_fit) tuple
+        If full_output=True: CosmologyFitResult dataclass with all fit info
     """
-    from scipy.optimize import minimize_scalar
+    result = fit_flat_lcdm(
+        z,
+        theta_arcsec,
+        theta_error,
+        z_error=z_error,
+    )
 
-    z = np.asarray(z, dtype=float)
-    theta_arcsec = np.asarray(theta_arcsec, dtype=float)
-    theta_error = np.asarray(theta_error, dtype=float)
+    if full_output:
+        return result
 
-    # Filter finite values
-    mask = np.isfinite(z) & np.isfinite(theta_arcsec) & np.isfinite(theta_error) & (theta_error > 0)
-    if mask.sum() < 3:
-        return np.nan, np.nan
-
-    z = z[mask]
-    theta_arcsec = theta_arcsec[mask]
-    theta_error = theta_error[mask]
-
-    # Convert to radians
-    theta_rad = theta_arcsec * ARCSEC_TO_RAD
-    theta_error_rad = theta_error * ARCSEC_TO_RAD
-
-    def chi_squared(Omega_m):
-        """Compute chi-squared for given Omega_m."""
-        if Omega_m <= 0.01 or Omega_m >= 0.99:
-            return 1e10
-
-        # Calculate R for this Omega_m
-        R = get_radius(z, theta_arcsec, theta_error, model="lcdm", Omega_m=Omega_m)
-        if not np.isfinite(R) or R <= 0:
-            return 1e10
-
-        # Calculate model predictions
-        theta_model = theta_lcdm_flat(z, R, Omega_m)
-
-        # Chi-squared
-        chi2 = np.sum(((theta_rad - theta_model) / theta_error_rad) ** 2)
-        return chi2
-
-    # Find best-fit Omega_m
-    result = minimize_scalar(chi_squared, bounds=(0.05, 0.95), method='bounded')
-    Omega_m_fit = result.x
-
-    # Calculate R for best-fit Omega_m
-    R_fit = get_radius(z, theta_arcsec, theta_error, model="lcdm", Omega_m=Omega_m_fit)
-
-    return R_fit, Omega_m_fit
+    # Backwards compatible: return (R, Omega_m) tuple
+    return result.R_mpc, result.Omega_m

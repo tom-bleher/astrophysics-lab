@@ -4,24 +4,37 @@ This module provides tools for separating point sources (stars)
 from extended sources (galaxies) using concentration, size, and
 other morphological parameters.
 
-Methods:
+Methods (basic):
 - Concentration index (stars are more concentrated)
 - Size relative to PSF (stars are unresolved)
 - Half-light radius comparison
 - ML-based classification (Random Forest with combined features)
 
+For professional-grade classification, use the professional_classification
+module which implements:
+- Multi-tier classification (Gaia → SPREAD_MODEL → ML → Color)
+- Empirical PSF measurement from Gaia stars
+- SPREAD_MODEL morphology comparison
+- Magnitude-dependent thresholds
+- Comprehensive validation metrics
+
 References:
 - Odewahn et al. 1992, AJ, 103, 318
 - Abraham et al. 1994, ApJ, 432, 75
 - Baqui et al. 2021, A&A, 645, A87 (miniJPAS ML classification)
+- Cook et al. 2024, MNRAS (WAVES UMAP+HDBSCAN)
+- Desai et al. 2012, ApJ (SPREAD_MODEL)
 """
 
 from pathlib import Path
-from typing import Optional
+from typing import TYPE_CHECKING
 
 import numpy as np
 import pandas as pd
 from numpy.typing import NDArray
+
+if TYPE_CHECKING:
+    pass
 
 
 def get_stellarity_index(
@@ -89,44 +102,47 @@ def classify_star_galaxy(
     pd.Series
         Boolean series: True = galaxy, False = star
     """
-    from morphology.concentration import concentration_index, half_light_radius
+    from morphology.concentration import (
+        concentration_index_batch,
+        half_light_radius_batch,
+    )
 
-    is_galaxy = pd.Series(index=catalog.index, dtype=bool)
+    # Extract coordinates as numpy arrays for vectorized processing
+    x_coords = catalog[x_col].values
+    y_coords = catalog[y_col].values
+    psf_sigma = psf_fwhm / 2.35
 
     if method == "concentration":
-        for idx, row in catalog.iterrows():
-            x, y = row[x_col], row[y_col]
-            c = concentration_index(image, x, y)
-            # Stars are MORE concentrated (lower concentration index)
-            is_galaxy[idx] = c > c_threshold if np.isfinite(c) else True
+        # Vectorized concentration calculation
+        c_values = concentration_index_batch(image, x_coords, y_coords)
+        # Stars are MORE concentrated (lower concentration index)
+        is_galaxy = np.where(np.isfinite(c_values), c_values > c_threshold, True)
 
     elif method == "size":
-        psf_sigma = psf_fwhm / 2.35
-        for idx, row in catalog.iterrows():
-            x, y = row[x_col], row[y_col]
-            r_half = half_light_radius(image, x, y)
-            # Galaxies are larger than PSF
-            is_galaxy[idx] = r_half > 1.5 * psf_sigma if np.isfinite(r_half) else True
+        # Vectorized half-light radius calculation
+        r_half_values = half_light_radius_batch(image, x_coords, y_coords)
+        # Galaxies are larger than PSF
+        is_galaxy = np.where(
+            np.isfinite(r_half_values), r_half_values > 1.5 * psf_sigma, True
+        )
 
     elif method == "combined":
-        for idx, row in catalog.iterrows():
-            x, y = row[x_col], row[y_col]
+        # Vectorized computation of both metrics
+        c_values = concentration_index_batch(image, x_coords, y_coords)
+        r_half_values = half_light_radius_batch(image, x_coords, y_coords)
 
-            c = concentration_index(image, x, y)
-            r_half = half_light_radius(image, x, y)
+        c_galaxy = np.where(np.isfinite(c_values), c_values > c_threshold, True)
+        size_galaxy = np.where(
+            np.isfinite(r_half_values), r_half_values > 1.5 * psf_sigma, True
+        )
 
-            c_galaxy = c > c_threshold if np.isfinite(c) else True
-
-            psf_sigma = psf_fwhm / 2.35
-            size_galaxy = r_half > 1.5 * psf_sigma if np.isfinite(r_half) else True
-
-            # Both criteria must agree for confident classification
-            is_galaxy[idx] = c_galaxy or size_galaxy
+        # Both criteria must agree for confident classification
+        is_galaxy = c_galaxy | size_galaxy
 
     else:
         raise ValueError(f"Unknown method: {method}")
 
-    return is_galaxy
+    return pd.Series(is_galaxy, index=catalog.index, dtype=bool)
 
 
 def classify_star_galaxy_batch(
@@ -135,11 +151,11 @@ def classify_star_galaxy_batch(
     x_col: str = "xcentroid",
     y_col: str = "ycentroid",
     psf_fwhm: float = 2.5,
-    snr_threshold: float = 5.0,
+    _snr_threshold: float = 5.0,
     method: str = "combined",
-    ml_model_path: Optional[Path | str] = None,
-    flux_cols: Optional[dict[str, str]] = None,
-    error_cols: Optional[dict[str, str]] = None,
+    ml_model_path: Path | str | None = None,
+    flux_cols: dict[str, str] | None = None,
+    error_cols: dict[str, str] | None = None,
 ) -> pd.DataFrame:
     """Classify stars/galaxies with multiple parameters and confidence.
 
@@ -208,7 +224,7 @@ def classify_star_galaxy_batch(
 
         # Build output DataFrame matching expected format
         output = []
-        for idx, r in zip(catalog.index, results):
+        for idx, r in zip(catalog.index, results, strict=False):
             output.append(
                 {
                     "source_id": idx,
@@ -223,64 +239,75 @@ def classify_star_galaxy_batch(
             )
         return pd.DataFrame(output)
 
-    # Classical methods
-    from morphology.concentration import (
-        calculate_concentration_c,
-        concentration_index,
-        half_light_radius,
-    )
+    # Classical methods - use vectorized batch processing
+    from morphology.concentration import compute_morphology_batch
 
-    results = []
+    # Extract coordinates as numpy arrays
+    x_coords = catalog[x_col].values
+    y_coords = catalog[y_col].values
+    n_sources = len(catalog)
 
-    for idx, row in catalog.iterrows():
-        x, y = row[x_col], row[y_col]
+    # Compute all morphological parameters at once (much faster than iterrows)
+    morphology = compute_morphology_batch(image, x_coords, y_coords)
 
-        # Measure parameters
-        c = concentration_index(image, x, y)
-        c_full = calculate_concentration_c(image, x, y)
-        r_half = half_light_radius(image, x, y)
+    c_values = morphology['concentration']
+    c_full_values = morphology['concentration_c']
+    r_half_values = morphology['half_light_radius']
 
-        # Calculate stellarity
-        if np.isfinite(r_half):
-            stellarity = get_stellarity_index(r_half, image[int(y), int(x)], psf_fwhm)
-        else:
-            stellarity = np.nan
+    # Vectorized stellarity calculation
+    stellarity_values = np.full(n_sources, np.nan)
+    valid_r_half = np.isfinite(r_half_values)
 
-        # Classification logic
-        psf_sigma = psf_fwhm / 2.35
+    # Get peak flux values for valid sources
+    y_int = np.clip(y_coords.astype(int), 0, image.shape[0] - 1)
+    x_int = np.clip(x_coords.astype(int), 0, image.shape[1] - 1)
+    peak_flux = image[y_int, x_int]
 
-        # Size criterion
-        size_star = r_half < 1.5 * psf_sigma if np.isfinite(r_half) else False
+    # Vectorized stellarity calculation
+    stellarity_values[valid_r_half] = np.array([
+        get_stellarity_index(r_half_values[i], peak_flux[i], psf_fwhm)
+        for i in np.where(valid_r_half)[0]
+    ])
 
-        # Concentration criterion (stars have C > 2.8 typically)
-        conc_star = c_full > 2.8 if np.isfinite(c_full) else False
+    # Vectorized classification logic
+    psf_sigma = psf_fwhm / 2.35
 
-        # Combined classification
-        if size_star and conc_star:
-            is_galaxy = False
-            confidence = 0.9
-        elif not size_star and not conc_star:
-            is_galaxy = True
-            confidence = 0.9
-        elif size_star != conc_star:
-            # Disagreement - use size as primary
-            is_galaxy = not size_star
-            confidence = 0.6
-        else:
-            is_galaxy = True  # Default to galaxy
-            confidence = 0.5
+    # Size criterion (stars are smaller than PSF)
+    size_star = np.where(np.isfinite(r_half_values), r_half_values < 1.5 * psf_sigma, False)
 
-        results.append({
-            "source_id": idx,
-            "is_galaxy": is_galaxy,
-            "stellarity": stellarity,
-            "concentration": c,
-            "concentration_c": c_full,
-            "half_light_radius": r_half,
-            "confidence": confidence,
-        })
+    # Concentration criterion (stars have C > 2.8 typically)
+    conc_star = np.where(np.isfinite(c_full_values), c_full_values > 2.8, False)
 
-    return pd.DataFrame(results)
+    # Vectorized classification
+    is_galaxy = np.full(n_sources, True)  # Default to galaxy
+    confidence = np.full(n_sources, 0.5)
+
+    # Both criteria agree: star
+    both_star = size_star & conc_star
+    is_galaxy[both_star] = False
+    confidence[both_star] = 0.9
+
+    # Both criteria agree: galaxy
+    both_galaxy = ~size_star & ~conc_star
+    confidence[both_galaxy] = 0.9
+
+    # Disagreement - use size as primary
+    disagree = size_star != conc_star
+    is_galaxy[disagree] = ~size_star[disagree]
+    confidence[disagree] = 0.6
+
+    # Build results DataFrame
+    results = pd.DataFrame({
+        "source_id": catalog.index,
+        "is_galaxy": is_galaxy,
+        "stellarity": stellarity_values,
+        "concentration": c_values,
+        "concentration_c": c_full_values,
+        "half_light_radius": r_half_values,
+        "confidence": confidence,
+    })
+
+    return results
 
 
 def apply_star_mask(
@@ -309,7 +336,7 @@ def apply_star_mask(
     n_stars = n_total - n_galaxies
 
     if verbose:
-        print(f"Star/galaxy classification:")
+        print("Star/galaxy classification:")
         print(f"  Total sources: {n_total}")
         print(f"  Stars:         {n_stars} ({100*n_stars/n_total:.1f}%)")
         print(f"  Galaxies:      {n_galaxies} ({100*n_galaxies/n_total:.1f}%)")
@@ -397,3 +424,316 @@ def plot_star_galaxy_separation(
 
     plt.tight_layout()
     return fig
+
+
+# =============================================================================
+# Professional Classification Integration
+# =============================================================================
+
+def classify_professional(
+    catalog: pd.DataFrame,
+    image: np.ndarray,
+    wcs=None,
+    gaia_catalog: pd.DataFrame | None = None,
+    ml_classifier=None,
+    x_col: str = "xcentroid",
+    y_col: str = "ycentroid",
+    ra_col: str = "ra",
+    dec_col: str = "dec",
+    mag_col: str = "mag_auto",
+    flux_cols: dict | None = None,
+    error_cols: dict | None = None,
+    pixel_scale: float = 0.04,
+    verbose: bool = True,
+) -> pd.DataFrame:
+    """Professional multi-tier star-galaxy classification.
+
+    This is a convenience wrapper around the professional_classification module.
+    It implements survey-standard classification using:
+
+    Tier 1: Gaia cross-match (100% confidence for bright stars)
+    Tier 2: SPREAD_MODEL morphology (high confidence)
+    Tier 3: Classical morphology (concentration + size)
+    Tier 4: ML classifier (if available)
+    Tier 5: Color-color stellar locus
+
+    Parameters
+    ----------
+    catalog : pd.DataFrame
+        Source catalog with positions and photometry
+    image : NDArray
+        2D image array for morphological measurements
+    wcs : WCS, optional
+        WCS for coordinate transformation
+    gaia_catalog : pd.DataFrame, optional
+        Gaia DR3 catalog for cross-matching
+    ml_classifier : optional
+        Trained ML classifier (MLStarGalaxyClassifier)
+    x_col, y_col : str
+        Column names for pixel positions
+    ra_col, dec_col : str
+        Column names for sky coordinates
+    mag_col : str
+        Column name for magnitude (for thresholds)
+    flux_cols : dict, optional
+        Mapping of band name to flux column
+    error_cols : dict, optional
+        Mapping of band name to error column
+    pixel_scale : float
+        Pixel scale in arcsec/pixel
+    verbose : bool
+        Print progress information
+
+    Returns
+    -------
+    pd.DataFrame
+        Classification results with columns:
+        - is_galaxy: Final classification
+        - is_star: Inverse of is_galaxy
+        - probability_galaxy: Probability (0-1)
+        - confidence: Classification confidence (0-1)
+        - classification_method: Primary method used
+        - classification_tier: Tier of classification
+        - spread_model: SPREAD_MODEL value
+        - gaia_confirmed_star: Confirmed star from Gaia
+        - concentration_c: Concentration index
+        - half_light_radius: Half-light radius
+
+    Example
+    -------
+    >>> from morphology.star_galaxy import classify_professional
+    >>> from download_hdf_data import query_gaia_stars
+    >>>
+    >>> # Query Gaia stars
+    >>> gaia_stars = query_gaia_stars(ra=189.2, dec=62.2, radius_arcmin=3.0)
+    >>> gaia_df = pd.DataFrame(gaia_stars)
+    >>>
+    >>> # Run professional classification
+    >>> results = classify_professional(
+    ...     catalog, image, wcs=wcs, gaia_catalog=gaia_df
+    ... )
+    >>>
+    >>> # Filter to galaxies only
+    >>> galaxies = catalog[results['is_galaxy']]
+    """
+    from morphology.professional_classification import (
+        classify_professional as _classify_professional,
+    )
+
+    return _classify_professional(
+        catalog=catalog,
+        image=image,
+        wcs=wcs,
+        gaia_catalog=gaia_catalog,
+        ml_classifier=ml_classifier,
+        x_col=x_col,
+        y_col=y_col,
+        ra_col=ra_col,
+        dec_col=dec_col,
+        mag_col=mag_col,
+        flux_cols=flux_cols,
+        error_cols=error_cols,
+        pixel_scale=pixel_scale,
+        verbose=verbose,
+    )
+
+
+def query_gaia_for_classification(
+    ra_center: float,
+    dec_center: float,
+    radius_arcmin: float = 3.0,
+    magnitude_limit: float = 21.0,
+) -> pd.DataFrame:
+    """Query Gaia DR3 for star-galaxy classification.
+
+    Convenience function to query Gaia and return a DataFrame
+    suitable for use with classify_professional().
+
+    Parameters
+    ----------
+    ra_center, dec_center : float
+        Field center in degrees
+    radius_arcmin : float
+        Search radius in arcminutes
+    magnitude_limit : float
+        Faint magnitude limit (Gaia completeness drops at G > 21)
+
+    Returns
+    -------
+    pd.DataFrame
+        Gaia catalog with columns needed for classification
+    """
+    try:
+        from astroquery.gaia import Gaia
+    except ImportError:
+        print("Warning: astroquery not installed. Install with: pip install astroquery")
+        return pd.DataFrame()
+
+    query = f"""
+    SELECT
+        source_id,
+        ra,
+        dec,
+        parallax,
+        parallax_error,
+        pmra,
+        pmdec,
+        phot_g_mean_mag,
+        astrometric_excess_noise,
+        ruwe
+    FROM gaiadr3.gaia_source
+    WHERE
+        CONTAINS(
+            POINT('ICRS', ra, dec),
+            CIRCLE('ICRS', {ra_center}, {dec_center}, {radius_arcmin / 60.0})
+        ) = 1
+        AND phot_g_mean_mag < {magnitude_limit}
+    ORDER BY phot_g_mean_mag ASC
+    """
+
+    try:
+        Gaia.MAIN_GAIA_TABLE = "gaiadr3.gaia_source"
+        Gaia.ROW_LIMIT = -1
+
+        job = Gaia.launch_job(query)
+        results = job.get_results()
+
+        return results.to_pandas()
+
+    except Exception as e:
+        print(f"Error querying Gaia: {e}")
+        return pd.DataFrame()
+
+
+def run_full_classification_pipeline(
+    catalog: pd.DataFrame,
+    image: np.ndarray,
+    header: dict,
+    field_ra: float = 189.228621,
+    field_dec: float = 62.212572,
+    field_radius_arcmin: float = 3.0,
+    output_dir: Path | None = None,
+    verbose: bool = True,
+) -> tuple[pd.DataFrame, dict]:
+    """Run the complete professional classification pipeline.
+
+    This is the main entry point for professional star-galaxy classification.
+    It handles:
+    1. Querying Gaia DR3 for foreground stars
+    2. Measuring empirical PSF from Gaia stars
+    3. Running multi-tier classification
+    4. Generating diagnostic plots
+    5. Computing validation metrics (if reference available)
+
+    Parameters
+    ----------
+    catalog : pd.DataFrame
+        Source catalog with positions (xcentroid, ycentroid) and
+        sky coordinates (ra, dec) if available
+    image : NDArray
+        2D science image
+    header : dict
+        FITS header with WCS information
+    field_ra, field_dec : float
+        Field center for Gaia query (degrees)
+    field_radius_arcmin : float
+        Gaia query radius (arcminutes)
+    output_dir : Path, optional
+        Directory for diagnostic outputs
+    verbose : bool
+        Print progress information
+
+    Returns
+    -------
+    results : pd.DataFrame
+        Classification results merged with input catalog
+    diagnostics : dict
+        Dictionary with PSF model, metrics, and other diagnostics
+    """
+    from astropy.wcs import WCS
+
+    if verbose:
+        print("\n" + "=" * 60)
+        print("PROFESSIONAL STAR-GALAXY CLASSIFICATION PIPELINE")
+        print("=" * 60)
+
+    diagnostics = {}
+
+    # Get WCS
+    try:
+        wcs = WCS(header)
+        if not wcs.has_celestial:
+            wcs = None
+    except Exception:
+        wcs = None
+
+    # Query Gaia
+    if verbose:
+        print(f"\nQuerying Gaia DR3 at RA={field_ra:.4f}, Dec={field_dec:.4f}...")
+
+    gaia_catalog = query_gaia_for_classification(
+        ra_center=field_ra,
+        dec_center=field_dec,
+        radius_arcmin=field_radius_arcmin,
+        magnitude_limit=21.0,
+    )
+
+    if len(gaia_catalog) > 0:
+        if verbose:
+            print(f"Retrieved {len(gaia_catalog)} Gaia sources")
+        diagnostics['gaia_sources'] = len(gaia_catalog)
+    else:
+        if verbose:
+            print("Warning: No Gaia sources retrieved")
+        diagnostics['gaia_sources'] = 0
+
+    # Run classification
+    results = classify_professional(
+        catalog=catalog,
+        image=image,
+        wcs=wcs,
+        gaia_catalog=gaia_catalog,
+        x_col="xcentroid",
+        y_col="ycentroid",
+        verbose=verbose,
+    )
+
+    # Store diagnostics
+    diagnostics['n_galaxies'] = results['is_galaxy'].sum()
+    diagnostics['n_stars'] = results['is_star'].sum()
+    diagnostics['gaia_confirmed_stars'] = results['gaia_confirmed_star'].sum() if 'gaia_confirmed_star' in results.columns else 0
+
+    # Merge results with input catalog
+    # Keep only classification columns
+    classification_cols = [
+        'is_galaxy', 'is_star', 'probability_galaxy', 'confidence',
+        'classification_method', 'classification_tier', 'classification_flags',
+        'spread_model', 'spread_model_err', 'gaia_match', 'gaia_confirmed_star',
+        'gaia_parallax', 'gaia_pmtot', 'concentration_c', 'half_light_radius',
+        'stellar_locus_distance'
+    ]
+
+    for col in classification_cols:
+        if col in results.columns and col not in catalog.columns:
+            catalog[col] = results[col].values
+
+    # Generate diagnostic plot
+    if output_dir:
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        from morphology.professional_classification import plot_classification_diagnostics
+        plot_classification_diagnostics(
+            results,
+            output_path=output_dir / "star_galaxy_diagnostics.pdf"
+        )
+
+    if verbose:
+        print("\n" + "=" * 60)
+        print("CLASSIFICATION COMPLETE")
+        print("=" * 60)
+        print(f"Galaxies: {diagnostics['n_galaxies']}")
+        print(f"Stars:    {diagnostics['n_stars']}")
+        print(f"Gaia-confirmed stars: {diagnostics['gaia_confirmed_stars']}")
+
+    return catalog, diagnostics

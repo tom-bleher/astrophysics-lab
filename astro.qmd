@@ -486,7 +486,7 @@ fig2.add_trace(go.Scatter(
 fig2.update_layout(
     title="Photo-z Uncertainty vs Redshift",
     xaxis_title="Photometric Redshift",
-    yaxis_title="Δz (1σ width)",
+    yaxis_title="dz (1-sigma width)",
     width=800, height=400
 )
 fig2.show()

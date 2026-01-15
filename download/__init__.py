@@ -16,16 +16,16 @@ Example usage:
     download_eazy_templates.download_templates()
 """
 
-from download.fetch_all_data import download_all, download_file, DATA_SOURCES
-from download.download_eazy_templates import download_templates, TEMPLATE_SETS
-from download.query_mast import search_hdf_observations, download_hdf_products
+from download.download_eazy_templates import TEMPLATE_SETS, download_templates
+from download.fetch_all_data import DATA_SOURCES, download_all, download_file
+from download.query_mast import download_hdf_products, search_hdf_observations
 
 __all__ = [
-    "download_all",
-    "download_file",
-    "download_templates",
-    "search_hdf_observations",
-    "download_hdf_products",
     "DATA_SOURCES",
     "TEMPLATE_SETS",
+    "download_all",
+    "download_file",
+    "download_hdf_products",
+    "download_templates",
+    "search_hdf_observations",
 ]

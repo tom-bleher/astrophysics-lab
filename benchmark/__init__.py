@@ -16,9 +16,9 @@ Example usage:
 """
 
 from benchmark.eazy_comparison import (
-    run_eazy_photoz,
-    compare_with_eazy,
     EazyBenchmarkResult,
+    compare_with_eazy,
+    run_eazy_photoz,
 )
 from benchmark.template_comparison import (
     compare_template_sets,
@@ -26,9 +26,9 @@ from benchmark.template_comparison import (
 )
 
 __all__ = [
-    "run_eazy_photoz",
-    "compare_with_eazy",
     "EazyBenchmarkResult",
     "compare_template_sets",
+    "compare_with_eazy",
     "plot_template_comparison",
+    "run_eazy_photoz",
 ]

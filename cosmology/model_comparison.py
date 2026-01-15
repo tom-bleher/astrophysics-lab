@@ -16,9 +16,10 @@ References:
 - Liddle 2007, MNRAS, 377, L74
 """
 
+from collections.abc import Callable
+
 import numpy as np
 from numpy.typing import NDArray
-from typing import Callable
 
 
 def compute_chi2(
@@ -75,10 +76,7 @@ def compute_aic(chi2: float, k: int, n: int) -> float:
     aic = chi2 + 2 * k
 
     # Corrected AIC for small samples (AICc)
-    if n > k + 1:
-        aicc = aic + (2 * k * (k + 1)) / (n - k - 1)
-    else:
-        aicc = aic
+    aicc = aic + 2 * k * (k + 1) / (n - k - 1) if n > k + 1 else aic
 
     return aicc
 

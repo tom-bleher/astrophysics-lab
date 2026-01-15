@@ -16,8 +16,8 @@ References:
 """
 
 import numpy as np
-from numpy.typing import NDArray
 import pandas as pd
+from numpy.typing import NDArray
 
 
 def surface_brightness_vs_redshift(
@@ -186,14 +186,14 @@ def interpret_tolman_result(n: float, n_err: float) -> str:
     lines.append(f"Fitted exponent: n = {n:.2f} ± {n_err:.2f}")
     lines.append("")
     lines.append("Expected values:")
-    lines.append(f"  Expanding universe (pure): n = -4")
-    lines.append(f"  Static universe:           n = 0")
+    lines.append("  Expanding universe (pure): n = -4")
+    lines.append("  Static universe:           n = 0")
     lines.append("")
 
     if sigma_from_expanding < 2:
-        lines.append(f"Result CONSISTENT with expanding universe ({sigma_from_expanding:.1f}σ from -4)")
+        lines.append(f"Result CONSISTENT with expanding universe ({sigma_from_expanding:.1f}-sigma from -4)")
     elif sigma_from_static < 2:
-        lines.append(f"Result CONSISTENT with static universe ({sigma_from_static:.1f}σ from 0)")
+        lines.append(f"Result CONSISTENT with static universe ({sigma_from_static:.1f}-sigma from 0)")
     elif -4 < n < 0:
         lines.append("Result between pure models - likely affected by galaxy evolution")
         lines.append("(Galaxies were brighter in the past, reducing dimming effect)")

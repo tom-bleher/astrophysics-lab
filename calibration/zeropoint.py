@@ -17,7 +17,6 @@ References:
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -77,9 +76,9 @@ class CalibrationResult:
 def calibrate_zeropoints(
     training_catalog: pd.DataFrame,
     z_spec_col: str = "z_spec",
-    flux_cols: Optional[dict[str, str]] = None,
-    error_cols: Optional[dict[str, str]] = None,
-    spectra_path: Optional[Path | str] = None,
+    flux_cols: dict[str, str] | None = None,
+    error_cols: dict[str, str] | None = None,
+    spectra_path: Path | str | None = None,
     max_iterations: int = 10,
     convergence_threshold: float = 0.001,
     sigma_clip: float = 3.0,
@@ -118,7 +117,6 @@ def calibrate_zeropoints(
     CalibrationResult
         Correction factors and convergence history
     """
-    from classify import classify_galaxy_with_pdf
 
     if flux_cols is None:
         flux_cols = {"u": "flux_u", "b": "flux_b", "v": "flux_v", "i": "flux_i"}
@@ -134,7 +132,7 @@ def calibrate_zeropoints(
     bands = list(flux_cols.keys())
 
     # Initialize corrections to zero
-    corrections = {band: 0.0 for band in bands}
+    corrections = dict.fromkeys(bands, 0.0)
     convergence_history = []
 
     # Filter to valid spec-z sources
@@ -250,43 +248,50 @@ def _compute_nmad(
     flux_cols: dict[str, str],
     error_cols: dict[str, str],
     z_spec_col: str,
-    spectra_path: Optional[Path | str],
+    spectra_path: Path | str | None,
 ) -> float:
     """Compute NMAD with current zero-point corrections."""
     from classify import classify_galaxy_with_pdf
 
-    z_phot_list = []
-    z_spec_list = []
-
     # Process a subset for speed during iteration
     sample = catalog.sample(min(100, len(catalog)), random_state=42)
 
-    for _, row in sample.iterrows():
-        # Apply corrections to fluxes
-        fluxes = [
-            row[flux_cols["b"]] * 10 ** (-0.4 * corrections["b"]),
-            row[flux_cols["i"]] * 10 ** (-0.4 * corrections["i"]),
-            row[flux_cols["u"]] * 10 ** (-0.4 * corrections["u"]),
-            row[flux_cols["v"]] * 10 ** (-0.4 * corrections["v"]),
-        ]
+    # Vectorized flux correction computation
+    band_order = ["b", "i", "u", "v"]
+    correction_factors = np.array([10 ** (-0.4 * corrections[b]) for b in band_order])
 
-        # Use proportional errors
-        errors = [
-            row.get(error_cols.get("b", "flux_b_err"), 0.1 * fluxes[0]),
-            row.get(error_cols.get("i", "flux_i_err"), 0.1 * fluxes[1]),
-            row.get(error_cols.get("u", "flux_u_err"), 0.1 * fluxes[2]),
-            row.get(error_cols.get("v", "flux_v_err"), 0.1 * fluxes[3]),
-        ]
+    # Extract flux arrays
+    flux_arrays = np.column_stack([
+        sample[flux_cols[b]].values for b in band_order
+    ])
+    corrected_fluxes = flux_arrays * correction_factors
 
-        # Handle missing errors
-        errors = [e if e > 0 else 0.1 * f for e, f in zip(errors, fluxes)]
+    # Extract error arrays (with fallback to 10% of flux)
+    error_arrays = np.column_stack([
+        sample[error_cols.get(b, f"flux_{b}_err")].values
+        if error_cols.get(b, f"flux_{b}_err") in sample.columns
+        else 0.1 * sample[flux_cols[b]].values
+        for b in band_order
+    ])
+    # Handle missing/invalid errors
+    error_arrays = np.where(error_arrays > 0, error_arrays, 0.1 * corrected_fluxes)
+
+    z_spec_values = sample[z_spec_col].values
+
+    z_phot_list = []
+    z_spec_list = []
+
+    # Process each source (classify_galaxy_with_pdf is not vectorizable)
+    for i in range(len(sample)):
+        fluxes = corrected_fluxes[i].tolist()
+        errors = error_arrays[i].tolist()
 
         try:
             result = classify_galaxy_with_pdf(
                 fluxes, errors, spectra_path=spectra_path
             )
             z_phot_list.append(result.redshift)
-            z_spec_list.append(row[z_spec_col])
+            z_spec_list.append(z_spec_values[i])
         except Exception:
             continue
 
@@ -306,7 +311,7 @@ def _compute_residuals(
     flux_cols: dict[str, str],
     error_cols: dict[str, str],
     z_spec_col: str,
-    spectra_path: Optional[Path | str],
+    spectra_path: Path | str | None,
 ) -> dict[str, list[float]]:
     """Compute per-band flux residuals for calibration."""
     from classify import classify_galaxy_with_pdf
@@ -317,22 +322,22 @@ def _compute_residuals(
     # Process a subset for speed
     sample = catalog.sample(min(100, len(catalog)), random_state=42)
 
-    for _, row in sample.iterrows():
-        z_true = row[z_spec_col]
+    # Vectorized flux correction computation
+    band_order = ["b", "i", "u", "v"]
+    correction_factors = np.array([10 ** (-0.4 * corrections[b]) for b in band_order])
 
-        # Get corrected fluxes
-        corrected_fluxes = {
-            band: row[flux_cols[band]] * 10 ** (-0.4 * corrections[band])
-            for band in bands
-        }
+    # Extract flux arrays
+    flux_arrays = np.column_stack([
+        sample[flux_cols[b]].values for b in band_order
+    ])
+    corrected_fluxes = flux_arrays * correction_factors
 
-        # Run photo-z at restricted range around true z
-        fluxes = [
-            corrected_fluxes["b"],
-            corrected_fluxes["i"],
-            corrected_fluxes["u"],
-            corrected_fluxes["v"],
-        ]
+    z_spec_values = sample[z_spec_col].values
+
+    # Process each source
+    for i in range(len(sample)):
+        z_true = z_spec_values[i]
+        fluxes = corrected_fluxes[i].tolist()
         errors = [0.1 * f for f in fluxes]  # Simplified for calibration
 
         try:
@@ -363,7 +368,7 @@ def _compute_residuals(
 def apply_zeropoint_corrections(
     fluxes: NDArray,
     corrections: list[ZeroPointCorrection],
-    band_order: Optional[list[str]] = None,
+    band_order: list[str] | None = None,
 ) -> NDArray:
     """Apply zero-point corrections to flux array.
 
@@ -440,16 +445,16 @@ def load_corrections(path: Path | str) -> list[ZeroPointCorrection]:
     path = Path(path)
     df = pd.read_csv(path)
 
-    corrections = []
-    for _, row in df.iterrows():
-        corrections.append(
-            ZeroPointCorrection(
-                band=row["band"],
-                correction_mag=row["correction_mag"],
-                correction_flux=row["correction_flux"],
-                n_sources=int(row["n_sources"]),
-                scatter=row["scatter"],
-            )
+    # Use vectorized access instead of iterrows
+    corrections = [
+        ZeroPointCorrection(
+            band=df.loc[i, "band"],
+            correction_mag=df.loc[i, "correction_mag"],
+            correction_flux=df.loc[i, "correction_flux"],
+            n_sources=int(df.loc[i, "n_sources"]),
+            scatter=df.loc[i, "scatter"],
         )
+        for i in range(len(df))
+    ]
 
     return corrections

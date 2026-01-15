@@ -4,9 +4,10 @@ Transform the star mask from Chip 3 coordinates to the full 4096x4096 mosaic.
 Use direct source matching to find the offset.
 """
 
+import matplotlib
 import numpy as np
 from astropy.io import fits
-import matplotlib
+
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from scipy import ndimage
@@ -31,7 +32,7 @@ mask_flipped = np.flipud(np.fliplr(mask_data))
 # Find THE brightest source in each image (using local max)
 def find_brightest_peak(data, n_peaks=5):
     """Find n brightest peaks in data using local maximum."""
-    from scipy.ndimage import maximum_filter, label
+    from scipy.ndimage import maximum_filter
     # Find local maxima
     local_max = maximum_filter(data, size=20)
     peaks = (data == local_max) & (data > np.percentile(data, 99.9))
@@ -47,11 +48,11 @@ def find_brightest_peak(data, n_peaks=5):
 chip3_peaks = find_brightest_peak(chip3_flipped, n_peaks=10)
 mosaic_peaks = find_brightest_peak(mosaic_data, n_peaks=20)
 
-print(f"\nBrightest peaks in flipped chip 3:")
+print("\nBrightest peaks in flipped chip 3:")
 for i, (x, y, v) in enumerate(chip3_peaks):
     print(f"  {i+1}: ({x}, {y}), value={v:.6f}")
 
-print(f"\nBrightest peaks in mosaic:")
+print("\nBrightest peaks in mosaic:")
 for i, (x, y, v) in enumerate(mosaic_peaks):
     print(f"  {i+1}: ({x}, {y}), value={v:.6f}")
 

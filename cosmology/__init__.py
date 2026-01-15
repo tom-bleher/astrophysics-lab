@@ -19,29 +19,29 @@ Example usage:
 """
 
 from cosmology.mcmc_fitting import (
+    MCMCResult,
     fit_cosmology_mcmc,
     fit_radius_mcmc,
-    MCMCResult,
-)
-from cosmology.tolman_test import (
-    surface_brightness_vs_redshift,
-    fit_tolman_exponent,
-    plot_tolman_test,
 )
 from cosmology.model_comparison import (
-    compute_bic,
-    compute_aic,
     compare_models,
+    compute_aic,
+    compute_bic,
+)
+from cosmology.tolman_test import (
+    fit_tolman_exponent,
+    plot_tolman_test,
+    surface_brightness_vs_redshift,
 )
 
 __all__ = [
+    "MCMCResult",
+    "compare_models",
+    "compute_aic",
+    "compute_bic",
     "fit_cosmology_mcmc",
     "fit_radius_mcmc",
-    "MCMCResult",
-    "surface_brightness_vs_redshift",
     "fit_tolman_exponent",
     "plot_tolman_test",
-    "compute_bic",
-    "compute_aic",
-    "compare_models",
+    "surface_brightness_vs_redshift",
 ]

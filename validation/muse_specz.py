@@ -30,10 +30,7 @@ def load_muse_catalog(
     pd.DataFrame
         Catalog with columns: ra, dec, z_spec, confidence
     """
-    if local_path is not None:
-        df = _load_muse_local(local_path)
-    else:
-        df = _query_muse_vizier()
+    df = _load_muse_local(local_path) if local_path is not None else _query_muse_vizier()
 
     if len(df) == 0:
         return df
@@ -50,6 +47,7 @@ def load_muse_catalog(
 def _load_muse_local(local_path: str) -> pd.DataFrame:
     """Load MUSE catalog from local FITS file."""
     from pathlib import Path
+
     from astropy.io import fits
 
     path = Path(local_path)
@@ -167,8 +165,8 @@ def validate_with_specz(
         - metrics: Photo-z quality metrics
         - outliers: Sources with |Δz/(1+z)| > 0.15
     """
-    from astropy.coordinates import SkyCoord, match_coordinates_sky
     import astropy.units as u
+    from astropy.coordinates import SkyCoord, match_coordinates_sky
 
     # Check required columns
     if our_z_col not in our_catalog.columns:
@@ -275,10 +273,10 @@ def print_validation_summary(validation_result: dict) -> None:
     print(f"Valid redshifts: {validation_result['n_valid']}")
 
     metrics = validation_result["metrics"]
-    print(f"\nMetrics:")
-    print(f"  NMAD (σ_NMAD):     {metrics['nmad']:.4f}")
+    print("\nMetrics:")
+    print(f"  NMAD (sigma_NMAD): {metrics['nmad']:.4f}")
     print(f"  Bias (median Δz):  {metrics['bias']:.4f}")
-    print(f"  Scatter (σ):       {metrics['sigma']:.4f}")
+    print(f"  Scatter (sigma):   {metrics['sigma']:.4f}")
     print(f"  Outlier fraction:  {metrics['outlier_frac']:.1%} (|Δz/(1+z)| > 0.15)")
     print(f"  Catastrophic:      {metrics['catastrophic_frac']:.1%} (|Δz/(1+z)| > 0.5)")
 

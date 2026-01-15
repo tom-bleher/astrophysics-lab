@@ -1,49 +1,19 @@
 """Download all external data for the HDF analysis project.
 
 This script downloads:
-- HLF photometric catalog (103,098 sources)
-- EAZY templates and example catalogs
-- Fernández-Soto 1999 catalog
-- MUSE spectroscopic redshifts
+- EAZY templates and example data
 
 Usage:
     python -m download.fetch_all_data
 """
 
-import urllib.request
-import urllib.error
-from pathlib import Path
 import sys
+import urllib.error
+import urllib.request
+from pathlib import Path
 
 # Data sources with metadata
-DATA_SOURCES: dict[str, dict] = {
-    "hlf_catalog": {
-        "url": "https://archive.stsci.edu/hlsps/hlf/hlsp_hlf_hst_goodss_v2.1_catalog.fits",
-        "local": "./data/external/hlf_catalog.fits",
-        "description": "Hubble Legacy Fields GOODS-S catalog (103,098 sources)",
-        "size_mb": 45,
-    },
-    "fernandez_soto_vizier": {
-        "url": "https://cdsarc.cds.unistra.fr/ftp/J/ApJ/513/34/table1.dat",
-        "local": "./data/external/fernandez_soto_1999.dat",
-        "description": "Fernández-Soto et al. 1999 HDF-N photo-z catalog",
-        "size_mb": 0.1,
-    },
-    "fernandez_soto_readme": {
-        "url": "https://cdsarc.cds.unistra.fr/ftp/J/ApJ/513/34/ReadMe",
-        "local": "./data/external/fernandez_soto_1999_readme.txt",
-        "description": "Fernández-Soto catalog format description",
-        "size_mb": 0.01,
-    },
-}
-
-# VizieR catalog IDs for astroquery access
-VIZIER_CATALOGS = {
-    "fernandez_soto": "J/ApJ/513/34",
-    "hudf_photometry": "II/258",
-    "muse_hudf": "J/A+A/608/A1",
-    "hdf_surface_photometry": "J/A+AS/129/583",
-}
+DATA_SOURCES: dict[str, dict] = {}
 
 
 def download_file(
@@ -111,71 +81,8 @@ def download_file(
         return False
 
 
-def download_vizier_catalog(
-    catalog_id: str,
-    output_path: str | Path,
-    row_limit: int = -1,
-) -> bool:
-    """Download a catalog from VizieR using astroquery.
-
-    Parameters
-    ----------
-    catalog_id : str
-        VizieR catalog identifier (e.g., "J/ApJ/513/34")
-    output_path : str or Path
-        Path to save the catalog
-    row_limit : int
-        Maximum number of rows (-1 for all)
-
-    Returns
-    -------
-    bool
-        True if download succeeded
-    """
-    output_path = Path(output_path)
-
-    if output_path.exists():
-        print(f"  [SKIP] Already exists: {output_path}")
-        return True
-
-    try:
-        from astroquery.vizier import Vizier
-
-        print(f"  Querying VizieR catalog: {catalog_id}")
-
-        Vizier.ROW_LIMIT = row_limit
-        result = Vizier.get_catalogs(catalog_id)
-
-        if not result:
-            print(f"    [WARN] No data returned for {catalog_id}")
-            return False
-
-        # Save the first table
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-
-        # Save as FITS for better compatibility
-        table = result[0]
-        fits_path = output_path.with_suffix(".fits")
-        table.write(fits_path, format="fits", overwrite=True)
-        print(f"    [OK] Saved {len(table)} rows to: {fits_path}")
-
-        return True
-
-    except ImportError:
-        print("    [ERROR] astroquery not installed. Run: pip install astroquery")
-        return False
-    except Exception as e:
-        print(f"    [ERROR] {type(e).__name__}: {e}")
-        return False
-
-
-def download_all(include_vizier: bool = True) -> dict[str, bool]:
+def download_all() -> dict[str, bool]:
     """Download all external data sources.
-
-    Parameters
-    ----------
-    include_vizier : bool
-        Whether to include VizieR catalog downloads (requires astroquery)
 
     Returns
     -------
@@ -189,7 +96,7 @@ def download_all(include_vizier: bool = True) -> dict[str, bool]:
     results = {}
 
     # Download direct URL sources
-    print("\n[1/2] Downloading from direct URLs...")
+    print("\nDownloading from direct URLs...")
     print("-" * 40)
 
     for name, info in DATA_SOURCES.items():
@@ -199,18 +106,6 @@ def download_all(include_vizier: bool = True) -> dict[str, bool]:
             info["description"],
         )
         results[name] = success
-
-    # Download VizieR catalogs
-    if include_vizier:
-        print("\n[2/2] Downloading from VizieR...")
-        print("-" * 40)
-
-        vizier_dir = Path("./data/external/vizier")
-
-        for name, catalog_id in VIZIER_CATALOGS.items():
-            output_path = vizier_dir / f"{name}.fits"
-            success = download_vizier_catalog(catalog_id, output_path)
-            results[f"vizier_{name}"] = success
 
     # Summary
     print("\n" + "=" * 60)
@@ -224,31 +119,13 @@ def download_all(include_vizier: bool = True) -> dict[str, bool]:
         status = "[OK]" if success else "[FAILED]"
         print(f"  {status} {name}")
 
-    print(f"\nTotal: {success_count}/{total_count} successful")
-
-    if success_count < total_count:
-        print("\nNote: Some downloads failed. This may be due to:")
-        print("  - Network issues")
-        print("  - Missing dependencies (astroquery)")
-        print("  - Temporary server unavailability")
-        print("You can re-run this script to retry failed downloads.")
-
-    print("\nNext steps:")
-    print("  1. Run validation scripts to compare with external catalogs")
-    print("  2. Use benchmark/eazy_comparison.py to compare photo-z methods")
+    if total_count > 0:
+        print(f"\nTotal: {success_count}/{total_count} successful")
+    else:
+        print("\nNo data sources configured.")
 
     return results
 
 
 if __name__ == "__main__":
-    import argparse
-
-    parser = argparse.ArgumentParser(description="Download external HDF data")
-    parser.add_argument(
-        "--no-vizier",
-        action="store_true",
-        help="Skip VizieR downloads (useful if astroquery is not installed)",
-    )
-    args = parser.parse_args()
-
-    download_all(include_vizier=not args.no_vizier)
+    download_all()

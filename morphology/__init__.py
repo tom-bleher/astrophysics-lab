@@ -44,12 +44,13 @@ from morphology.star_galaxy import (
 try:
     from morphology.ml_classifier import (
         HAS_SKLEARN as HAS_ML_CLASSIFIER,
+    )
+    from morphology.ml_classifier import (
         ClassificationResult,
         ClassifierMetrics,
         MLStarGalaxyClassifier,
         extract_features_from_catalog,
         extract_features_from_photometry,
-        train_from_external_catalogs,
     )
 except ImportError:
     HAS_ML_CLASSIFIER = False
@@ -58,26 +59,24 @@ except ImportError:
     ClassifierMetrics = None
     extract_features_from_catalog = None
     extract_features_from_photometry = None
-    train_from_external_catalogs = None
 
 __all__ = [
-    # Sérsic fitting
-    "measure_sersic_params",
-    "fit_sersic_profile",
-    "SersicParams",
-    # Concentration and morphology
-    "concentration_index",
-    "calculate_concentration_c",
-    "petrosian_radius",
-    # Classical star-galaxy classification
-    "classify_star_galaxy",
-    "get_stellarity_index",
     # ML star-galaxy classification
     "HAS_ML_CLASSIFIER",
-    "MLStarGalaxyClassifier",
     "ClassificationResult",
     "ClassifierMetrics",
+    "MLStarGalaxyClassifier",
+    "SersicParams",
+    "calculate_concentration_c",
+    # Classical star-galaxy classification
+    "classify_star_galaxy",
+    # Concentration and morphology
+    "concentration_index",
     "extract_features_from_catalog",
     "extract_features_from_photometry",
-    "train_from_external_catalogs",
+    "fit_sersic_profile",
+    "get_stellarity_index",
+    # Sérsic fitting
+    "measure_sersic_params",
+    "petrosian_radius",
 ]

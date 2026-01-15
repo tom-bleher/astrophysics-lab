@@ -5,7 +5,7 @@ This module provides Bayesian parameter estimation using MCMC
 
 Fits for:
 - R: Characteristic galaxy size [kpc]
-- Omega_m: Matter density parameter (optional)
+- Omega_L: Dark energy density parameter (optional, with flat universe constraint)
 
 Returns posterior distributions and uncertainties.
 
@@ -15,7 +15,6 @@ References:
 """
 
 from dataclasses import dataclass
-from typing import Optional
 
 import numpy as np
 from numpy.typing import NDArray
@@ -33,10 +32,10 @@ class MCMCResult:
         1-sigma uncertainty on R
     R_kpc_lo, R_kpc_hi : float
         16th and 84th percentile bounds
-    Omega_m : float or None
-        Best-fit matter density (if fitted)
-    Omega_m_err : float or None
-        1-sigma uncertainty on Omega_m
+    Omega_L : float or None
+        Best-fit dark energy density (if fitted)
+    Omega_L_err : float or None
+        1-sigma uncertainty on Omega_L
     samples : NDArray
         Full MCMC samples
     log_prob : NDArray
@@ -51,28 +50,35 @@ class MCMCResult:
     R_kpc_err: float
     R_kpc_lo: float
     R_kpc_hi: float
-    Omega_m: Optional[float]
-    Omega_m_err: Optional[float]
+    Omega_L: float | None
+    Omega_L_err: float | None
     samples: NDArray
     log_prob: NDArray
     acceptance_fraction: float
     autocorr_time: float
 
+    @property
+    def Omega_m(self) -> float | None:
+        """Matter density (flat universe: Omega_m = 1 - Omega_L)."""
+        return 1.0 - self.Omega_L if self.Omega_L is not None else None
+
+    @property
+    def Omega_m_err(self) -> float | None:
+        """Uncertainty on Omega_m (same as Omega_L for flat universe)."""
+        return self.Omega_L_err
+
 
 def check_emcee_available() -> bool:
     """Check if emcee is installed."""
-    try:
-        import emcee
-        return True
-    except ImportError:
-        return False
+    import importlib.util
+    return importlib.util.find_spec("emcee") is not None
 
 
 def fit_radius_mcmc(
     z: NDArray,
     theta_arcsec: NDArray,
     theta_error: NDArray,
-    Omega_m: float = 0.3,
+    Omega_L: float = 0.7,
     n_walkers: int = 32,
     n_steps: int = 5000,
     n_burn: int = 1000,
@@ -88,8 +94,8 @@ def fit_radius_mcmc(
         Angular sizes in arcseconds
     theta_error : NDArray
         Uncertainties on angular sizes
-    Omega_m : float
-        Fixed matter density parameter
+    Omega_L : float
+        Fixed dark energy density parameter (flat universe: Omega_m = 1 - Omega_L)
     n_walkers : int
         Number of MCMC walkers
     n_steps : int
@@ -106,13 +112,14 @@ def fit_radius_mcmc(
     """
     if not check_emcee_available():
         print("emcee not installed. Install with: pip install emcee")
-        return _fit_radius_scipy(z, theta_arcsec, theta_error, Omega_m)
+        return _fit_radius_scipy(z, theta_arcsec, theta_error, Omega_L)
 
+    import astropy.units as u
     import emcee
     from astropy.cosmology import FlatLambdaCDM
-    import astropy.units as u
 
-    # Set up cosmology
+    # Set up cosmology (flat universe: Omega_m = 1 - Omega_L)
+    Omega_m = 1.0 - Omega_L
     cosmo = FlatLambdaCDM(H0=70 * u.km / u.s / u.Mpc, Om0=Omega_m)
 
     # Compute angular diameter distances
@@ -150,9 +157,10 @@ def fit_radius_mcmc(
 
     # Initialize walkers
     ndim = 1
+    rng = np.random.default_rng()
     # Initial guess from simple fit
     R_init = np.median(theta_rad * D_A) * 1000  # kpc
-    p0 = R_init + 0.5 * np.random.randn(n_walkers, ndim)
+    p0 = R_init + 0.5 * rng.standard_normal((n_walkers, ndim))
     p0 = np.abs(p0)  # Ensure positive
 
     # Run MCMC
@@ -182,8 +190,8 @@ def fit_radius_mcmc(
         R_kpc_err=R_err,
         R_kpc_lo=R_lo,
         R_kpc_hi=R_hi,
-        Omega_m=Omega_m,
-        Omega_m_err=None,
+        Omega_L=Omega_L,
+        Omega_L_err=None,
         samples=samples,
         log_prob=log_prob,
         acceptance_fraction=np.mean(sampler.acceptance_fraction),
@@ -200,7 +208,7 @@ def fit_cosmology_mcmc(
     n_burn: int = 2000,
     progress: bool = True,
 ) -> MCMCResult:
-    """Fit both R and Omega_m using MCMC.
+    """Fit both R and Omega_L using MCMC (flat universe constraint).
 
     Parameters
     ----------
@@ -222,30 +230,31 @@ def fit_cosmology_mcmc(
     Returns
     -------
     MCMCResult
-        MCMC fit results including Omega_m
+        MCMC fit results including Omega_L
     """
     if not check_emcee_available():
         print("emcee not installed. Install with: pip install emcee")
         return _fit_cosmology_scipy(z, theta_arcsec, theta_error)
 
+    import astropy.units as u
     import emcee
     from astropy.cosmology import FlatLambdaCDM
-    import astropy.units as u
 
     # Convert theta to radians
     theta_rad = theta_arcsec * np.pi / (180 * 3600)
     theta_err_rad = theta_error * np.pi / (180 * 3600)
 
     def log_likelihood(params):
-        R_kpc, Omega_m = params
+        R_kpc, Omega_L = params
 
-        if R_kpc <= 0 or Omega_m <= 0.01 or Omega_m >= 0.99:
+        if R_kpc <= 0 or Omega_L <= 0.01 or Omega_L >= 0.99:
             return -np.inf
 
         R_Mpc = R_kpc / 1000
 
-        # Compute D_A for this Omega_m
+        # Compute D_A for this Omega_L (flat universe: Omega_m = 1 - Omega_L)
         try:
+            Omega_m = 1.0 - Omega_L
             cosmo = FlatLambdaCDM(H0=70 * u.km / u.s / u.Mpc, Om0=Omega_m)
             D_A = cosmo.angular_diameter_distance(z).to(u.Mpc).value
         except Exception:
@@ -260,10 +269,10 @@ def fit_cosmology_mcmc(
         return -0.5 * chi2
 
     def log_prior(params):
-        R_kpc, Omega_m = params
-        if 0.1 < R_kpc < 100 and 0.05 < Omega_m < 0.95:
-            # Flat prior on R, Gaussian prior on Omega_m centered on 0.3
-            return -0.5 * ((Omega_m - 0.3) / 0.1) ** 2
+        R_kpc, Omega_L = params
+        if 0.1 < R_kpc < 100 and 0.05 < Omega_L < 0.95:
+            # Flat prior on R, Gaussian prior on Omega_L centered on 0.7
+            return -0.5 * ((Omega_L - 0.7) / 0.1) ** 2
         return -np.inf
 
     def log_probability(params):
@@ -274,14 +283,15 @@ def fit_cosmology_mcmc(
 
     # Initialize walkers
     ndim = 2
-    p0 = np.array([5.0, 0.3]) + 0.1 * np.random.randn(n_walkers, ndim)
+    rng = np.random.default_rng()
+    p0 = np.array([5.0, 0.7]) + 0.1 * rng.standard_normal((n_walkers, ndim))
     p0[:, 0] = np.abs(p0[:, 0])  # R positive
-    p0[:, 1] = np.clip(p0[:, 1], 0.1, 0.9)  # Omega_m in range
+    p0[:, 1] = np.clip(p0[:, 1], 0.1, 0.9)  # Omega_L in range
 
     # Run MCMC
     sampler = emcee.EnsembleSampler(n_walkers, ndim, log_probability)
 
-    print("Running MCMC (fitting R and Omega_m)...")
+    print("Running MCMC (fitting R and Omega_L)...")
     sampler.run_mcmc(p0, n_steps, progress=progress)
 
     # Extract samples
@@ -296,23 +306,23 @@ def fit_cosmology_mcmc(
 
     # Compute statistics
     R_samples = samples[:, 0]
-    Om_samples = samples[:, 1]
+    OmL_samples = samples[:, 1]
 
     R_median = np.median(R_samples)
     R_lo = np.percentile(R_samples, 16)
     R_hi = np.percentile(R_samples, 84)
 
-    Om_median = np.median(Om_samples)
-    Om_lo = np.percentile(Om_samples, 16)
-    Om_hi = np.percentile(Om_samples, 84)
+    OmL_median = np.median(OmL_samples)
+    OmL_lo = np.percentile(OmL_samples, 16)
+    OmL_hi = np.percentile(OmL_samples, 84)
 
     return MCMCResult(
         R_kpc=R_median,
         R_kpc_err=(R_hi - R_lo) / 2,
         R_kpc_lo=R_lo,
         R_kpc_hi=R_hi,
-        Omega_m=Om_median,
-        Omega_m_err=(Om_hi - Om_lo) / 2,
+        Omega_L=OmL_median,
+        Omega_L_err=(OmL_hi - OmL_lo) / 2,
         samples=samples,
         log_prob=log_prob,
         acceptance_fraction=np.mean(sampler.acceptance_fraction),
@@ -324,13 +334,14 @@ def _fit_radius_scipy(
     z: NDArray,
     theta_arcsec: NDArray,
     theta_error: NDArray,
-    Omega_m: float,
+    Omega_L: float,
 ) -> MCMCResult:
     """Fallback scipy-based fitting when emcee is not available."""
-    from scipy.optimize import minimize
-    from astropy.cosmology import FlatLambdaCDM
     import astropy.units as u
+    from astropy.cosmology import FlatLambdaCDM
+    from scipy.optimize import minimize
 
+    Omega_m = 1.0 - Omega_L
     cosmo = FlatLambdaCDM(H0=70 * u.km / u.s / u.Mpc, Om0=Omega_m)
     D_A = cosmo.angular_diameter_distance(z).to(u.Mpc).value
 
@@ -353,8 +364,8 @@ def _fit_radius_scipy(
         R_kpc_err=R_err,
         R_kpc_lo=R_best - R_err,
         R_kpc_hi=R_best + R_err,
-        Omega_m=Omega_m,
-        Omega_m_err=None,
+        Omega_L=Omega_L,
+        Omega_L_err=None,
         samples=np.array([[R_best]]),
         log_prob=np.array([-chi2(R_best) / 2]),
         acceptance_fraction=1.0,
@@ -368,36 +379,37 @@ def _fit_cosmology_scipy(
     theta_error: NDArray,
 ) -> MCMCResult:
     """Fallback scipy-based fitting when emcee is not available."""
-    from scipy.optimize import minimize
-    from astropy.cosmology import FlatLambdaCDM
     import astropy.units as u
+    from astropy.cosmology import FlatLambdaCDM
+    from scipy.optimize import minimize
 
     theta_rad = theta_arcsec * np.pi / (180 * 3600)
     theta_err_rad = theta_error * np.pi / (180 * 3600)
 
     def chi2(params):
-        R_kpc, Omega_m = params
-        if R_kpc <= 0 or Omega_m <= 0.01 or Omega_m >= 0.99:
+        R_kpc, Omega_L = params
+        if R_kpc <= 0 or Omega_L <= 0.01 or Omega_L >= 0.99:
             return 1e10
 
         R_Mpc = R_kpc / 1000
+        Omega_m = 1.0 - Omega_L
         cosmo = FlatLambdaCDM(H0=70 * u.km / u.s / u.Mpc, Om0=Omega_m)
         D_A = cosmo.angular_diameter_distance(z).to(u.Mpc).value
         theta_model = R_Mpc / D_A
         return np.sum(((theta_rad - theta_model) / theta_err_rad) ** 2)
 
-    result = minimize(chi2, x0=[5.0, 0.3], bounds=[(0.1, 100), (0.05, 0.95)])
-    R_best, Om_best = result.x
+    result = minimize(chi2, x0=[5.0, 0.7], bounds=[(0.1, 100), (0.05, 0.95)])
+    R_best, OmL_best = result.x
 
     return MCMCResult(
         R_kpc=R_best,
         R_kpc_err=0.5,
         R_kpc_lo=R_best - 0.5,
         R_kpc_hi=R_best + 0.5,
-        Omega_m=Om_best,
-        Omega_m_err=0.05,
-        samples=np.array([[R_best, Om_best]]),
-        log_prob=np.array([-chi2([R_best, Om_best]) / 2]),
+        Omega_L=OmL_best,
+        Omega_L_err=0.05,
+        samples=np.array([[R_best, OmL_best]]),
+        log_prob=np.array([-chi2([R_best, OmL_best]) / 2]),
         acceptance_fraction=1.0,
         autocorr_time=np.nan,
     )
@@ -424,9 +436,9 @@ def plot_corner(result: MCMCResult, figsize: tuple = (8, 8)):
         print("corner package not installed. Install with: pip install corner")
         return None
 
-    if result.Omega_m is not None and result.samples.shape[1] == 2:
-        labels = [r"$R$ [kpc]", r"$\Omega_m$"]
-        truths = [result.R_kpc, result.Omega_m]
+    if result.Omega_L is not None and result.samples.shape[1] == 2:
+        labels = [r"$R$ [kpc]", r"$\Omega_\Lambda$"]
+        truths = [result.R_kpc, result.Omega_L]
     else:
         labels = [r"$R$ [kpc]"]
         truths = [result.R_kpc]
@@ -455,16 +467,17 @@ def print_mcmc_summary(result: MCMCResult) -> None:
     print("MCMC Fit Results")
     print("=" * 50)
 
-    print(f"\nGalaxy Size:")
+    print("\nGalaxy Size:")
     print(f"  R = {result.R_kpc:.2f} +{result.R_kpc_hi-result.R_kpc:.2f} "
           f"-{result.R_kpc-result.R_kpc_lo:.2f} kpc")
     print(f"  R = {result.R_kpc:.2f} ± {result.R_kpc_err:.2f} kpc (symmetric)")
 
-    if result.Omega_m is not None:
-        print(f"\nMatter Density:")
-        print(f"  Omega_m = {result.Omega_m:.3f} ± {result.Omega_m_err:.3f}")
+    if result.Omega_L is not None:
+        print("\nDark Energy Density:")
+        print(f"  Omega_L = {result.Omega_L:.3f} ± {result.Omega_L_err:.3f}")
+        print(f"  Omega_m = {result.Omega_m:.3f} ± {result.Omega_m_err:.3f} (derived)")
 
-    print(f"\nMCMC Diagnostics:")
+    print("\nMCMC Diagnostics:")
     print(f"  Acceptance fraction: {result.acceptance_fraction:.2f}")
     if np.isfinite(result.autocorr_time):
         print(f"  Autocorrelation time: {result.autocorr_time:.1f}")

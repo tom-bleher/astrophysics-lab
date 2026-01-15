@@ -12,10 +12,9 @@ Usage:
     python -m download.download_eazy_templates
 """
 
-import urllib.request
 import urllib.error
+import urllib.request
 from pathlib import Path
-import sys
 
 EAZY_TEMPLATE_BASE = (
     "https://raw.githubusercontent.com/gbrammer/eazy-photoz/master/templates"

@@ -17,7 +17,6 @@ References:
 """
 
 from dataclasses import dataclass
-from typing import Optional
 
 import numpy as np
 from numpy.typing import NDArray
@@ -106,8 +105,8 @@ def sersic_1d(r: NDArray, amplitude: float, r_eff: float, n: float) -> NDArray:
 def fit_sersic_1d(
     r: NDArray,
     intensity: NDArray,
-    weights: Optional[NDArray] = None,
-    n_fixed: Optional[float] = None,
+    weights: NDArray | None = None,
+    n_fixed: float | None = None,
 ) -> dict:
     """Fit 1D Sérsic profile to radial profile.
 
@@ -151,7 +150,7 @@ def fit_sersic_1d(
             def model(r, amp, r_eff):
                 return sersic_1d(r, amp, r_eff, n_fixed)
 
-            popt, pcov = curve_fit(
+            popt, _pcov = curve_fit(
                 model,
                 r,
                 intensity,
@@ -171,7 +170,7 @@ def fit_sersic_1d(
             def model(r, amp, r_eff, n):
                 return sersic_1d(r, amp, r_eff, n)
 
-            popt, pcov = curve_fit(
+            popt, _pcov = curve_fit(
                 model,
                 r,
                 intensity,
@@ -209,7 +208,7 @@ def measure_sersic_params(
     image: NDArray,
     segm_map: NDArray,
     source_id: int,
-    psf: Optional[NDArray] = None,
+    psf: NDArray | None = None,
     pixel_scale: float = 0.04,
 ) -> SersicParams:
     """Fit Sérsic profile to get robust effective radius.
@@ -246,13 +245,12 @@ def _fit_with_petrofit(
     image: NDArray,
     segm_map: NDArray,
     source_id: int,
-    psf: Optional[NDArray],
+    psf: NDArray | None,
     pixel_scale: float,
 ) -> SersicParams:
     """Fit Sérsic profile using PetroFit."""
-    from petrofit.modeling import PSFConvolvedModel2D, fit_model
-    from petrofit.segmentation import make_catalog
     from astropy.modeling.models import Sersic2D
+    from petrofit.modeling import PSFConvolvedModel2D, fit_model
 
     # Get source position from segmentation
     source_mask = segm_map == source_id
@@ -297,10 +295,7 @@ def _fit_with_petrofit(
     )
 
     # Fit with PSF convolution if available
-    if psf is not None:
-        model = PSFConvolvedModel2D(sersic_model, psf=psf)
-    else:
-        model = sersic_model
+    model = PSFConvolvedModel2D(sersic_model, psf=psf) if psf is not None else sersic_model
 
     try:
         fitted_model, fit_info = fit_model(cutout, model, maxiter=500, epsilon=1e-6)
@@ -413,8 +408,8 @@ def fit_sersic_profile(
     image: NDArray,
     x: float,
     y: float,
-    initial_r_eff: float = 5.0,
-    initial_n: float = 2.5,
+    _initial_r_eff: float = 5.0,
+    _initial_n: float = 2.5,
     pixel_scale: float = 0.04,
 ) -> SersicParams:
     """Fit Sérsic profile at a given position.

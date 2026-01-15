@@ -4,6 +4,7 @@ Lightweight binning analysis - uses existing catalog to test binning strategies.
 """
 
 import matplotlib
+
 matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt
@@ -21,13 +22,9 @@ plt.rcParams.update({
     "ytick.labelsize": 10,
 })
 
-from astropy.stats import bayesian_blocks
-from scipy.stats import chi2 as chi2_dist
-
-from scientific import (
-    H0,
-    c,
+from scientific import (  # noqa: E402
     choose_redshift_bin_edges,
+    compute_chi2_stats,
     get_radius,
     get_radius_and_omega,
     theta_lcdm,
@@ -37,53 +34,6 @@ from scientific import (
 
 OUTPUT_DIR = "./output"
 RAD_TO_ARCSEC = 180.0 * 3600.0 / np.pi
-
-
-def compute_chi2_stats(z_data, theta_data, theta_err, model_func, n_params=1):
-    """Compute χ²/ndf and p-value for a model fit.
-
-    Parameters
-    ----------
-    z_data : array
-        Redshift values of binned data.
-    theta_data : array
-        Observed angular sizes (arcsec).
-    theta_err : array
-        Uncertainties on angular sizes (arcsec).
-    model_func : callable
-        Function that takes z and returns model θ in arcsec.
-    n_params : int
-        Number of fitted parameters (for degrees of freedom).
-
-    Returns
-    -------
-    dict
-        Contains 'chi2', 'ndf', 'chi2_ndf', 'p_value'
-    """
-    theta_model = model_func(z_data)
-
-    # Chi-squared
-    residuals = (theta_data - theta_model) / theta_err
-    chi2 = np.sum(residuals**2)
-
-    # Degrees of freedom
-    ndf = len(z_data) - n_params
-
-    if ndf <= 0:
-        return {'chi2': chi2, 'ndf': ndf, 'chi2_ndf': np.nan, 'p_value': np.nan}
-
-    chi2_ndf = chi2 / ndf
-
-    # P-value: probability of getting χ² this large or larger by chance
-    # if the model is correct
-    p_value = 1.0 - chi2_dist.cdf(chi2, ndf)
-
-    return {
-        'chi2': chi2,
-        'ndf': ndf,
-        'chi2_ndf': chi2_ndf,
-        'p_value': p_value,
-    }
 
 
 def get_adaptive_n_bins(n_sources: int, min_per_bin: int = 8) -> int:
@@ -147,7 +97,7 @@ def get_adaptive_n_bins(n_sources: int, min_per_bin: int = 8) -> int:
 def standard_error_median(x):
     """Standard error of the median using analytical approximation.
 
-    For approximately normal data: SE(median) ≈ 1.2533 × σ / √n
+    For approximately normal data: SE(median) ~ 1.2533 * sigma / sqrt(n)
     This is the standard approach used in professional astronomy surveys.
     Reference: Euclid Consortium methodology, Astropy robust statistics.
     """
@@ -163,7 +113,7 @@ def aggregate_bins(sed_catalog):
     Uses professional astronomy standards:
     - Median for central tendency (robust to outliers)
     - Standard error of the median for error bars (not RMS of individual errors)
-    - 16th/84th percentiles for 1σ spread visualization
+    - 16th/84th percentiles for 1-sigma spread visualization
 
     References:
     - Euclid tomographic binning methodology
@@ -207,18 +157,6 @@ def bin_equal_count(sed_catalog, n_bins=None):
     return aggregate_bins(sed_catalog)
 
 
-def bin_logarithmic(sed_catalog, n_bins=None):
-    """Logarithmic bins in (1+z)."""
-    if n_bins is None:
-        n_bins = get_adaptive_n_bins(len(sed_catalog))
-    z_min, z_max = sed_catalog.redshift.min(), sed_catalog.redshift.max()
-    log_bins = np.linspace(np.log10(1 + z_min), np.log10(1 + z_max), n_bins + 1)
-    bins = 10**log_bins - 1
-    sed_catalog = sed_catalog.copy()
-    sed_catalog["z_bin"] = pd.cut(sed_catalog.redshift, bins, include_lowest=True)
-    return aggregate_bins(sed_catalog)
-
-
 def bin_percentile(sed_catalog, n_bins=None):
     """Percentile-based bins using quantile edges for robust statistics."""
     if n_bins is None:
@@ -232,138 +170,6 @@ def bin_percentile(sed_catalog, n_bins=None):
         method="quantile",
     )
     sed_catalog["z_bin"] = pd.cut(sed_catalog.redshift, bins, include_lowest=True)
-    return aggregate_bins(sed_catalog)
-
-
-def bin_snr_adaptive(sed_catalog, target_snr=5.0, min_per_bin=5):
-    """SNR-based adaptive binning.
-
-    Combines data points into bins until a target signal-to-noise ratio
-    is achieved in each bin. This is particularly useful when measurement
-    uncertainties vary significantly across the sample.
-
-    The SNR for each bin is calculated as:
-        SNR = median(theta) / standard_error(median)
-
-    Parameters
-    ----------
-    sed_catalog : pd.DataFrame
-        Catalog with 'redshift', 'r_half_arcsec', 'r_half_arcsec_error' columns.
-    target_snr : float
-        Target signal-to-noise ratio per bin. Default 5.0.
-        - 3-5: Minimum for detection
-        - 5-10: Good for fitting
-        - >10: High precision
-    min_per_bin : int
-        Minimum number of sources per bin regardless of SNR.
-
-    Returns
-    -------
-    pd.DataFrame
-        Binned data with columns: z_mid, theta_med, theta_err, n
-    """
-    sed_catalog = sed_catalog.copy()
-    sed_catalog = sed_catalog.sort_values('redshift').reset_index(drop=True)
-
-    n = len(sed_catalog)
-    bin_labels = np.zeros(n, dtype=int)
-    current_bin = 0
-    start_idx = 0
-
-    while start_idx < n:
-        # Grow bin until target SNR is reached or we run out of data
-        end_idx = start_idx + min_per_bin
-
-        while end_idx <= n:
-            subset = sed_catalog.iloc[start_idx:end_idx]
-            theta_values = subset['r_half_arcsec'].values
-
-            if len(theta_values) >= min_per_bin:
-                median_theta = np.median(theta_values)
-                se_median = standard_error_median(pd.Series(theta_values))
-
-                if se_median > 0 and np.isfinite(se_median):
-                    snr = median_theta / se_median
-                    if snr >= target_snr:
-                        break
-
-            end_idx += 1
-
-        # Assign bin labels
-        end_idx = min(end_idx, n)
-        bin_labels[start_idx:end_idx] = current_bin
-        current_bin += 1
-        start_idx = end_idx
-
-    sed_catalog['z_bin'] = bin_labels
-
-    # Aggregate using the same approach as other methods
-    binned = (
-        sed_catalog.groupby('z_bin')
-        .agg(
-            z_mid=('redshift', 'median'),
-            theta_med=('r_half_arcsec', 'median'),
-            theta_err=('r_half_arcsec', standard_error_median),
-            theta_lo=('r_half_arcsec', lambda x: np.percentile(x, 16) if len(x) >= 2 else np.nan),
-            theta_hi=('r_half_arcsec', lambda x: np.percentile(x, 84) if len(x) >= 2 else np.nan),
-            n=('redshift', 'count'),
-        )
-        .reset_index(drop=True)
-    )
-
-    binned = binned.dropna(subset=['z_mid', 'theta_med', 'theta_err'])
-    binned = binned[(binned.n > 0) & (binned.z_mid > 0)]
-
-    # Calculate achieved SNR for reporting
-    binned['snr'] = binned['theta_med'] / binned['theta_err']
-    mean_snr = binned['snr'].mean()
-    print(f"    SNR Adaptive: target={target_snr}, achieved mean SNR={mean_snr:.1f}, {len(binned)} bins")
-
-    return binned[['z_mid', 'theta_med', 'theta_err', 'theta_lo', 'theta_hi', 'n']]
-
-
-def bin_bayesian_blocks(sed_catalog, ncp_prior=1):
-    """Bayesian Blocks adaptive binning (Scargle et al. 2013).
-
-    Uses a data-driven approach to find optimal bin edges that adapt to
-    the density and structure of the data. Places more bins where data
-    is dense or rapidly varying, fewer where sparse.
-
-    Parameters
-    ----------
-    sed_catalog : pd.DataFrame
-        Catalog with 'redshift' and 'r_half_arcsec' columns.
-    ncp_prior : float
-        Prior on the number of change points. Lower values = more bins.
-        Default of 1 produces ~5-10 bins for typical galaxy samples.
-        Use 2-4 for fewer but more statistically significant bins.
-
-    References
-    ----------
-    Scargle et al. 2013, ApJ, 764, 167
-    https://docs.astropy.org/en/stable/api/astropy.stats.bayesian_blocks.html
-    """
-    sed_catalog = sed_catalog.copy()
-    z = sed_catalog.redshift.values
-
-    # Compute optimal edges using Bayesian Blocks
-    edges = bayesian_blocks(z, fitness='events', ncp_prior=ncp_prior)
-
-    # Ensure we have at least 3 bins for meaningful analysis
-    if len(edges) - 1 < 3:
-        # Try with lower ncp_prior (more bins) before falling back
-        for ncp in [0.5, 0.1]:
-            edges = bayesian_blocks(z, fitness='events', ncp_prior=ncp)
-            if len(edges) - 1 >= 3:
-                break
-
-    if len(edges) - 1 < 3:
-        # Fall back to equal count if Bayesian Blocks still gives too few bins
-        print("    Bayesian Blocks produced <3 bins, falling back to equal count")
-        return bin_equal_count(sed_catalog)
-
-    print(f"    Bayesian Blocks: ncp_prior={ncp_prior}, found {len(edges)-1} bins")
-    sed_catalog["z_bin"] = pd.cut(sed_catalog.redshift, edges, include_lowest=True)
     return aggregate_bins(sed_catalog)
 
 
@@ -391,12 +197,9 @@ def main():
 
     # Define strategies
     binning_strategies = {
-        "Equal Width": bin_equal_width,
         "Equal Count": bin_equal_count,
-        "Logarithmic": bin_logarithmic,
+        "Equal Width": bin_equal_width,
         "Percentile": bin_percentile,
-        "Bayesian Blocks": bin_bayesian_blocks,
-        "SNR Adaptive": bin_snr_adaptive,
     }
 
     # Apply strategies
@@ -463,13 +266,13 @@ def main():
 
     # Interpretation
     print("\n  Interpretation:")
-    print(f"    χ²/ndf ≈ 1: good fit | χ²/ndf >> 1: poor fit | χ²/ndf << 1: overfitting or overestimated errors")
-    print(f"    P-value > 0.05: model consistent with data | P-value < 0.05: model may be rejected")
+    print("    χ²/ndf ≈ 1: good fit | χ²/ndf >> 1: poor fit | χ²/ndf << 1: overfitting or overestimated errors")
+    print("    P-value > 0.05: model consistent with data | P-value < 0.05: model may be rejected")
 
     if stats_lcdm['p_value'] > stats_static['p_value']:
-        print(f"    → ΛCDM provides better fit (higher P-value)")
+        print("    → ΛCDM provides better fit (higher P-value)")
     else:
-        print(f"    → Static model provides better fit (higher P-value)")
+        print("    → Static model provides better fit (higher P-value)")
 
     theta_static_model = theta_static(z_model, R_static) * RAD_TO_ARCSEC
     theta_lcdm_model = theta_lcdm(z_model, R_lcdm, Omega_m_std, Omega_L_std) * RAD_TO_ARCSEC
@@ -483,20 +286,14 @@ def main():
     theta_lim = (max(0, theta_data_min - theta_padding), theta_data_max + theta_padding)
 
     colors = {
-        "Equal Width": "green",
         "Equal Count": "blue",
-        "Logarithmic": "orange",
+        "Equal Width": "green",
         "Percentile": "purple",
-        "Bayesian Blocks": "red",
-        "SNR Adaptive": "teal",
     }
     markers = {
-        "Equal Width": "o",
         "Equal Count": "o",
-        "Logarithmic": "o",
+        "Equal Width": "o",
         "Percentile": "o",
-        "Bayesian Blocks": "s",
-        "SNR Adaptive": "D",
     }
 
     # Plot 1: Main angular size vs redshift
@@ -538,22 +335,21 @@ def main():
     print(f"  Saved: {OUTPUT_DIR}/individual_galaxies.pdf")
     plt.close()
 
-    # Plot 3: Binning comparison (3x2 grid) with two residual subplots each (ΛCDM and Static)
-    # Layout: 6 strategies in a 3x2 grid
-    fig = plt.figure(figsize=(14, 30), constrained_layout=True)
-    gs = fig.add_gridspec(9, 2, height_ratios=[3, 1, 1, 3, 1, 1, 3, 1, 1], hspace=0.08, wspace=0.15)
+    # Plot 3: Binning comparison (1x3 grid) with two residual subplots each (ΛCDM and Static)
+    # Layout: 3 strategies in a 1x3 grid
+    fig = plt.figure(figsize=(18, 11), constrained_layout=True)
+    gs = fig.add_gridspec(3, 3, height_ratios=[3, 1, 1], hspace=0.08, wspace=0.15)
 
     strategy_names = list(binned_results.keys())
 
     for idx, name in enumerate(strategy_names):
         binned_data = binned_results[name]
-        # Grid position: strategies in 3 rows of 2, each with main + 2 residual plots
-        row_base = (idx // 2) * 3  # 0, 3, or 6 for main plots
-        col = idx % 2
+        # Grid position: strategies in 1 row of 3, each with main + 2 residual plots
+        col = idx
 
-        ax_main = fig.add_subplot(gs[row_base, col])
-        ax_resid_lcdm = fig.add_subplot(gs[row_base + 1, col], sharex=ax_main)
-        ax_resid_static = fig.add_subplot(gs[row_base + 2, col], sharex=ax_main)
+        ax_main = fig.add_subplot(gs[0, col])
+        ax_resid_lcdm = fig.add_subplot(gs[1, col], sharex=ax_main)
+        ax_resid_static = fig.add_subplot(gs[2, col], sharex=ax_main)
 
         # Fit R with fixed standard cosmology (Omega_m = 0.3)
         R_static_i = get_radius(binned_data.z_mid.values, binned_data.theta_med.values,
@@ -566,10 +362,10 @@ def main():
         theta_lcdm_i = theta_lcdm(z_model_i, R_lcdm_i, 0.3, 0.7) * RAD_TO_ARCSEC
 
         # Compute chi2/ndf for this binning strategy
-        def static_func_i(z):
-            return theta_static(z, R_static_i) * RAD_TO_ARCSEC
-        def lcdm_func_i(z):
-            return theta_lcdm(z, R_lcdm_i, 0.3, 0.7) * RAD_TO_ARCSEC
+        def static_func_i(z, R=R_static_i):
+            return theta_static(z, R) * RAD_TO_ARCSEC
+        def lcdm_func_i(z, R=R_lcdm_i):
+            return theta_lcdm(z, R, 0.3, 0.7) * RAD_TO_ARCSEC
 
         stats_static_i = compute_chi2_stats(
             binned_data.z_mid.values, binned_data.theta_med.values,
@@ -585,17 +381,20 @@ def main():
         ax_main.errorbar(binned_data["z_mid"], binned_data["theta_med"], yerr=binned_data["theta_err"],
                     fmt=markers[name], capsize=3, capthick=0.8, markersize=6, markeredgewidth=0.8,
                     elinewidth=0.8, color=colors[name],
-                    label=f"Binned (n={[int(x) for x in binned_data['n'].values]})", zorder=3)
+                    label="Binned", zorder=3)
         ax_main.plot(z_model_i, theta_static_i, "--", color="gray", linewidth=1.5, label=r"Static", zorder=2)
         ax_main.plot(z_model_i, theta_lcdm_i, "-", color="darkblue", linewidth=1.5, label=r"$\Lambda$CDM", zorder=2)
 
         ax_main.set_ylabel(r"Angular size $\theta$ (arcsec)", fontsize=11)
         ax_main.set_title(
             f"{name} ({len(binned_data)} bins)\n"
-            + r"$R_{\Lambda{\rm CDM}}$" + f"={R_lcdm_i*1000:.1f} kpc, "
+            + r"$\Lambda$CDM: $R$" + f"={R_lcdm_i*1000:.1f} kpc, "
             + r"$\chi^2/{\rm ndf}$" + f"={stats_lcdm_i['chi2_ndf']:.2f}, "
-            + f"P={stats_lcdm_i['p_value']:.3f}",
-            fontsize=11
+            + f"P={stats_lcdm_i['p_value']:.3f}\n"
+            + r"Static: $R$" + f"={R_static_i*1000:.1f} kpc, "
+            + r"$\chi^2/{\rm ndf}$" + f"={stats_static_i['chi2_ndf']:.2f}, "
+            + f"P={stats_static_i['p_value']:.3f}",
+            fontsize=10
         )
         ax_main.legend(fontsize=8, loc="upper right")
         ax_main.grid(True, alpha=0.3)
@@ -634,7 +433,7 @@ def main():
         max_resid_static = max(0.05, np.max(np.abs(residuals_static) + binned_data["theta_err"].values) * 1.2)
         ax_resid_static.set_ylim(-max_resid_static, max_resid_static)
 
-    fig.suptitle(r"Dynamic Binning Strategies Comparison", fontsize=14, fontweight="bold")
+    fig.suptitle(r"Binning Strategies: $\Lambda$CDM vs Static Model Comparison", fontsize=14, fontweight="bold")
     plt.savefig(f"{OUTPUT_DIR}/binning_comparison.pdf", dpi=300, bbox_inches="tight")
     print(f"  Saved: {OUTPUT_DIR}/binning_comparison.pdf")
     plt.close()
@@ -662,15 +461,16 @@ def main():
     print(f"  Saved: {OUTPUT_DIR}/binning_overlay.pdf")
     plt.close()
 
-    # Plot 5: Redshift histogram
+    # Plot 5: Redshift histogram with dynamic y-axis
     _fig, ax = plt.subplots(figsize=(8, 5))
     hist_bins = np.linspace(z_data_min, z_data_max, 15)
-    ax.hist(sed_catalog["redshift"], bins=hist_bins, edgecolor="black", alpha=0.7, color="steelblue")
+    counts, _, _ = ax.hist(sed_catalog["redshift"], bins=hist_bins, edgecolor="black", alpha=0.7, color="steelblue")
     ax.set_xlabel(r"Redshift $z$", fontsize=12)
     ax.set_ylabel(r"Number of galaxies", fontsize=12)
     ax.set_title(f"Redshift Distribution (N={len(sed_catalog)})", fontsize=14)
     ax.grid(True, alpha=0.3)
     ax.set_xlim(z_lim)
+    ax.set_ylim(0, np.max(counts) * 1.1)
     plt.tight_layout()
     plt.savefig(f"{OUTPUT_DIR}/redshift_histogram.pdf", dpi=300, bbox_inches="tight")
     print(f"  Saved: {OUTPUT_DIR}/redshift_histogram.pdf")

@@ -4,15 +4,25 @@ Full analysis pipeline for angular size test
 Runs the complete processing and saves output plots as PDFs
 
 Usage:
-    python run_analysis.py full    # Run on entire image (4096x4096), output to ./output/full/
-    python run_analysis.py chip3   # Run on chip3 only (2048x2048), output to ./output/chip3/
+    python run_analysis.py full    # Run on entire image (4096x4096), output to ./output/full_HDF/
+    python run_analysis.py chip3   # Run on chip3 only (2048x2048), output to ./output/chip3_HDF/
+    python run_analysis.py both    # Run full and extract chip3, output to ./output/full_HDF/ and ./output/chip3_HDF/
 """
 
-import argparse
+# =============================================================================
+# Performance Optimization: Set thread counts BEFORE importing numpy/numba
+# =============================================================================
 import os
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+
+# Optimal thread settings for Intel i7-1065G7 (4 cores, 8 threads)
+_N_THREADS = str(min(os.cpu_count() or 4, 8))
+os.environ.setdefault("NUMBA_NUM_THREADS", _N_THREADS)
+os.environ.setdefault("OMP_NUM_THREADS", _N_THREADS)
+os.environ.setdefault("MKL_NUM_THREADS", _N_THREADS)
+os.environ.setdefault("OPENBLAS_NUM_THREADS", _N_THREADS)
+
+import argparse
 from dataclasses import dataclass
-from functools import partial
 
 import matplotlib
 
@@ -32,28 +42,34 @@ plt.rcParams.update({
     "xtick.labelsize": 10,
     "ytick.labelsize": 10,
 })
-import numpy as np
-import pandas as pd
-from astropy.io import fits
-from astropy.stats import sigma_clipped_stats
-from astropy.convolution import convolve
-from photutils.background import Background2D, MedianBackground
-from photutils.segmentation import SourceCatalog, SourceFinder, make_2dgaussian_kernel
-from scipy.spatial import cKDTree
-from scipy import ndimage
+import numpy as np  # noqa: E402
+import pandas as pd  # noqa: E402
+from astropy.convolution import convolve  # noqa: E402
+from astropy.io import fits  # noqa: E402
+from photutils.background import Background2D, MedianBackground  # noqa: E402
+from photutils.segmentation import SourceCatalog, SourceFinder, make_2dgaussian_kernel  # noqa: E402
+from scipy import ndimage  # noqa: E402
+from scipy.spatial import cKDTree  # noqa: E402
 
-from classify import classify_galaxy, classify_galaxy_batch_with_pdf, PhotoZResult
-from scientific import (
-    D_A_LCDM_vectorized,
+from classify import (  # noqa: E402
+    classify_batch_ultrafast,
+    classify_galaxy,
+    classify_galaxy_batch_with_pdf,
+)
+from scientific import (  # noqa: E402
     H0,
+    D_A_LCDM_vectorized,
     c,
     choose_redshift_bin_edges,
+    compute_chi2_stats,
     get_radius,
     get_radius_and_omega,
-    theta_lcdm,
     theta_lcdm_flat,
     theta_static,
 )
+
+# Professional star-galaxy classification (research-standard)
+USE_PROFESSIONAL_CLASSIFICATION = True  # Set to False to use basic classification only
 
 # Configuration
 PIXEL_SCALE = 0.04  # arcsec/pixel
@@ -67,6 +83,55 @@ CHIP3_Y_MIN, CHIP3_Y_MAX = 184, 2232  # 184 + 2048
 # =============================================================================
 # Quality Flags (following COSMOS/SDSS conventions)
 # =============================================================================
+"""
+QUALITY FLAG DOCUMENTATION
+==========================
+
+Flags are bit-packed integers for efficient storage and combination.
+Multiple flags can be set on a single source by bitwise OR.
+
+Usage:
+    - Check if flag is set: (quality_flag & FLAG_BLENDED) != 0
+    - Set a flag: quality_flag |= FLAG_BLENDED
+    - Clear a flag: quality_flag &= ~FLAG_BLENDED
+    - Check if clean: quality_flag == FLAG_NONE
+
+FLAG DEFINITIONS:
+-----------------
+FLAG_NONE (0):        Clean source, no quality issues detected
+FLAG_BLENDED (1):     Source was deblended from overlapping neighbor.
+                      Photometry may be affected by neighbor subtraction.
+FLAG_EDGE (2):        Source near image edge. May have truncated flux
+                      measurement or unreliable morphology.
+FLAG_SATURATED (4):   Contains saturated pixels. Flux measurement is
+                      a lower limit; morphology unreliable.
+FLAG_LOW_SNR (8):     Signal-to-noise ratio < 5 in detection band.
+                      Photometry and morphology may be unreliable.
+FLAG_CROWDED (16):    Located in crowded region with many nearby sources.
+                      Increased chance of photometric contamination.
+FLAG_BAD_PHOTOZ (32): Photo-z quality ODDS < 0.6 OR redshift hit boundary.
+                      Redshift estimate is unreliable.
+FLAG_PSF_LIKE (64):   Source morphology is consistent with PSF (point source).
+                      Likely a star or quasar, not a resolved galaxy.
+FLAG_MASKED (128):    Partially overlaps with masked region (diffraction
+                      spike, satellite trail, etc.). Photometry affected.
+FLAG_UNRELIABLE_Z (256): Redshift error exceeds redshift value (σ_z > z).
+                      Measurement uncertainty larger than measurement itself.
+
+FILTERING MODES:
+----------------
+HIGH_QUALITY_MODE (default):
+    Excludes: blended, edge, saturated, low_snr, crowded, bad_photoz,
+              psf_like, masked, unreliable_z
+    Requires: ODDS >= 0.9, chi2_flag == 0, non-bimodal redshift
+    Purpose: Publication-quality sample with maximum reliability.
+    Typical rejection: ~40% of raw detections.
+
+MODERATE_MODE:
+    Excludes: bad_photoz, psf_like, masked
+    Purpose: Broader sample accepting more sources with potential issues.
+    Use when sample size is more important than individual reliability.
+"""
 # Flags are bit-packed integers for efficient storage
 # Use bitwise AND to check: (flag & FLAG_BLENDED) != 0
 FLAG_NONE = 0           # Clean source, no issues
@@ -78,6 +143,7 @@ FLAG_CROWDED = 16       # Many nearby sources (crowded region)
 FLAG_BAD_PHOTOZ = 32    # Photo-z ODDS < 0.6 (unreliable redshift)
 FLAG_PSF_LIKE = 64      # Source is PSF-like (possible star)
 FLAG_MASKED = 128       # Partially overlaps with masked region
+FLAG_UNRELIABLE_Z = 256 # Redshift error exceeds redshift (σ_z > z)
 
 # Human-readable flag descriptions
 FLAG_DESCRIPTIONS = {
@@ -89,6 +155,7 @@ FLAG_DESCRIPTIONS = {
     FLAG_BAD_PHOTOZ: "bad_photoz",
     FLAG_PSF_LIKE: "psf_like",
     FLAG_MASKED: "masked",
+    FLAG_UNRELIABLE_Z: "unreliable_z",
 }
 
 
@@ -155,10 +222,11 @@ def compute_stellarity_score(
     psf_fwhm_pix: float,
 ) -> float:
     """
-    Compute stellarity index (0=galaxy, 1=star) following SExtractor methodology.
+    Compute stellarity index (0=galaxy, 1=star) using HST-optimized criteria.
 
-    This provides a continuous 0-1 score based on multiple morphological criteria,
-    similar to SExtractor's CLASS_STAR but using interpretable parameters.
+    This provides a continuous 0-1 score based on multiple morphological criteria.
+    Optimized for HST's excellent spatial resolution where SIZE is the primary
+    discriminator between stars (point sources) and galaxies (extended).
 
     Parameters
     ----------
@@ -179,36 +247,44 @@ def compute_stellarity_score(
     References
     ----------
     - SExtractor CLASS_STAR: https://sextractor.readthedocs.io/en/latest/ClassStar.html
-    - SDSS star/galaxy: https://www.sdss.org/dr16/algorithms/classify/
+    - SDSS star/galaxy: https://www.sdss4.org/dr14/algorithms/classify/
+    - HST Source Catalog: https://archive.stsci.edu/hst/hsc/help/HSC_faq.html
     """
     scores = []
+    weights = []
 
-    # 1. Size score: stars have r_half close to PSF
+    # 1. Size score (PRIMARY criterion for HST - weight 2x)
+    # Stars are point sources with r_half very close to PSF
     # PSF half-light radius ≈ PSF_FWHM * 0.42 (for Gaussian)
     psf_r_half = psf_fwhm_pix * 0.42
-    if np.isfinite(r_half) and r_half > 0:
+    if np.isfinite(r_half) and r_half > 0 and psf_r_half > 0:
         size_ratio = r_half / psf_r_half
-        # Score: 1 if exactly PSF size, 0 if 3x larger
-        size_score = max(0, 1.0 - abs(size_ratio - 1.0) / 2.0)
+        # Score: 1 if exactly PSF size, drops rapidly for larger sources
+        # 0 if 2x PSF size (much stricter than before)
+        size_score = 1.0 if size_ratio <= 1.0 else max(0, 1.0 - (size_ratio - 1.0))
         scores.append(size_score)
+        weights.append(2.0)  # Size is most reliable for HST
 
-    # 2. Concentration score: stars have C > 0.45 (SDSS-style r50/r90)
-    # Higher concentration = more star-like
+    # 2. Concentration score: stars have high concentration
+    # But NOTE: elliptical galaxies also have high concentration!
     if np.isfinite(concentration):
-        # Map: C=0.30 -> 0, C=0.50 -> 1
-        conc_score = min(1.0, max(0, (concentration - 0.30) / 0.20))
+        # Map: C=0.35 -> 0, C=0.55 -> 1
+        conc_score = min(1.0, max(0, (concentration - 0.35) / 0.20))
         scores.append(conc_score)
+        weights.append(1.0)
 
     # 3. Roundness score: stars are round (low ellipticity)
-    # Map: e=0 -> 1 (round=star-like), e=0.5 -> 0 (elongated=galaxy-like)
+    # Map: e=0 -> 1 (round=star-like), e=0.3 -> 0 (elongated=galaxy-like)
     if np.isfinite(ellipticity):
-        round_score = max(0, 1.0 - ellipticity / 0.5)
+        round_score = max(0, 1.0 - ellipticity / 0.3)
         scores.append(round_score)
+        weights.append(1.0)
 
     if len(scores) == 0:
         return 0.0
 
-    return float(np.mean(scores))
+    # Weighted average (size counts double)
+    return float(np.average(scores, weights=weights))
 
 
 def check_stellar_colors(flux_u: float, flux_b: float, flux_v: float, flux_i: float) -> tuple[bool, float]:
@@ -351,247 +427,6 @@ GALAXY_TYPE_COLORS = {
 GALAXY_TYPE_FALLBACK_COLOR = "#999999"
 
 
-def plot_color_color_diagram(
-    sed_catalog: pd.DataFrame,
-    output_path: str,
-    title_suffix: str = "",
-    show_templates: bool = True,
-    spectra_path: str = "./spectra",
-) -> None:
-    """
-    Create a U-B vs B-V color-color diagram for galaxy classification analysis.
-
-    This diagnostic plot shows how galaxies distribute in color-color space,
-    which is sensitive to stellar populations, star formation history, and redshift.
-    Early-type (elliptical) galaxies tend toward red colors (positive U-B, B-V),
-    while late-type starbursts are bluer.
-
-    Parameters
-    ----------
-    sed_catalog : pd.DataFrame
-        Galaxy catalog with flux columns: flux_u, flux_b, flux_v, flux_i
-        and galaxy_type column for classification
-    output_path : str
-        Output file path for the PDF
-    title_suffix : str, optional
-        Suffix to add to plot title (e.g., " (Chip 3)")
-    show_templates : bool, optional
-        If True, overlay expected template colors at different redshifts
-    spectra_path : str, optional
-        Path to spectra directory for template calculations
-
-    Notes
-    -----
-    Magnitudes are computed as instrumental magnitudes: m = -2.5 * log10(flux)
-    Color indices are differences: U-B = m_U - m_B, B-V = m_B - m_V
-
-    References
-    ----------
-    - SDSS color-color diagrams: https://www.sdss.org/dr17/algorithms/magnitudes/
-    - Galaxy color evolution: Strateva et al. (2001), AJ 122, 1861
-    """
-    # Convert fluxes to instrumental magnitudes
-    with np.errstate(divide="ignore", invalid="ignore"):
-        mag_u = np.where(
-            sed_catalog["flux_u"] > 0,
-            -2.5 * np.log10(sed_catalog["flux_u"]),
-            np.nan,
-        )
-        mag_b = np.where(
-            sed_catalog["flux_b"] > 0,
-            -2.5 * np.log10(sed_catalog["flux_b"]),
-            np.nan,
-        )
-        mag_v = np.where(
-            sed_catalog["flux_v"] > 0,
-            -2.5 * np.log10(sed_catalog["flux_v"]),
-            np.nan,
-        )
-
-    # Compute color indices
-    color_ub = mag_u - mag_b  # U-B
-    color_bv = mag_b - mag_v  # B-V
-
-    # Filter out invalid colors
-    valid_mask = np.isfinite(color_ub) & np.isfinite(color_bv)
-    color_ub_valid = color_ub[valid_mask]
-    color_bv_valid = color_bv[valid_mask]
-    galaxy_types_valid = sed_catalog.loc[valid_mask, "galaxy_type"].values
-
-    if len(color_ub_valid) == 0:
-        print(f"    Warning: No valid colors for color-color diagram, skipping")
-        return
-
-    # Create figure
-    _fig, ax = plt.subplots(figsize=(10, 8))
-
-    # Plot galaxies by type with consistent colors
-    unique_types = np.unique(galaxy_types_valid)
-
-    for gtype in unique_types:
-        mask = galaxy_types_valid == gtype
-        color = GALAXY_TYPE_COLORS.get(gtype, GALAXY_TYPE_FALLBACK_COLOR)
-
-        ax.scatter(
-            color_bv_valid[mask],
-            color_ub_valid[mask],
-            c=color,
-            s=25,
-            alpha=0.6,
-            label=gtype,
-            edgecolors="none",
-        )
-
-    # Overlay template tracks at different redshifts (optional)
-    if show_templates:
-        try:
-            _overlay_template_colors(ax, spectra_path)
-        except Exception as e:
-            print(f"    Warning: Could not overlay template colors: {e}")
-
-    # Axis labels and styling
-    ax.set_xlabel(r"$B - V$ (mag)", fontsize=12)
-    ax.set_ylabel(r"$U - B$ (mag)", fontsize=12)
-    ax.set_title(
-        r"Color-Color Diagram" + title_suffix + f"\n(N={len(color_ub_valid)} galaxies)",
-        fontsize=14,
-    )
-
-    # Add legend with galaxy types
-    ax.legend(
-        fontsize=9,
-        loc="upper left",
-        framealpha=0.9,
-        title="Galaxy Type",
-        title_fontsize=10,
-    )
-
-    ax.grid(True, alpha=0.3)
-
-    # Let matplotlib auto-scale to include both data and template tracks
-    # Add small margin for aesthetics
-    ax.margins(0.05)
-
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=300, bbox_inches="tight")
-    plt.close()
-
-
-def _overlay_template_colors(ax, spectra_path: str) -> None:
-    """
-    Overlay expected galaxy template colors at different redshifts.
-
-    Draws tracks showing how each galaxy type moves in color-color space
-    as redshift increases (k-correction effects).
-
-    Parameters
-    ----------
-    ax : matplotlib.axes.Axes
-        Axes to draw on
-    spectra_path : str
-        Path to spectra directory
-    """
-    from classify import GALAXY_TYPES, _load_spectrum
-
-    # Redshift grid for template tracks
-    z_grid = np.array([0.0, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0])
-
-    # Filter wavelength ranges (center, half-width) in Angstroms
-    # HST/WFPC2 filters: F300W (U), F450W (B), F606W (V), F814W (I)
-    filter_ranges = {
-        "u": (3000.0, 760.0),   # F300W: ~2240-3760 A
-        "b": (4500.0, 750.0),   # F450W: ~3750-5250 A
-        "v": (6060.0, 475.0),   # F606W: ~5585-6535 A
-        "i": (8140.0, 383.0),   # F814W: ~7757-8523 A
-    }
-
-    # Only plot tracks for a subset of types to avoid clutter
-    template_types = ["elliptical", "Sa", "Sb", "sbt3", "sbt6"]
-
-    for gtype in template_types:
-        if gtype not in GALAXY_TYPES:
-            continue
-
-        try:
-            wl, spec = _load_spectrum(spectra_path, gtype)
-        except Exception:
-            continue
-
-        colors_bv = []
-        colors_ub = []
-
-        for z in z_grid:
-            # Compute synthetic photometry at this redshift
-            # Redshift the spectrum: observed wavelength = rest wavelength * (1+z)
-            wl_obs = wl * (1 + z)
-
-            # Compute flux in each filter (simplified - integrate spectrum over filter)
-            fluxes = {}
-            for band, (center, half_width) in filter_ranges.items():
-                wl_lo = center - half_width
-                wl_hi = center + half_width
-                # Find spectrum indices within filter range
-                in_filter = (wl_obs >= wl_lo) & (wl_obs <= wl_hi)
-                if np.sum(in_filter) > 2:
-                    # Simple trapezoidal integration
-                    fluxes[band] = np.trapezoid(spec[in_filter], wl_obs[in_filter])
-                else:
-                    fluxes[band] = np.nan
-
-            # Convert to magnitudes and colors
-            if all(fluxes.get(b, 0) > 0 for b in ["u", "b", "v"]):
-                mag_u = -2.5 * np.log10(fluxes["u"])
-                mag_b = -2.5 * np.log10(fluxes["b"])
-                mag_v = -2.5 * np.log10(fluxes["v"])
-                colors_bv.append(mag_b - mag_v)
-                colors_ub.append(mag_u - mag_b)
-            else:
-                colors_bv.append(np.nan)
-                colors_ub.append(np.nan)
-
-        # Plot template track
-        colors_bv = np.array(colors_bv)
-        colors_ub = np.array(colors_ub)
-        valid = np.isfinite(colors_bv) & np.isfinite(colors_ub)
-
-        if np.sum(valid) > 1:
-            color = GALAXY_TYPE_COLORS.get(gtype, GALAXY_TYPE_FALLBACK_COLOR)
-            # Plot template track as dashed line with markers
-            ax.plot(
-                colors_bv[valid],
-                colors_ub[valid],
-                "--",
-                color=color,
-                linewidth=2.5,
-                alpha=0.9,
-                zorder=5,
-            )
-            # Mark redshift points with small circles
-            ax.scatter(
-                colors_bv[valid],
-                colors_ub[valid],
-                c=color,
-                s=30,
-                marker="o",
-                edgecolors="white",
-                linewidths=0.5,
-                zorder=6,
-            )
-            # Annotate redshift values (only at key points to avoid clutter)
-            for i, z in enumerate(z_grid):
-                if valid[i] and z in [0.0, 0.5, 1.0, 2.0]:
-                    ax.annotate(
-                        f"z={z:.1f}",
-                        (colors_bv[i], colors_ub[i]),
-                        fontsize=7,
-                        fontweight="bold",
-                        alpha=0.8,
-                        xytext=(5, 5),
-                        textcoords="offset points",
-                        bbox=dict(boxstyle="round,pad=0.2", fc="white", alpha=0.7, ec="none"),
-                    )
-
-
 def get_adaptive_n_bins(n_sources: int, min_per_bin: int = 5) -> int:
     """
     Calculate adaptive number of bins based on data size.
@@ -659,7 +494,7 @@ def bin_percentile(sed_catalog, n_bins=None):
 def standard_error_median(x):
     """Standard error of the median using analytical approximation.
 
-    For approximately normal data: SE(median) ≈ 1.2533 × σ / √n
+    For approximately normal data: SE(median) ~ 1.2533 * sigma / sqrt(n)
     This is the standard approach used in professional astronomy surveys.
     Reference: Euclid Consortium methodology, Astropy robust statistics.
     """
@@ -675,7 +510,7 @@ def aggregate_bins(sed_catalog):
     Uses professional astronomy standards:
     - Median for central tendency (robust to outliers)
     - Standard error of the median for error bars (not RMS of individual errors)
-    - 16th/84th percentiles for 1σ spread visualization
+    - 16th/84th percentiles for 1-sigma spread visualization
 
     References:
     - Euclid tomographic binning methodology
@@ -759,22 +594,30 @@ def read_fits(file_path, weight_path=None):
     weight : np.ndarray or None
         Weight map (inverse variance) if provided
     """
-    with fits.open(file_path) as hdul:
+    # Use memory mapping for large files to reduce memory footprint
+    # memmap='r' loads data lazily, only reading chunks as needed
+    with fits.open(file_path, memmap=True) as hdul:
         data = hdul[0].data
         header = hdul[0].header
         # Use native byte order for efficient numpy operations
+        # Note: This copies the data, but ensures optimal memory layout
         if data.dtype.byteorder == ">":
             data = data.astype(data.dtype.newbyteorder("="), copy=False)
+        else:
+            # Force copy from mmap to regular array for subsequent operations
+            data = np.array(data)
         data = adjust_data(data)
 
     # Load weight map if provided
     weight = None
     if weight_path is not None:
         try:
-            with fits.open(weight_path) as hdul_w:
+            with fits.open(weight_path, memmap=True) as hdul_w:
                 weight = hdul_w[0].data
                 if weight.dtype.byteorder == ">":
                     weight = weight.astype(weight.dtype.newbyteorder("="), copy=False)
+                else:
+                    weight = np.array(weight)
                 weight = adjust_data(weight)
         except FileNotFoundError:
             print(f"  Warning: Weight file not found: {weight_path}")
@@ -814,12 +657,12 @@ def iterative_background(data, box_size=100, n_iterations=2, sigma_clip=3.0, mas
     Background2D
         Final background estimate with source masking
     """
-    from photutils.background import Background2D, MedianBackground, SExtractorBackground
+    from photutils.background import Background2D, MedianBackground
 
     bkg_estimator = MedianBackground()
     current_mask = mask.copy() if mask is not None else np.zeros(data.shape, dtype=bool)
 
-    for iteration in range(n_iterations):
+    for _iteration in range(n_iterations):
         # Estimate background with current mask
         bkg = Background2D(
             data,
@@ -859,7 +702,7 @@ def _process_single_band(args):
 
     This function is designed to be called in a separate process.
     """
-    band, data, weight, mask, kernel, detection_sigma, npixels, nlevels, contrast = args
+    band, data, _weight, mask, kernel, detection_sigma, npixels, nlevels, contrast = args
 
     from astropy.convolution import convolve
     from photutils.background import Background2D, MedianBackground
@@ -903,7 +746,6 @@ def _process_single_band(args):
 def _classify_single_galaxy(args):
     """Classify a single galaxy (for parallel execution)."""
     idx, fluxes, errors, spectra_path = args
-    from classify import classify_galaxy
     galaxy_type, redshift = classify_galaxy(fluxes, errors, spectra_path=spectra_path)
     return idx, galaxy_type, redshift
 
@@ -911,7 +753,6 @@ def _classify_single_galaxy(args):
 def _classify_galaxy_batch(args):
     """Classify a batch of galaxies with PDF uncertainties (reduces IPC overhead)."""
     batch, spectra_path = args
-    from classify import classify_galaxy_batch_with_pdf
 
     # Use the new PDF-based batch classification
     # Returns: (idx, galaxy_type, redshift, z_lo, z_hi, chi_sq_min, odds)
@@ -919,429 +760,14 @@ def _classify_galaxy_batch(args):
     return results
 
 
-def plot_photoz_quality(
-    catalog: pd.DataFrame,
-    output_dir: str,
-    title_suffix: str = "",
-) -> None:
-    """
-    Plot photo-z quality metrics (ODDS and chi-squared distributions).
-
-    Creates a 2-panel figure showing:
-    - Left: ODDS distribution histogram with quality thresholds
-    - Right: Chi-squared distribution histogram
-
-    Both panels include:
-    - Quality threshold lines
-    - Fraction of galaxies passing cuts
-    - Median/mean annotations
-
-    Parameters
-    ----------
-    catalog : pd.DataFrame
-        Galaxy catalog containing 'photo_z_odds' and 'chi_sq_min' columns
-    output_dir : str
-        Directory to save the output PDF
-    title_suffix : str, optional
-        Suffix to add to plot title (e.g., " (Chip 3)")
-
-    Notes
-    -----
-    ODDS thresholds follow BPZ conventions:
-    - ODDS > 0.95: Excellent (highly confident photo-z)
-    - ODDS > 0.90: Good (reliable photo-z)
-    - ODDS > 0.60: Acceptable (usable with caution)
-    - ODDS < 0.60: Poor (unreliable, flagged as FLAG_BAD_PHOTOZ)
-
-    Chi-squared interpretation:
-    - chi_sq < 1: Very good fit (may indicate overestimated errors)
-    - chi_sq ~ 1-3: Good fit
-    - chi_sq > 10: Poor fit (may indicate bad template match or outlier)
-    """
-    # Check if required columns exist
-    has_odds = "photo_z_odds" in catalog.columns
-    has_chi2 = "chi_sq_min" in catalog.columns
-
-    if not has_odds and not has_chi2:
-        print(f"  Warning: No photo-z quality columns found, skipping photoz_quality plot")
-        return
-
-    # Determine figure layout based on available data
-    if has_odds and has_chi2:
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
-    elif has_odds:
-        fig, ax1 = plt.subplots(figsize=(8, 5))
-        ax2 = None
-    else:
-        fig, ax2 = plt.subplots(figsize=(8, 5))
-        ax1 = None
-
-    # Panel 1: ODDS distribution
-    if has_odds and ax1 is not None:
-        odds = catalog["photo_z_odds"].dropna().values
-        n_total = len(odds)
-
-        if n_total > 0:
-            # Compute statistics
-            odds_median = np.median(odds)
-            odds_mean = np.mean(odds)
-
-            # Quality thresholds
-            n_excellent = np.sum(odds >= 0.95)
-            n_good = np.sum((odds >= 0.90) & (odds < 0.95))
-            n_acceptable = np.sum((odds >= 0.60) & (odds < 0.90))
-            n_poor = np.sum(odds < 0.60)
-
-            frac_excellent = n_excellent / n_total * 100
-            frac_good = n_good / n_total * 100
-            frac_acceptable = n_acceptable / n_total * 100
-            frac_poor = n_poor / n_total * 100
-
-            # Histogram
-            bins = np.linspace(0, 1, 25)
-            ax1.hist(odds, bins=bins, edgecolor="black", alpha=0.7, color="steelblue")
-
-            # Threshold lines
-            ax1.axvline(0.95, color="green", linestyle="--", linewidth=2, label=r"Excellent ($\geq$0.95)")
-            ax1.axvline(0.90, color="orange", linestyle="--", linewidth=2, label=r"Good ($\geq$0.90)")
-            ax1.axvline(0.60, color="red", linestyle="--", linewidth=2, label=r"Acceptable ($\geq$0.60)")
-
-            # Median/mean lines
-            ax1.axvline(odds_median, color="darkblue", linestyle="-", linewidth=2, alpha=0.8)
-            ax1.axvline(odds_mean, color="purple", linestyle=":", linewidth=2, alpha=0.8)
-
-            # Annotations
-            ax1.text(
-                0.02, 0.95,
-                f"N = {n_total}\n"
-                f"Median = {odds_median:.3f}\n"
-                f"Mean = {odds_mean:.3f}",
-                transform=ax1.transAxes,
-                verticalalignment="top",
-                fontsize=10,
-                bbox=dict(boxstyle="round", facecolor="white", alpha=0.8),
-            )
-
-            # Quality breakdown annotation (right side)
-            ax1.text(
-                0.98, 0.95,
-                f"Excellent: {frac_excellent:.1f}\\%\n"
-                f"Good: {frac_good:.1f}\\%\n"
-                f"Acceptable: {frac_acceptable:.1f}\\%\n"
-                f"Poor: {frac_poor:.1f}\\%",
-                transform=ax1.transAxes,
-                verticalalignment="top",
-                horizontalalignment="right",
-                fontsize=10,
-                bbox=dict(boxstyle="round", facecolor="white", alpha=0.8),
-            )
-
-            ax1.set_xlabel(r"Photo-z ODDS", fontsize=12)
-            ax1.set_ylabel(r"Number of galaxies", fontsize=12)
-            ax1.set_title(r"Photo-z Quality: ODDS Distribution", fontsize=14)
-            ax1.set_xlim(0, 1.05)
-            ax1.legend(loc="upper left", fontsize=9, framealpha=0.9)
-            ax1.grid(True, alpha=0.3)
-
-    # Panel 2: Chi-squared distribution
-    if has_chi2 and ax2 is not None:
-        chi2 = catalog["chi_sq_min"].dropna().values
-        # Filter out extreme values for better visualization
-        chi2_valid = chi2[(chi2 > 0) & (chi2 < 100)]
-        n_total_chi2 = len(chi2)
-        n_valid = len(chi2_valid)
-
-        if n_valid > 0:
-            # Compute statistics
-            chi2_median = np.median(chi2_valid)
-            chi2_mean = np.mean(chi2_valid)
-
-            # Quality thresholds
-            n_very_good = np.sum(chi2_valid <= 1.0)
-            n_good = np.sum((chi2_valid > 1.0) & (chi2_valid <= 3.0))
-            n_fair = np.sum((chi2_valid > 3.0) & (chi2_valid <= 10.0))
-            n_poor = np.sum(chi2_valid > 10.0)
-
-            frac_very_good = n_very_good / n_valid * 100
-            frac_good = n_good / n_valid * 100
-            frac_fair = n_fair / n_valid * 100
-            frac_poor = n_poor / n_valid * 100
-
-            # Use logarithmic bins for chi-squared (spans wide range)
-            chi2_max = min(np.percentile(chi2_valid, 99), 50)
-            bins = np.logspace(np.log10(max(0.01, chi2_valid.min())), np.log10(chi2_max), 30)
-            ax2.hist(chi2_valid, bins=bins, edgecolor="black", alpha=0.7, color="coral")
-            ax2.set_xscale("log")
-
-            # Threshold lines
-            ax2.axvline(1.0, color="green", linestyle="--", linewidth=2, label=r"$\chi^2 = 1$")
-            ax2.axvline(3.0, color="orange", linestyle="--", linewidth=2, label=r"$\chi^2 = 3$")
-            ax2.axvline(10.0, color="red", linestyle="--", linewidth=2, label=r"$\chi^2 = 10$")
-
-            # Median line
-            ax2.axvline(chi2_median, color="darkblue", linestyle="-", linewidth=2, alpha=0.8)
-
-            # Annotations
-            ax2.text(
-                0.02, 0.95,
-                f"N = {n_valid}"
-                + (f" (of {n_total_chi2})" if n_valid < n_total_chi2 else "")
-                + f"\nMedian = {chi2_median:.2f}\n"
-                f"Mean = {chi2_mean:.2f}",
-                transform=ax2.transAxes,
-                verticalalignment="top",
-                fontsize=10,
-                bbox=dict(boxstyle="round", facecolor="white", alpha=0.8),
-            )
-
-            # Quality breakdown annotation (right side)
-            ax2.text(
-                0.98, 0.95,
-                f"Very good ($\\leq$1): {frac_very_good:.1f}\\%\n"
-                f"Good (1-3): {frac_good:.1f}\\%\n"
-                f"Fair (3-10): {frac_fair:.1f}\\%\n"
-                f"Poor ($>$10): {frac_poor:.1f}\\%",
-                transform=ax2.transAxes,
-                verticalalignment="top",
-                horizontalalignment="right",
-                fontsize=10,
-                bbox=dict(boxstyle="round", facecolor="white", alpha=0.8),
-            )
-
-            ax2.set_xlabel(r"$\chi^2_{\mathrm{min}}$ (SED fit)", fontsize=12)
-            ax2.set_ylabel(r"Number of galaxies", fontsize=12)
-            ax2.set_title(r"Photo-z Quality: $\chi^2$ Distribution", fontsize=14)
-            ax2.legend(loc="upper right", fontsize=9, framealpha=0.9)
-            ax2.grid(True, alpha=0.3)
-
-    # Overall title if two panels
-    if has_odds and has_chi2:
-        fig.suptitle(f"Photo-z Quality Metrics{title_suffix}", fontsize=14, fontweight="bold", y=1.02)
-
-    plt.tight_layout()
-    plt.savefig(f"{output_dir}/photoz_quality.pdf", dpi=300, bbox_inches="tight")
-    plt.close()
-    print(f"  Saved: {output_dir}/photoz_quality.pdf")
-
-
-def plot_physical_size_distribution(
-    catalog: pd.DataFrame,
-    output_path: str,
-    Omega_m: float = 0.3,
-    Omega_L: float = 0.7,
-    title_suffix: str = "",
-    by_type: bool = False,
-    by_redshift_bin: bool = False,
-    n_redshift_bins: int = 3,
-) -> dict:
-    """
-    Plot histogram of physical galaxy sizes in kpc.
-
-    Converts angular sizes (arcsec) to physical sizes (kpc) using the LCDM
-    angular diameter distance D_A(z).
-
-    Physical size formula: R = theta * D_A(z)
-    where theta is in radians and D_A is in Mpc, giving R in Mpc (converted to kpc).
-
-    Parameters
-    ----------
-    catalog : pd.DataFrame
-        Galaxy catalog with columns: 'redshift', 'r_half_arcsec', and optionally 'galaxy_type'
-    output_path : str
-        Path to save the output PDF
-    Omega_m : float
-        Matter density parameter for LCDM cosmology (default: 0.3)
-    Omega_L : float
-        Dark energy density parameter (default: 0.7)
-    title_suffix : str
-        Optional suffix for plot title (e.g., " (Chip 3)")
-    by_type : bool
-        If True, show separate histograms for different galaxy types
-    by_redshift_bin : bool
-        If True, show separate histograms for different redshift bins
-    n_redshift_bins : int
-        Number of redshift bins if by_redshift_bin is True
-
-    Returns
-    -------
-    dict
-        Statistics: mean, median, std, min, max of physical sizes in kpc
-    """
-    # Filter valid data
-    valid_mask = (
-        np.isfinite(catalog["redshift"]) &
-        np.isfinite(catalog["r_half_arcsec"]) &
-        (catalog["redshift"] > 0) &
-        (catalog["r_half_arcsec"] > 0)
-    )
-    df = catalog[valid_mask].copy()
-
-    if len(df) == 0:
-        print(f"  Warning: No valid data for physical size distribution")
-        return {}
-
-    # Convert angular size (arcsec) to radians
-    ARCSEC_TO_RAD = np.pi / (180.0 * 3600.0)
-    theta_rad = df["r_half_arcsec"].values * ARCSEC_TO_RAD
-
-    # Calculate angular diameter distance D_A(z) in Mpc
-    D_A_Mpc = D_A_LCDM_vectorized(df["redshift"].values, Omega_m, Omega_L)
-
-    # Physical size R = theta * D_A in Mpc, convert to kpc
-    R_Mpc = theta_rad * D_A_Mpc
-    R_kpc = R_Mpc * 1000.0  # Convert Mpc to kpc
-    df["R_kpc"] = R_kpc
-
-    # Calculate statistics
-    stats = {
-        "mean_kpc": float(np.mean(R_kpc)),
-        "median_kpc": float(np.median(R_kpc)),
-        "std_kpc": float(np.std(R_kpc)),
-        "min_kpc": float(np.min(R_kpc)),
-        "max_kpc": float(np.max(R_kpc)),
-        "n_galaxies": len(R_kpc),
-    }
-
-    # Determine number of histogram bins adaptively
-    n_hist_bins = max(10, min(30, int(np.sqrt(len(R_kpc)))))
-
-    # Create figure based on options
-    if by_type and "galaxy_type" in df.columns:
-        # Separate histograms by galaxy type
-        galaxy_types = df["galaxy_type"].dropna().unique()
-        n_types = len(galaxy_types)
-        if n_types > 1:
-            fig, axes = plt.subplots(1, n_types + 1, figsize=(4 * (n_types + 1), 5))
-            axes = np.atleast_1d(axes)
-
-            # Overall histogram
-            ax = axes[0]
-            ax.hist(R_kpc, bins=n_hist_bins, edgecolor="black", alpha=0.7, color="steelblue")
-            ax.axvline(stats["median_kpc"], color="red", linestyle="--", linewidth=2,
-                       label=f"Median = {stats['median_kpc']:.1f} kpc")
-            ax.axvline(stats["mean_kpc"], color="orange", linestyle="-", linewidth=2,
-                       label=f"Mean = {stats['mean_kpc']:.1f} kpc")
-            ax.set_xlabel(r"Physical Size $R$ (kpc)", fontsize=12)
-            ax.set_ylabel(r"Number of galaxies", fontsize=12)
-            ax.set_title(f"All Types (N={len(R_kpc)})", fontsize=11)
-            ax.legend(fontsize=9)
-            ax.grid(True, alpha=0.3)
-
-            # Per-type histograms
-            colors = plt.cm.tab10(np.linspace(0, 1, n_types))
-            for i, gtype in enumerate(sorted(galaxy_types)):
-                ax = axes[i + 1]
-                mask = df["galaxy_type"] == gtype
-                R_type = df.loc[mask, "R_kpc"].values
-                if len(R_type) > 0:
-                    type_median = np.median(R_type)
-                    type_mean = np.mean(R_type)
-                    ax.hist(R_type, bins=n_hist_bins, edgecolor="black", alpha=0.7, color=colors[i])
-                    ax.axvline(type_median, color="red", linestyle="--", linewidth=2,
-                               label=f"Median = {type_median:.1f} kpc")
-                    ax.axvline(type_mean, color="orange", linestyle="-", linewidth=2,
-                               label=f"Mean = {type_mean:.1f} kpc")
-                ax.set_xlabel(r"Physical Size $R$ (kpc)", fontsize=12)
-                ax.set_ylabel(r"Number of galaxies", fontsize=12)
-                ax.set_title(f"{gtype} (N={len(R_type)})", fontsize=11)
-                ax.legend(fontsize=9)
-                ax.grid(True, alpha=0.3)
-
-            plt.suptitle(r"Physical Size Distribution by Galaxy Type" + title_suffix,
-                         fontsize=14, fontweight="bold")
-            plt.tight_layout()
-        else:
-            # Only one type, fall through to simple histogram
-            by_type = False
-
-    if by_redshift_bin and not by_type:
-        # Separate histograms by redshift bin
-        z_edges = np.quantile(df["redshift"].values, np.linspace(0, 1, n_redshift_bins + 1))
-        z_edges = np.unique(z_edges)  # Remove duplicates
-        n_bins_actual = len(z_edges) - 1
-
-        if n_bins_actual > 1:
-            fig, axes = plt.subplots(1, n_bins_actual + 1, figsize=(4 * (n_bins_actual + 1), 5))
-            axes = np.atleast_1d(axes)
-
-            # Overall histogram
-            ax = axes[0]
-            ax.hist(R_kpc, bins=n_hist_bins, edgecolor="black", alpha=0.7, color="steelblue")
-            ax.axvline(stats["median_kpc"], color="red", linestyle="--", linewidth=2,
-                       label=f"Median = {stats['median_kpc']:.1f} kpc")
-            ax.axvline(stats["mean_kpc"], color="orange", linestyle="-", linewidth=2,
-                       label=f"Mean = {stats['mean_kpc']:.1f} kpc")
-            ax.set_xlabel(r"Physical Size $R$ (kpc)", fontsize=12)
-            ax.set_ylabel(r"Number of galaxies", fontsize=12)
-            ax.set_title(f"All Redshifts (N={len(R_kpc)})", fontsize=11)
-            ax.legend(fontsize=9)
-            ax.grid(True, alpha=0.3)
-
-            # Per-redshift-bin histograms
-            colors = plt.cm.viridis(np.linspace(0.2, 0.8, n_bins_actual))
-            for i in range(n_bins_actual):
-                ax = axes[i + 1]
-                z_lo, z_hi = z_edges[i], z_edges[i + 1]
-                mask = (df["redshift"] >= z_lo) & (df["redshift"] < z_hi)
-                if i == n_bins_actual - 1:
-                    mask = (df["redshift"] >= z_lo) & (df["redshift"] <= z_hi)
-                R_bin = df.loc[mask, "R_kpc"].values
-                if len(R_bin) > 0:
-                    bin_median = np.median(R_bin)
-                    bin_mean = np.mean(R_bin)
-                    ax.hist(R_bin, bins=n_hist_bins, edgecolor="black", alpha=0.7, color=colors[i])
-                    ax.axvline(bin_median, color="red", linestyle="--", linewidth=2,
-                               label=f"Median = {bin_median:.1f} kpc")
-                    ax.axvline(bin_mean, color="orange", linestyle="-", linewidth=2,
-                               label=f"Mean = {bin_mean:.1f} kpc")
-                ax.set_xlabel(r"Physical Size $R$ (kpc)", fontsize=12)
-                ax.set_ylabel(r"Number of galaxies", fontsize=12)
-                ax.set_title(f"$z \\in [{z_lo:.2f}, {z_hi:.2f}]$ (N={len(R_bin)})", fontsize=11)
-                ax.legend(fontsize=9)
-                ax.grid(True, alpha=0.3)
-
-            plt.suptitle(r"Physical Size Distribution by Redshift" + title_suffix,
-                         fontsize=14, fontweight="bold")
-            plt.tight_layout()
-        else:
-            # Not enough bins, fall through to simple histogram
-            by_redshift_bin = False
-
-    if not by_type and not by_redshift_bin:
-        # Simple single histogram
-        fig, ax = plt.subplots(figsize=(10, 6))
-        ax.hist(R_kpc, bins=n_hist_bins, edgecolor="black", alpha=0.7, color="steelblue")
-        ax.axvline(stats["median_kpc"], color="red", linestyle="--", linewidth=2,
-                   label=f"Median = {stats['median_kpc']:.1f} kpc")
-        ax.axvline(stats["mean_kpc"], color="orange", linestyle="-", linewidth=2,
-                   label=f"Mean = {stats['mean_kpc']:.1f} kpc")
-        ax.set_xlabel(r"Physical Size $R$ (kpc)", fontsize=12)
-        ax.set_ylabel(r"Number of galaxies", fontsize=12)
-        ax.set_title(
-            r"Physical Galaxy Size Distribution" + title_suffix + f"\n(N={len(R_kpc)}, "
-            + r"$\Omega_m$=" + f"{Omega_m:.2f})",
-            fontsize=14
-        )
-        ax.legend(fontsize=10)
-        ax.grid(True, alpha=0.3)
-        plt.tight_layout()
-
-    # Save figure
-    plt.savefig(output_path, dpi=300, bbox_inches="tight")
-    plt.close()
-    print(f"  Saved: {output_path}")
-
-    return stats
-
-
 def analyze_and_plot_catalog(
     sed_catalog: pd.DataFrame,
     sed_catalog_filtered: pd.DataFrame,
     output_dir: str,
     title_suffix: str = "",
-    images: list = None,
-    crop_bounds: tuple = None,
-    star_mask_centers: list = None,
+    images: list | None = None,
+    crop_bounds: tuple | None = None,
+    star_mask_centers: list | None = None,
 ):
     """
     Analyze catalog data and generate plots without re-running detection.
@@ -1371,20 +797,20 @@ def analyze_and_plot_catalog(
     print(f"\n  Analyzing {len(sed_catalog_analysis)} quality-filtered sources...")
 
     # Redshift statistics
-    print(f"\n  Redshift statistics (filtered):")
+    print("\n  Redshift statistics (filtered):")
     print(f"    Min: {sed_catalog_analysis['redshift'].min():.3f}")
     print(f"    Max: {sed_catalog_analysis['redshift'].max():.3f}")
     print(f"    Mean: {sed_catalog_analysis['redshift'].mean():.3f}")
     print(f"    Median: {sed_catalog_analysis['redshift'].median():.3f}")
 
     # Galaxy type distribution
-    print(f"\n  Galaxy type distribution:")
+    print("\n  Galaxy type distribution:")
     type_counts = sed_catalog_analysis["galaxy_type"].value_counts()
     for gtype, count in type_counts.items():
         print(f"    {gtype}: {count}")
 
     # Angular size statistics
-    print(f"\n  Angular size statistics (PSF-corrected):")
+    print("\n  Angular size statistics (PSF-corrected):")
     print(f"    Min: {sed_catalog_analysis['r_half_arcsec'].min():.4f} arcsec")
     print(f"    Max: {sed_catalog_analysis['r_half_arcsec'].max():.4f} arcsec")
     print(f"    Median: {sed_catalog_analysis['r_half_arcsec'].median():.4f} arcsec")
@@ -1410,7 +836,7 @@ def analyze_and_plot_catalog(
         print("  No valid binning results!")
         return
 
-    binned = binned_results.get("Equal Count", list(binned_results.values())[0])
+    binned = binned_results.get("Equal Count", next(iter(binned_results.values())))
 
     # Model fitting
     z_data = binned["z_mid"].values
@@ -1444,7 +870,7 @@ def analyze_and_plot_catalog(
     except Exception as e:
         print(f"    Model fitting failed: {e}")
 
-    print(f"\n  Fitted parameters:")
+    print("\n  Fitted parameters:")
     print(f"    Static model: R = {R_static*1000:.2f} kpc")
     print(f"    ΛCDM model:   R = {R_lcdm*1000:.2f} kpc, Ω_m = {Omega_m_fit:.3f}")
 
@@ -1454,7 +880,7 @@ def analyze_and_plot_catalog(
     theta_lcdm_model = theta_lcdm_flat(z_model, R_lcdm, Omega_m_fit) * RAD_TO_ARCSEC
 
     # Generate plots
-    print(f"\n  Creating plots...")
+    print("\n  Creating plots...")
 
     # Axis limits
     z_data_min, z_data_max = sed_catalog_analysis["redshift"].min(), sed_catalog_analysis["redshift"].max()
@@ -1568,6 +994,21 @@ def analyze_and_plot_catalog(
         theta_static_i = theta_static(z_model_i, R_static_i) * RAD_TO_ARCSEC
         theta_lcdm_i = theta_lcdm_flat(z_model_i, R_lcdm_i, Omega_m_i) * RAD_TO_ARCSEC
 
+        # Compute chi2/ndf for both models
+        def static_func_i(z, R=R_static_i):
+            return theta_static(z, R) * RAD_TO_ARCSEC
+        def lcdm_func_i(z, R=R_lcdm_i, Om=Omega_m_i):
+            return theta_lcdm_flat(z, R, Om) * RAD_TO_ARCSEC
+
+        stats_static_i = compute_chi2_stats(
+            binned_data.z_mid.values, binned_data.theta_med.values,
+            binned_data.theta_err.values, static_func_i, n_params=1
+        )
+        stats_lcdm_i = compute_chi2_stats(
+            binned_data.z_mid.values, binned_data.theta_med.values,
+            binned_data.theta_err.values, lcdm_func_i, n_params=2
+        )
+
         # Plot individual galaxies as background
         ax_main.scatter(
             sed_catalog_analysis["redshift"],
@@ -1590,7 +1031,7 @@ def analyze_and_plot_catalog(
             markeredgewidth=0.8,
             elinewidth=0.8,
             color=colors[name],
-            label=f"Binned (n={[int(x) for x in binned_data['n'].values]})",
+            label="Binned",
             zorder=3,
         )
 
@@ -1604,7 +1045,14 @@ def analyze_and_plot_catalog(
 
         ax_main.set_ylabel(r"Angular size $\theta$ (arcsec)", fontsize=11)
         ax_main.set_title(
-            f"{name} Binning\n" + r"($\Omega_m$" + f"={Omega_m_i:.2f}, " + r"$R_{\Lambda \rm CDM}$" + f"={R_lcdm_i:.4f} Mpc)", fontsize=12
+            f"{name} ({len(binned_data)} bins)\n"
+            + r"$\Lambda$CDM: $R$" + f"={R_lcdm_i*1000:.1f} kpc, "
+            + r"$\chi^2/{\rm ndf}$" + f"={stats_lcdm_i['chi2_ndf']:.2f}, "
+            + f"P={stats_lcdm_i['p_value']:.3f}\n"
+            + r"Static: $R$" + f"={R_static_i*1000:.1f} kpc, "
+            + r"$\chi^2/{\rm ndf}$" + f"={stats_static_i['chi2_ndf']:.2f}, "
+            + f"P={stats_static_i['p_value']:.3f}",
+            fontsize=10
         )
         ax_main.legend(fontsize=8, loc="upper right")
         ax_main.grid(True, alpha=0.3)
@@ -1638,7 +1086,7 @@ def analyze_and_plot_catalog(
         max_resid = max(0.05, np.max(np.abs(residuals_lcdm) + binned_data["theta_err"].values) * 1.2)
         ax_resid.set_ylim(-max_resid, max_resid)
 
-    fig.suptitle(r"Comparison of Binning Strategies" + title_suffix, fontsize=14, fontweight="bold")
+    fig.suptitle(r"Binning Strategies: $\Lambda$CDM vs Static" + title_suffix, fontsize=14, fontweight="bold")
     plt.savefig(f"{output_dir}/binning_comparison.pdf", dpi=300, bbox_inches="tight")
     plt.close()
     print(f"    Saved: {output_dir}/binning_comparison.pdf")
@@ -1702,28 +1150,32 @@ def analyze_and_plot_catalog(
     plt.close()
     print(f"    Saved: {output_dir}/binning_overlay.pdf")
 
-    # Plot 5: Redshift histogram
+    # Plot 5: Redshift histogram with dynamic limits
     _fig, ax = plt.subplots(figsize=(10, 6))
-    ax.hist(sed_catalog_analysis["redshift"], bins=20, edgecolor="black", alpha=0.7)
+    z_hist_min, z_hist_max = sed_catalog_analysis["redshift"].min(), sed_catalog_analysis["redshift"].max()
+    z_hist_padding = (z_hist_max - z_hist_min) * 0.05
+    hist_bins = np.linspace(z_hist_min, z_hist_max, 21)
+    counts, _, _ = ax.hist(sed_catalog_analysis["redshift"], bins=hist_bins, edgecolor="black", alpha=0.7, color="steelblue")
     ax.set_xlabel(r"Redshift $z$", fontsize=12)
     ax.set_ylabel("Count", fontsize=12)
     ax.set_title(f"Redshift Distribution{title_suffix}", fontsize=14)
+    ax.set_xlim(z_hist_min - z_hist_padding, z_hist_max + z_hist_padding)
+    ax.set_ylim(0, np.max(counts) * 1.1)
     ax.grid(True, alpha=0.3)
     plt.tight_layout()
     plt.savefig(f"{output_dir}/redshift_histogram.pdf", dpi=300, bbox_inches="tight")
     plt.close()
     print(f"    Saved: {output_dir}/redshift_histogram.pdf")
 
-    # Plot 5b: Photo-z quality metrics (ODDS and chi-squared distributions)
-    plot_photoz_quality(sed_catalog_analysis, output_dir, title_suffix)
-
-    # Plot 6: Galaxy types
+    # Plot 6: Galaxy types with dynamic y-axis
     _fig, ax = plt.subplots(figsize=(10, 6))
-    type_counts.plot(kind="bar", ax=ax, edgecolor="black", alpha=0.7)
+    type_counts.plot(kind="bar", ax=ax, edgecolor="black", alpha=0.7, color="steelblue")
     ax.set_xlabel("Galaxy Type", fontsize=12)
     ax.set_ylabel("Count", fontsize=12)
     ax.set_title(f"Galaxy Type Distribution{title_suffix}", fontsize=14)
     ax.yaxis.set_major_locator(MaxNLocator(integer=True))
+    max_count = type_counts.max()
+    ax.set_ylim(0, max_count * 1.1)
     ax.grid(True, alpha=0.3, axis="y")
     plt.xticks(rotation=45, ha="right")
     plt.tight_layout()
@@ -1731,19 +1183,12 @@ def analyze_and_plot_catalog(
     plt.close()
     print(f"    Saved: {output_dir}/galaxy_types.pdf")
 
-    # Plot 6b: Color-color diagram
-    plot_color_color_diagram(
-        sed_catalog_analysis,
-        f"{output_dir}/color_color_diagram.pdf",
-        title_suffix=title_suffix,
-        show_templates=True,
-        spectra_path="./spectra",
-    )
-    print(f"    Saved: {output_dir}/color_color_diagram.pdf")
-
-    # Plot 7: Angular diameter distance
+    # Plot 7: Angular diameter distance with dynamic limits
     _fig, ax = plt.subplots(figsize=(10, 7))
-    z_plot = np.linspace(0.01, 3.0, 200)
+    # Use data redshift range for plotting
+    z_max_data = sed_catalog_analysis["redshift"].max()
+    z_plot_max = max(2.5, z_max_data * 1.2)
+    z_plot = np.linspace(0.01, z_plot_max, 200)
     # Ensure Omega_m_fit is a scalar float
     Omega_m_plot = float(Omega_m_fit) if not isinstance(Omega_m_fit, float) else Omega_m_fit
     D_A_model = D_A_LCDM_vectorized(z_plot, Omega_m_plot, 1.0 - Omega_m_plot)
@@ -1754,6 +1199,10 @@ def analyze_and_plot_catalog(
     ax.set_ylabel(r"Angular Diameter Distance $D_A$ (Mpc)", fontsize=12)
     ax.set_title(f"Angular Diameter Distance{title_suffix}", fontsize=14)
     ax.legend(fontsize=10)
+    # Dynamic axis limits
+    D_A_max = max(np.max(D_A_model), np.max(D_A_std))
+    ax.set_xlim(0, z_plot_max * 1.02)
+    ax.set_ylim(0, D_A_max * 1.1)
     ax.grid(True, alpha=0.3)
     plt.tight_layout()
     plt.savefig(f"{output_dir}/angular_diameter_distance.pdf", dpi=300, bbox_inches="tight")
@@ -1776,8 +1225,8 @@ def analyze_and_plot_catalog(
         is_galaxy = ~is_psf_like & ~is_in_mask
 
         n_galaxies = is_galaxy.sum()
-        n_detected_stars = is_detected_star.sum()
-        n_mask_stars = is_in_mask.sum()
+        is_detected_star.sum()
+        is_in_mask.sum()
 
         # Crop images if bounds provided
         plot_images = []
@@ -1808,30 +1257,15 @@ def analyze_and_plot_catalog(
                     plot_catalog.loc[is_galaxy, "ycentroid"],
                     s=10, facecolors="none", edgecolors="red", linewidth=0.5,
                 )
-            # Blue: detected stars
-            if n_detected_stars > 0:
-                ax.scatter(
-                    plot_catalog.loc[is_detected_star, "xcentroid"],
-                    plot_catalog.loc[is_detected_star, "ycentroid"],
-                    s=10, facecolors="none", edgecolors="blue", linewidth=0.5,
-                )
-            # Yellow: mask stars
-            if n_mask_stars > 0:
-                ax.scatter(
-                    plot_catalog.loc[is_in_mask, "xcentroid"],
-                    plot_catalog.loc[is_in_mask, "ycentroid"],
-                    s=80, facecolors="none", edgecolors="yellow", linewidth=2.0,
-                )
 
             ax.set_title(
-                f"Band {image.band.upper()} -- {n_galaxies} galaxies (red), "
-                f"{n_detected_stars} detected stars (blue), {n_mask_stars} mask stars (yellow)",
+                f"Band {image.band.upper()} -- {n_galaxies} galaxies",
                 fontsize=9,
             )
             ax.set_xlabel(r"X (pixels)")
             ax.set_ylabel(r"Y (pixels)")
 
-        plt.suptitle(f"Source Detection{title_suffix} (red=galaxies, blue=detected stars, yellow=mask stars)", fontsize=14, fontweight="bold", y=1.01)
+        plt.suptitle(f"Source Detection{title_suffix} ({n_galaxies} galaxies)", fontsize=14, fontweight="bold", y=1.01)
         plt.tight_layout()
         plt.savefig(f"{output_dir}/source_detection.pdf", dpi=150, bbox_inches="tight")
         plt.close()
@@ -1850,46 +1284,15 @@ def analyze_and_plot_catalog(
                     plot_catalog.loc[is_galaxy, "ycentroid"],
                     s=10, facecolors="none", edgecolors="red", linewidth=0.5,
                 )
-            if n_detected_stars > 0:
-                ax.scatter(
-                    plot_catalog.loc[is_detected_star, "xcentroid"],
-                    plot_catalog.loc[is_detected_star, "ycentroid"],
-                    s=10, facecolors="none", edgecolors="blue", linewidth=0.5,
-                )
-            if n_mask_stars > 0:
-                ax.scatter(
-                    plot_catalog.loc[is_in_mask, "xcentroid"],
-                    plot_catalog.loc[is_in_mask, "ycentroid"],
-                    s=80, facecolors="none", edgecolors="yellow", linewidth=2.0,
-                )
-
-            # Draw markers at ALL mask region centers (regardless of detection)
-            if star_mask_centers:
-                # Adjust for crop bounds if needed
-                adjusted_centers = []
-                for cx, cy in star_mask_centers:
-                    if crop_bounds is not None:
-                        x_min, x_max, y_min, y_max = crop_bounds
-                        # Only include centers within crop bounds
-                        if x_min <= cx <= x_max and y_min <= cy <= y_max:
-                            adjusted_centers.append((cx - x_min, cy - y_min))
-                    else:
-                        adjusted_centers.append((cx, cy))
-                if adjusted_centers:
-                    mask_x = [c[0] for c in adjusted_centers]
-                    mask_y = [c[1] for c in adjusted_centers]
-                    ax.scatter(mask_x, mask_y, s=200, marker='s', facecolors="none",
-                              edgecolors="lime", linewidth=2.5, label="Mask regions")
 
             ax.set_title(
-                f"Band {image.band.upper()} -- {n_galaxies} galaxies (red), "
-                f"{n_detected_stars} detected stars (blue), {len(star_mask_centers)} mask regions (green sq)",
+                f"Band {image.band.upper()} -- {n_galaxies} galaxies",
                 fontsize=9,
             )
             ax.set_xlabel(r"X (pixels)")
             ax.set_ylabel(r"Y (pixels)")
 
-        plt.suptitle(f"Final Selection{title_suffix} (red=galaxies, blue=stars, green sq=mask regions)", fontsize=14, fontweight="bold", y=1.01)
+        plt.suptitle(f"Final Selection{title_suffix} ({n_galaxies} galaxies)", fontsize=14, fontweight="bold", y=1.01)
         plt.tight_layout()
         plt.savefig(f"{output_dir}/final_selection.pdf", dpi=150, bbox_inches="tight")
         plt.close()
@@ -1904,20 +1307,25 @@ def analyze_and_plot_catalog(
     print(f"\n  Analysis complete for{title_suffix.lower() if title_suffix else ' catalog'}!")
 
 
-def main(mode: str = "full"):
+def main(mode: str = "full", output_subdir: str | None = None):
     """
     Run the analysis pipeline.
 
     Args:
         mode: "full" for entire 4096x4096 image, "chip3" for 2048x2048 chip3 only
+        output_subdir: Optional subdirectory within output/{mode}_HDF/ (e.g., "full_z")
     """
-    # Set output directory based on mode
-    output_dir = f"./output/{mode}"
+    # Set output directory based on mode and optional subdirectory
+    # Mode naming: full -> full_HDF, chip3 -> chip3_HDF
+    mode_dir = f"{mode}_HDF"
+    output_dir = f"./output/{mode_dir}/{output_subdir}" if output_subdir else f"./output/{mode_dir}"
     os.makedirs(output_dir, exist_ok=True)
 
     print("=" * 60)
     print("ANGULAR SIZE TEST ANALYSIS")
     print(f"Mode: {mode}")
+    if output_subdir:
+        print(f"Output: {output_dir}")
     print("=" * 60)
 
     # Step 1: Load FITS files
@@ -1959,6 +1367,20 @@ def main(mode: str = "full"):
             print(f"  Loaded {band} band - shape: {data.shape} (no weight map)")
 
         images.append(AstroImage(data=data, header=header, band=band, weight=weight))
+
+    # Extract WCS from first image for coordinate transformations
+    reference_header = images[0].header
+    reference_wcs = None
+    try:
+        from astropy.wcs import WCS as AstropyWCS
+        reference_wcs = AstropyWCS(reference_header)
+        if reference_wcs.has_celestial:
+            print(f"  Extracted WCS from {next(iter(files.keys()))} band")
+        else:
+            reference_wcs = None
+            print("  WCS found but no celestial coordinates")
+    except Exception as e:
+        print(f"  Could not extract WCS: {e}")
 
     # Load or create mask based on image size
     image_shape = images[0].data.shape
@@ -2011,12 +1433,12 @@ def main(mode: str = "full"):
                 print(f"  No matching mask for {image_shape} - using no mask")
         except FileNotFoundError:
             mask = np.zeros(image_shape, dtype=bool)
-            print(f"  No mask file found - using no mask")
+            print("  No mask file found - using no mask")
     else:
         # For 2048x2048 data, don't mask during detection - we'll flag stars instead
         # This allows sources in star regions to be detected and flagged
         mask = np.zeros(image_shape, dtype=bool)
-        print(f"  Detection mask: none (star flagging enabled via star_mask)")
+        print("  Detection mask: none (star flagging enabled via star_mask)")
 
     # Step 2: Source detection using adaptive PSF-based parameters
     print("\n[2/6] Detecting sources (adaptive PSF-based method)...")
@@ -2026,14 +1448,14 @@ def main(mode: str = "full"):
     PSF_FWHM_ARCSEC = 0.09  # Typical HST ACS PSF FWHM
     PSF_FWHM_PIX = PSF_FWHM_ARCSEC / PIXEL_SCALE  # ~2.25 pixels at 0.04"/pix
 
-    # Adaptive kernel FWHM: Use larger kernel to enhance extended sources (galaxies)
-    # Using 2x PSF FWHM for stricter galaxy detection (filters point sources)
-    KERNEL_FWHM_PIX = max(4.0, PSF_FWHM_PIX * 2.0)
+    # Adaptive kernel FWHM: Use kernel matched to PSF for optimal detection
+    # Using 1.5x PSF FWHM to balance point source rejection with faint galaxy detection
+    KERNEL_FWHM_PIX = max(3.0, PSF_FWHM_PIX * 1.5)
 
-    # Adaptive npixels based on PSF area: π × (FWHM/2)²
-    # STRICT: Use 5x PSF area to require substantial extended emission
+    # Adaptive npixels based on PSF area: pi * (FWHM/2)^2
+    # Use 3x PSF area - sensitive enough to detect faint galaxies
     PSF_AREA = np.pi * (PSF_FWHM_PIX / 2) ** 2
-    BASE_NPIXELS = int(np.ceil(PSF_AREA * 5.0))  # ~20 pixels - stricter filtering
+    BASE_NPIXELS = int(np.ceil(PSF_AREA * 3.0))  # ~12 pixels - more sensitive
 
     # Scale npixels with image resolution (larger images have more pixels per source)
     def get_adaptive_npixels(image_shape, base_npixels):
@@ -2043,8 +1465,8 @@ def main(mode: str = "full"):
         return int(base_npixels * scale)
 
     # Detection threshold: sigma above background RMS
-    # STRICT: Higher threshold requires stronger signal
-    DETECTION_SIGMA = 2.5  # Higher threshold filters faint/uncertain sources
+    # Lower threshold for sensitive detection of faint galaxies
+    DETECTION_SIGMA = 1.5  # Lower threshold to detect faint sources
 
     # Deblending parameters for separating overlapping galaxies
     NLEVELS = 32  # Multi-thresholding levels
@@ -2052,8 +1474,8 @@ def main(mode: str = "full"):
 
     print(f"  PSF FWHM: {PSF_FWHM_ARCSEC:.3f} arcsec ({PSF_FWHM_PIX:.2f} pixels)")
     print(f"  Kernel FWHM: {KERNEL_FWHM_PIX:.2f} pixels")
-    print(f"  Base npixels: {BASE_NPIXELS} (PSF area × 5.0 - strict)")
-    print(f"  Detection threshold: {DETECTION_SIGMA}σ above background")
+    print(f"  Base npixels: {BASE_NPIXELS} (PSF area x 3.0 - sensitive)")
+    print(f"  Detection threshold: {DETECTION_SIGMA}-sigma above background")
     print(f"  Deblending: nlevels={NLEVELS}, contrast={CONTRAST}")
 
     # Create 2D Gaussian kernel for source detection
@@ -2119,6 +1541,7 @@ def main(mode: str = "full"):
 
     # Import gc early for memory management
     import gc
+
     from scipy.ndimage import sum as ndsum
 
     band_catalogs = {}
@@ -2181,7 +1604,7 @@ def main(mode: str = "full"):
         # Get ellipticity from catalog (for stellarity computation)
         try:
             cat["ellipticity"] = np.array(image.catalog.ellipticity, dtype=np.float32)
-        except Exception:
+        except (AttributeError, KeyError, TypeError):
             cat["ellipticity"] = np.float32(np.nan)
 
         # Store only the columns we need (float32 to save memory)
@@ -2236,38 +1659,83 @@ def main(mode: str = "full"):
     # Image dimensions for edge detection
     image_shape = images[0].data.shape
 
+    # Minimum number of bands required for a valid detection
+    # For reliable photo-z, we need all 4 bands (U, B, V, I)
+    # 3-band detections have much higher photo-z failure rates
+    MIN_BANDS_REQUIRED = 4  # Require all 4 bands for reliable photo-z
+
+    # ==========================================================================
+    # OPTIMIZATION: Vectorized batch KD-tree queries (2-3x faster than loop)
+    # Query all reference sources against all bands at once
+    # ==========================================================================
+    batch_distances = {}
+    batch_indices = {}
+    for band in other_bands:
+        # Batch query: get nearest neighbor for ALL ref sources at once
+        distances, indices = kdtrees[band].query(ref_coords, k=1)
+        batch_distances[band] = distances
+        batch_indices[band] = indices
+
+    # Pre-extract reference band arrays for fast indexing
+    ref_source_sky = ref_cat["source_sky"].values
+    ref_source_error = ref_cat["source_error"].values
+    ref_r_half = ref_cat["r_half_pix"].values
+    ref_r_half_error = ref_cat["r_half_pix_error"].values
+    ref_concentration = ref_cat["concentration"].values
+    ref_snr = ref_cat["snr"].values
+    ref_ellipticity = ref_cat["ellipticity"].values
+
+    # Pre-extract other band arrays
+    band_arrays = {}
+    for band in other_bands:
+        cat = band_catalogs[band]
+        band_arrays[band] = {
+            "source_sky": cat["source_sky"].values,
+            "source_error": cat["source_error"].values,
+            "r_half_pix": cat["r_half_pix"].values,
+            "r_half_pix_error": cat["r_half_pix_error"].values,
+            "concentration": cat["concentration"].values,
+            "snr": cat["snr"].values,
+            "ellipticity": cat["ellipticity"].values,
+        }
+
     for idx in range(len(ref_cat)):
         ref_x, ref_y = ref_coords[idx]
-        ref_row = ref_cat.iloc[idx]
         matches = {"xcentroid": ref_x, "ycentroid": ref_y}
-        r_half_values = [ref_row["r_half_pix"]]
-        r_half_pix_errors = [ref_row["r_half_pix_error"]]
-        concentration_values = [ref_row["concentration"]]
-        snr_values = [ref_row["snr"]]
-        ellipticity_values = [ref_row["ellipticity"]]
+        r_half_values = [ref_r_half[idx]]
+        r_half_pix_errors = [ref_r_half_error[idx]]
+        concentration_values = [ref_concentration[idx]]
+        snr_values = [ref_snr[idx]]
+        ellipticity_values = [ref_ellipticity[idx]]
 
-        matches[f"source_sky_{reference_band}"] = ref_row["source_sky"]
-        matches[f"source_error_{reference_band}"] = ref_row["source_error"]
+        matches[f"source_sky_{reference_band}"] = ref_source_sky[idx]
+        matches[f"source_error_{reference_band}"] = ref_source_error[idx]
 
-        found_in_all_bands = True
+        bands_matched = [reference_band]  # Reference band is always matched
         for band in other_bands:
-            # Query KD-tree for nearest neighbor
-            dist, nearest_idx = kdtrees[band].query([ref_x, ref_y], k=1)
+            # Use pre-computed batch query results (already computed above)
+            dist = batch_distances[band][idx]
+            nearest_idx = batch_indices[band][idx]
 
             if dist < match_radius:
-                cat = band_catalogs[band]
-                matches[f"source_sky_{band}"] = cat.iloc[nearest_idx]["source_sky"]
-                matches[f"source_error_{band}"] = cat.iloc[nearest_idx]["source_error"]
-                r_half_values.append(cat.iloc[nearest_idx]["r_half_pix"])
-                r_half_pix_errors.append(cat.iloc[nearest_idx]["r_half_pix_error"])
-                concentration_values.append(cat.iloc[nearest_idx]["concentration"])
-                snr_values.append(cat.iloc[nearest_idx]["snr"])
-                ellipticity_values.append(cat.iloc[nearest_idx]["ellipticity"])
+                arr = band_arrays[band]
+                matches[f"source_sky_{band}"] = arr["source_sky"][nearest_idx]
+                matches[f"source_error_{band}"] = arr["source_error"][nearest_idx]
+                r_half_values.append(arr["r_half_pix"][nearest_idx])
+                r_half_pix_errors.append(arr["r_half_pix_error"][nearest_idx])
+                concentration_values.append(arr["concentration"][nearest_idx])
+                snr_values.append(arr["snr"][nearest_idx])
+                ellipticity_values.append(arr["ellipticity"][nearest_idx])
+                bands_matched.append(band)
             else:
-                found_in_all_bands = False
-                break
+                # No match in this band - use NaN for flux
+                matches[f"source_sky_{band}"] = np.nan
+                matches[f"source_error_{band}"] = np.nan
 
-        if found_in_all_bands:
+        # Accept sources detected in at least MIN_BANDS_REQUIRED bands
+        if len(bands_matched) >= MIN_BANDS_REQUIRED:
+            matches["n_bands"] = len(bands_matched)
+            matches["bands_matched"] = ",".join(bands_matched)
             r_half_arr = np.array(r_half_values)
             r_half_err_arr = np.array(r_half_pix_errors)
             matches["r_half_pix"] = np.median(r_half_arr)
@@ -2313,9 +1781,44 @@ def main(mode: str = "full"):
                 flag |= FLAG_EDGE
 
             # Check for PSF-like source using multi-criteria (professional approach)
-            # Flag if stellarity > 0.6 (likely star) OR concentration > 0.45 (high concentration)
-            # References: SExtractor CLASS_STAR, SDSS star/galaxy separation
-            if matches["stellarity"] > 0.6 or matches["concentration"] > 0.45:
+            # Based on: SExtractor CLASS_STAR, SDSS DR14, HST Source Catalog (HSC)
+            #
+            # Key insight from research:
+            # - SExtractor uses CLASS_STAR > 0.95 for confident stars
+            # - HST ACS PSF FWHM is 0.10-0.13 arcsec, so stars have r_half < ~0.06 arcsec
+            # - Elliptical galaxies have high concentration BUT are extended (r_half >> PSF)
+            # - Stars are point sources: compact, round, high concentration
+            #
+            # References:
+            # - https://sextractor.readthedocs.io/en/latest/ClassStar.html
+            # - https://www.sdss4.org/dr14/algorithms/classify/
+            # - https://archive.stsci.edu/hst/hsc/help/HSC_faq.html
+
+            is_star = False
+
+            # PSF half-light radius (Gaussian approximation: r_half ≈ 0.42 * FWHM)
+            psf_r_half_pix = PSF_FWHM_PIX * 0.42  # ~0.95 pixels for HST ACS
+
+            # Size ratio: how many times larger than PSF
+            size_ratio = matches["r_half_pix"] / psf_r_half_pix if psf_r_half_pix > 0 else 999
+
+            # Criterion 1: Very high stellarity (confident star classification)
+            # SExtractor recommends > 0.95, we use 0.8 as compromise
+            if matches["stellarity"] > 0.8:
+                is_star = True
+
+            # Criterion 2: Compact + round + concentrated (all three required)
+            # This catches stars that have moderate stellarity but clear point-source morphology
+            elif size_ratio < 1.8:  # Very compact (within 1.8x PSF size)
+                is_round = matches["ellipticity"] < 0.2  # Stars are very round
+                is_concentrated = matches["concentration"] > 0.45  # High light concentration
+                if is_round and is_concentrated:
+                    is_star = True
+
+            # Criterion 3: Stellar colors + compact morphology
+            # (handled separately in color_stellarity check later)
+
+            if is_star:
                 flag |= FLAG_PSF_LIKE
 
             # Check if source is inside star mask OR near a mask region center
@@ -2326,11 +1829,10 @@ def main(mode: str = "full"):
 
             if star_mask is not None:
                 # Method 1: Check if pixel is directly in mask
-                px, py = int(round(ref_x)), int(round(ref_y))
-                if 0 <= py < star_mask.shape[0] and 0 <= px < star_mask.shape[1]:
-                    if star_mask[py, px]:
-                        flag |= FLAG_PSF_LIKE
-                        matches["in_star_mask"] = True
+                px, py = round(ref_x), round(ref_y)
+                if 0 <= py < star_mask.shape[0] and 0 <= px < star_mask.shape[1] and star_mask[py, px]:
+                    flag |= FLAG_PSF_LIKE
+                    matches["in_star_mask"] = True
 
             # Method 2: Check proximity to mask region centers (catches offset sources)
             if star_mask_centers and not matches["in_star_mask"]:
@@ -2345,7 +1847,10 @@ def main(mode: str = "full"):
             matched_sources.append(matches)
 
     cross_matched_catalog = pd.DataFrame(matched_sources)
-    print(f"  Cross-matched: {len(cross_matched_catalog)} sources in all 4 bands")
+    n_4band = (cross_matched_catalog["n_bands"] == 4).sum()
+    n_3band = (cross_matched_catalog["n_bands"] == 3).sum()
+    print(f"  Cross-matched: {len(cross_matched_catalog)} sources (≥{MIN_BANDS_REQUIRED} bands)")
+    print(f"    4-band detections: {n_4band}, 3-band detections: {n_3band}")
 
     # Report flag statistics
     n_clean = (cross_matched_catalog["quality_flag"] == FLAG_NONE).sum()
@@ -2359,7 +1864,7 @@ def main(mode: str = "full"):
 
     # Add FLAG_MASKED to sources inside the star mask (known stars from class)
     if "in_star_mask" in cross_matched_catalog.columns:
-        star_mask_sources = cross_matched_catalog["in_star_mask"] == True
+        star_mask_sources = cross_matched_catalog["in_star_mask"]
         cross_matched_catalog.loc[star_mask_sources, "quality_flag"] = (
             cross_matched_catalog.loc[star_mask_sources, "quality_flag"].astype(int) | FLAG_MASKED
         )
@@ -2386,90 +1891,116 @@ def main(mode: str = "full"):
         sed_catalog[f"flux_{band}"] = cross_matched_catalog[f"source_sky_{band}"] * conversion_factors[band]
         sed_catalog[f"error_{band}"] = cross_matched_catalog[f"source_error_{band}"] * conversion_factors[band]
 
+    # Add sky coordinates (RA, Dec) for Gaia cross-matching
+    if reference_wcs is not None:
+        try:
+            pixel_coords = np.column_stack([
+                sed_catalog["xcentroid"].values,
+                sed_catalog["ycentroid"].values
+            ])
+            sky_coords = reference_wcs.pixel_to_world(pixel_coords[:, 0], pixel_coords[:, 1])
+            sed_catalog["ra"] = sky_coords.ra.deg
+            sed_catalog["dec"] = sky_coords.dec.deg
+            print(f"  Added sky coordinates (RA, Dec) for {len(sed_catalog)} sources")
+        except Exception as e:
+            print(f"  Could not compute sky coordinates: {e}")
+            sed_catalog["ra"] = np.nan
+            sed_catalog["dec"] = np.nan
+    else:
+        # Use approximate coordinates based on HDF-N center
+        HDF_CENTER_RA = 189.228621
+        HDF_CENTER_DEC = 62.212572
+        # Approximate: 0.04 arcsec/pixel, centered on HDF
+        center_x, center_y = image_shape[1] / 2, image_shape[0] / 2
+        sed_catalog["ra"] = HDF_CENTER_RA + (sed_catalog["xcentroid"] - center_x) * PIXEL_SCALE / 3600.0
+        sed_catalog["dec"] = HDF_CENTER_DEC + (sed_catalog["ycentroid"] - center_y) * PIXEL_SCALE / 3600.0
+        print("  Added approximate sky coordinates (no WCS available)")
+
     # Force garbage collection before heavy computation
     gc.collect()
 
-    # Classify galaxies in parallel using batched processing with PDF uncertainties
-    # Use fewer workers to reduce memory pressure (each worker needs ~50-100MB)
-    n_workers = min(os.cpu_count() or 6, 6)  # Limit to 6 workers
-    print(f"  Classifying galaxies in parallel ({n_workers} workers, with PDF uncertainties)...")
+    # ULTRA FAST: Classify ALL galaxies at once with coarse-to-fine + float32 + parallel numba
+    # This eliminates ProcessPoolExecutor overhead and processes everything in parallel
+    # Speed: ~600,000 galaxies/second!
+    n_galaxies = len(sed_catalog)
+    print(f"  Classifying {n_galaxies} galaxies with ULTRA FAST classifier (~600k/sec)...")
 
-    # Prepare data for batch processing (vectorized approach - avoids slow iterrows)
-    # Extract flux and error arrays directly from DataFrame
-    flux_arrays = {band: sed_catalog[f"flux_{band}"].to_numpy() for band in ["b", "i", "u", "v"]}
-    error_arrays = {band: sed_catalog[f"error_{band}"].to_numpy() for band in ["b", "i", "u", "v"]}
-    indices = sed_catalog.index.to_numpy()
+    # Build flux and error arrays in [U, B, V, I] order for vectorized classifier
+    flux_array = np.column_stack([
+        sed_catalog["flux_u"].to_numpy(),
+        sed_catalog["flux_b"].to_numpy(),
+        sed_catalog["flux_v"].to_numpy(),
+        sed_catalog["flux_i"].to_numpy(),
+    ])
+    error_array = np.column_stack([
+        sed_catalog["error_u"].to_numpy(),
+        sed_catalog["error_b"].to_numpy(),
+        sed_catalog["error_v"].to_numpy(),
+        sed_catalog["error_i"].to_numpy(),
+    ])
 
-    # Build galaxy_data list using numpy indexing (faster than iterrows)
-    galaxy_data = [
-        (
-            indices[i],
-            [flux_arrays["b"][i], flux_arrays["i"][i], flux_arrays["u"][i], flux_arrays["v"][i]],
-            [error_arrays["b"][i], error_arrays["i"][i], error_arrays["u"][i], error_arrays["v"][i]],
-        )
-        for i in range(len(indices))
-    ]
+    # ULTRA FAST: Coarse-to-fine + float32 + parallel numba
+    import time
+    t0 = time.perf_counter()
+    results = classify_batch_ultrafast(flux_array, error_array, spectra_path="./spectra")
+    t1 = time.perf_counter()
+    print(f"    Classified {n_galaxies} galaxies in {t1-t0:.4f}s ({n_galaxies/(t1-t0):.0f} galaxies/sec)")
 
-    # Split into smaller batches to reduce peak memory usage
-    # Each galaxy uses ~30KB for chi-sq grid, so 100 galaxies = 3MB per batch
-    n_galaxies = len(galaxy_data)
-    MAX_BATCH_SIZE = 100  # Limit batch size for memory efficiency
-    batch_size = min(MAX_BATCH_SIZE, max(1, n_galaxies // n_workers))
-    batches = []
-    for i in range(0, n_galaxies, batch_size):
-        batch = galaxy_data[i:i + batch_size]
-        batches.append((batch, "./spectra"))
+    # Directly assign results (already aligned arrays)
+    sed_catalog["redshift"] = results['redshift']
+    sed_catalog["redshift_lo"] = results['z_lo']  # 16th percentile
+    sed_catalog["redshift_hi"] = results['z_hi']  # 84th percentile
+    sed_catalog["redshift_err"] = (results['z_hi'] - results['z_lo']) / 2.0  # Symmetric error estimate
+    sed_catalog["chi_sq_min"] = results['chi_sq_min']
+    sed_catalog["photo_z_odds"] = results['odds']  # Photo-z quality (BPZ ODDS parameter)
+    sed_catalog["galaxy_type"] = results['galaxy_type']
 
-    # Run batched classification in parallel
-    # New format: (idx, galaxy_type, redshift, z_lo, z_hi, chi_sq_min, odds)
-    results = {}
-    with ProcessPoolExecutor(max_workers=n_workers) as executor:
-        futures = {executor.submit(_classify_galaxy_batch, batch): i for i, batch in enumerate(batches)}
-        completed_batches = 0
-        for future in as_completed(futures):
-            batch_results = future.result()
-            for idx, galaxy_type, redshift, z_lo, z_hi, chi_sq_min, odds in batch_results:
-                results[idx] = (galaxy_type, redshift, z_lo, z_hi, chi_sq_min, odds)
-            completed_batches += 1
-            print(f"    Completed batch {completed_batches}/{len(batches)} ({len(results)}/{n_galaxies} galaxies)")
+    # Add quality control flags from classification
+    sed_catalog["chi2_flag"] = results['chi2_flag']
+    sed_catalog["odds_flag"] = results['odds_flag']
+    sed_catalog["bimodal_flag"] = results['bimodal_flag']
+    sed_catalog["template_ambiguity"] = results['template_ambiguity']
+    sed_catalog["reduced_chi2"] = results['reduced_chi2']
+    sed_catalog["second_best_template"] = results['second_best_template']
+    sed_catalog["delta_chi2_templates"] = results['delta_chi2_templates']
 
-    # Update catalog with results using vectorized operations (much faster than iterrows)
-    # Convert results dict to arrays aligned with sed_catalog index
-    n_rows = len(sed_catalog)
-    galaxy_types = [None] * n_rows
-    redshifts = np.empty(n_rows)
-    z_los = np.empty(n_rows)
-    z_his = np.empty(n_rows)
-    chi_sq_mins = np.empty(n_rows)
-    odds_arr = np.empty(n_rows)
+    # Add boundary flag (sources at z_min or z_max - fitting likely failed)
+    if 'z_boundary_flag' in results:
+        sed_catalog["z_boundary_flag"] = results['z_boundary_flag']
+    else:
+        # Fallback: compute from redshift values
+        sed_catalog["z_boundary_flag"] = (results['redshift'] <= 0.01) | (results['redshift'] >= 5.99)
 
-    for i, idx in enumerate(sed_catalog.index):
-        galaxy_type, redshift, z_lo, z_hi, chi_sq_min, odds = results[idx]
-        galaxy_types[i] = galaxy_type
-        redshifts[i] = redshift
-        z_los[i] = z_lo
-        z_his[i] = z_hi
-        chi_sq_mins[i] = chi_sq_min
-        odds_arr[i] = odds
-
-    # Assign all columns at once (vectorized)
-    sed_catalog["redshift"] = redshifts
-    sed_catalog["redshift_lo"] = z_los  # 16th percentile
-    sed_catalog["redshift_hi"] = z_his  # 84th percentile
-    sed_catalog["redshift_err"] = (z_his - z_los) / 2.0  # Symmetric error estimate
-    sed_catalog["chi_sq_min"] = chi_sq_mins
-    sed_catalog["photo_z_odds"] = odds_arr  # Photo-z quality (BPZ ODDS parameter)
-    sed_catalog["galaxy_type"] = galaxy_types
+    # Track number of valid bands used in photo-z fitting
+    if 'n_valid_bands' in results:
+        sed_catalog["n_valid_bands"] = results['n_valid_bands']
+    else:
+        # Fallback: count non-NaN flux values
+        flux_cols = [f"flux_{b}" for b in ["u", "b", "v", "i"]]
+        sed_catalog["n_valid_bands"] = sed_catalog[flux_cols].notna().sum(axis=1)
 
     # Use PSF-corrected radius for angular size (vectorized)
     sed_catalog["r_half_arcsec"] = sed_catalog["r_half_pix_corrected"] * PIXEL_SCALE
     sed_catalog["r_half_arcsec_error"] = sed_catalog["r_half_pix_error"] * PIXEL_SCALE
 
-    # Update quality flag for bad photo-z (ODDS < 0.6) - vectorized
-    bad_photoz_mask = odds_arr < 0.6
+    # Update quality flag for bad photo-z (ODDS < 0.6 OR hit redshift boundary) - vectorized
+    bad_photoz_mask = (results['odds'] < 0.6) | sed_catalog["z_boundary_flag"]
     sed_catalog.loc[bad_photoz_mask, "quality_flag"] = (
         sed_catalog.loc[bad_photoz_mask, "quality_flag"].astype(int) | FLAG_BAD_PHOTOZ
     )
+
+    # Flag unreliable redshifts where error exceeds redshift value (σ_z > z)
+    # These measurements have uncertainty larger than the measurement itself
+    unreliable_z_mask = (
+        (sed_catalog["redshift_err"] > sed_catalog["redshift"]) &
+        (sed_catalog["redshift"] > 0)  # Only for positive redshifts
+    )
+    n_unreliable_z = unreliable_z_mask.sum()
+    if n_unreliable_z > 0:
+        sed_catalog.loc[unreliable_z_mask, "quality_flag"] = (
+            sed_catalog.loc[unreliable_z_mask, "quality_flag"].astype(int) | FLAG_UNRELIABLE_Z
+        )
+        print(f"  Flagged {n_unreliable_z} sources with unreliable redshifts (σ_z > z)")
 
     # Add color-based stellar contamination check
     # Stars have flat SEDs (small color scatter), galaxies have strong colors
@@ -2493,6 +2024,161 @@ def main(mode: str = "full"):
         print(f"    Flagged {n_stellar_colors} additional sources with stellar colors + morphology")
 
     print(f"  Classified {len(sed_catalog)} galaxies")
+
+    # =========================================================================
+    # PROFESSIONAL STAR-GALAXY CLASSIFICATION (Research Standard)
+    # Uses multi-tier approach: Gaia → SPREAD_MODEL → ML → Color-color
+    # =========================================================================
+    if USE_PROFESSIONAL_CLASSIFICATION:
+        print("\n  Running professional star-galaxy classification...")
+        try:
+            from morphology.professional_classification import classify_professional
+            from morphology.star_galaxy import query_gaia_for_classification
+
+            # Query Gaia DR3 for foreground stars
+            HDF_CENTER_RA = 189.228621
+            HDF_CENTER_DEC = 62.212572
+            print("    Querying Gaia DR3 for foreground stars...")
+            gaia_catalog = query_gaia_for_classification(
+                ra_center=HDF_CENTER_RA,
+                dec_center=HDF_CENTER_DEC,
+                radius_arcmin=3.0,
+                magnitude_limit=21.0,
+            )
+            if len(gaia_catalog) > 0:
+                print(f"    Retrieved {len(gaia_catalog)} Gaia sources")
+            else:
+                print("    Warning: No Gaia sources retrieved (proceeding without Gaia)")
+                gaia_catalog = None
+
+            # Get reference image for morphological analysis (use I-band)
+            ref_image = None
+            for img in images:
+                if img.band == 'i':
+                    ref_image = img.data
+                    break
+            if ref_image is None:
+                ref_image = images[0].data
+
+            # Run professional classification
+            classification_results = classify_professional(
+                catalog=sed_catalog,
+                image=ref_image,
+                wcs=reference_wcs,
+                gaia_catalog=gaia_catalog,
+                x_col="xcentroid",
+                y_col="ycentroid",
+                ra_col="ra",
+                dec_col="dec",
+                pixel_scale=PIXEL_SCALE,
+                verbose=True,
+            )
+
+            # Merge professional classification results
+            pro_cols = ['is_galaxy', 'is_star', 'probability_galaxy', 'confidence',
+                       'classification_method', 'classification_tier', 'spread_model',
+                       'gaia_confirmed_star', 'concentration_c', 'half_light_radius']
+            for col in pro_cols:
+                if col in classification_results.columns:
+                    sed_catalog[f"pro_{col}"] = classification_results[col].values
+
+            # Update FLAG_PSF_LIKE based on professional classification
+            # Only flag sources that professional classification confirms as stars
+            if 'is_star' in classification_results.columns:
+                pro_stars = classification_results['is_star'].values
+                n_pro_stars = pro_stars.sum()
+
+                # Clear basic PSF_LIKE flags and use professional classification
+                # This replaces the basic heuristic with the professional result
+                sed_catalog.loc[pro_stars, "quality_flag"] = (
+                    sed_catalog.loc[pro_stars, "quality_flag"].astype(int) | FLAG_PSF_LIKE
+                )
+
+                # Sources confirmed as galaxies by professional classification
+                # can have their FLAG_PSF_LIKE cleared if it was set by basic method
+                pro_galaxies = classification_results['is_galaxy'].values
+                high_conf_galaxies = pro_galaxies & (classification_results['confidence'].values > 0.7)
+                sed_catalog.loc[high_conf_galaxies, "quality_flag"] = (
+                    sed_catalog.loc[high_conf_galaxies, "quality_flag"].astype(int) & ~FLAG_PSF_LIKE
+                )
+
+                print(f"    Professional classification: {n_pro_stars} stars, "
+                      f"{pro_galaxies.sum()} galaxies")
+
+                # Report classification by tier
+                if 'classification_tier' in classification_results.columns:
+                    tier_names = {1: "Gaia", 2: "SPREAD_MODEL", 3: "Morphology",
+                                 4: "ML", 5: "Color-color"}
+                    for tier, name in tier_names.items():
+                        n_tier = (classification_results['classification_tier'] == tier).sum()
+                        if n_tier > 0:
+                            print(f"      Tier {tier} ({name}): {n_tier} sources")
+
+                # Skip diagnostic plot (star_galaxy_classification.pdf) - not needed
+                # try:
+                #     from morphology.professional_classification import plot_classification_diagnostics
+                #     plot_classification_diagnostics(
+                #         classification_results,
+                #         output_path=f"{output_dir}/star_galaxy_classification.pdf"
+                #     )
+                #     print(f"    Saved: {output_dir}/star_galaxy_classification.pdf")
+                # except Exception as plot_error:
+                #     print(f"    Could not save diagnostic plot: {plot_error}")
+
+        except ImportError as e:
+            print(f"    Warning: Professional classification not available: {e}")
+            print("    Using basic classification only")
+        except Exception as e:
+            print(f"    Warning: Professional classification failed: {e}")
+            print("    Using basic classification only")
+
+    # Cross-match with 3D-HST catalog for additional star identification
+    # This catches stars our morphological methods miss
+    print("\n  Cross-matching with 3D-HST catalog (Skelton et al. 2014)...")
+    try:
+        from validation.external_crossmatch import crossmatch_with_3dhst
+
+        sed_catalog = crossmatch_with_3dhst(sed_catalog, match_radius_arcsec=1.0)
+
+        # Flag sources identified as stars by 3D-HST
+        if 'star_3dhst' in sed_catalog.columns:
+            n_3dhst_stars = sed_catalog['star_3dhst'].sum()
+            if n_3dhst_stars > 0:
+                # Update FLAG_PSF_LIKE for 3D-HST identified stars
+                sed_catalog.loc[sed_catalog['star_3dhst'], "quality_flag"] = (
+                    sed_catalog.loc[sed_catalog['star_3dhst'], "quality_flag"].astype(int) | FLAG_PSF_LIKE
+                )
+                print(f"    Flagged {n_3dhst_stars} additional stars from 3D-HST")
+
+                # Update pro_is_star column if it exists
+                if 'pro_is_star' in sed_catalog.columns:
+                    sed_catalog.loc[sed_catalog['star_3dhst'], 'pro_is_star'] = True
+
+        # Apply spectroscopic redshifts from 3D-HST where available
+        # This fixes catastrophic photo-z failures
+        from validation.external_crossmatch import apply_spectroscopic_redshifts
+        sed_catalog = apply_spectroscopic_redshifts(
+            sed_catalog,
+            z_col='redshift',
+            match_radius_arcsec=1.0,
+            flag_catastrophic=True,
+            catastrophic_threshold=0.15
+        )
+
+        # Report how many redshifts were updated
+        if 'has_specz' in sed_catalog.columns:
+            n_specz = sed_catalog['has_specz'].sum()
+            if n_specz > 0:
+                print(f"    Applied {n_specz} spectroscopic redshifts from 3D-HST")
+                if 'catastrophic_photoz' in sed_catalog.columns:
+                    n_catastrophic = sed_catalog['catastrophic_photoz'].sum()
+                    if n_catastrophic > 0:
+                        print(f"    Fixed {n_catastrophic} catastrophic photo-z failures")
+
+    except ImportError:
+        print("    Warning: 3D-HST cross-match not available (install astroquery)")
+    except Exception as e:
+        print(f"    Warning: 3D-HST cross-match failed: {e}")
 
     # Report photo-z quality statistics
     odds_good = (sed_catalog["photo_z_odds"] >= 0.9).sum()
@@ -2520,15 +2206,89 @@ def main(mode: str = "full"):
         if count > 0:
             print(f"      {name}: {count}")
 
-    # Option to filter by quality (comment/uncomment as needed)
-    # For strict analysis, use only clean sources:
-    # sed_catalog = sed_catalog[sed_catalog["quality_flag"] == FLAG_NONE]
-    # For moderate filtering, exclude bad photo-z, PSF-like, and masked (known stars):
-    EXCLUDE_FLAGS = FLAG_BAD_PHOTOZ | FLAG_PSF_LIKE | FLAG_MASKED
-    sed_catalog_filtered = sed_catalog[
-        (sed_catalog["quality_flag"].astype(int) & EXCLUDE_FLAGS) == 0
-    ]
-    print(f"\n  After quality filtering (excluding bad_photoz, psf_like, masked): {len(sed_catalog_filtered)}")
+    # ==========================================================================
+    # HIGH-QUALITY FILTERING FOR PRECISE RESULTS
+    # ==========================================================================
+    # For publication-quality plots, we apply strict quality cuts following
+    # best practices from COSMOS, DES, and other major surveys:
+    #
+    # 1. FLAG EXCLUSIONS:
+    #    - blended: Photometry may be contaminated by neighbor subtraction
+    #    - edge: Truncated aperture may bias flux/size measurements
+    #    - saturated: Flux is lower limit, morphology unreliable
+    #    - low_snr: SNR < 5, measurements dominated by noise
+    #    - crowded: High chance of photometric contamination
+    #    - bad_photoz: ODDS < 0.6 or hit redshift grid boundary
+    #    - psf_like: Likely star or quasar, not a resolved galaxy
+    #    - masked: Overlaps masked regions (diffraction spikes, etc.)
+    #    - unreliable_z: σ_z > z (error exceeds measurement)
+    #
+    # 2. PHOTO-Z QUALITY (ODDS >= 0.9):
+    #    The ODDS parameter measures the integrated probability within
+    #    ±0.1(1+z) of the peak. ODDS >= 0.9 indicates a well-constrained,
+    #    unimodal redshift solution.
+    #
+    # 3. SED FIT QUALITY (chi2_flag == 0, reduced chi2 < 5):
+    #    Good template fit ensures the photometry is consistent with
+    #    galaxy SED models. High chi2 may indicate calibration issues,
+    #    AGN contamination, or photometric errors.
+    #
+    # 4. NON-BIMODAL SOLUTIONS:
+    #    Excludes sources where multiple redshift solutions fit equally
+    #    well (e.g., z=0.5 vs z=3 degeneracy from Lyman/4000Å break).
+
+    HIGH_QUALITY_MODE = True  # Set to False for broader (but noisier) sample
+
+    if HIGH_QUALITY_MODE:
+        # Strict flag exclusions - exclude any source with potential issues
+        STRICT_EXCLUDE_FLAGS = (
+            FLAG_BLENDED | FLAG_EDGE | FLAG_SATURATED | FLAG_LOW_SNR |
+            FLAG_CROWDED | FLAG_BAD_PHOTOZ | FLAG_PSF_LIKE | FLAG_MASKED |
+            FLAG_UNRELIABLE_Z  # Exclude sources where σ_z > z
+        )
+
+        # Apply all quality cuts
+        quality_mask = (
+            # No problematic flags
+            ((sed_catalog["quality_flag"].astype(int) & STRICT_EXCLUDE_FLAGS) == 0) &
+            # Excellent photo-z confidence (ODDS >= 0.9)
+            (sed_catalog["odds_flag"] == 0) &
+            # Good chi-squared fit (reduced chi2 < 5)
+            (sed_catalog["chi2_flag"] == 0) &
+            # Not bimodal (single clear redshift solution)
+            (~sed_catalog["bimodal_flag"])
+        )
+
+        sed_catalog_filtered = sed_catalog[quality_mask]
+
+        # Report filtering breakdown
+        n_total = len(sed_catalog)
+        n_kept = len(sed_catalog_filtered)
+        n_rejected = n_total - n_kept
+
+        print(f"\n  HIGH-QUALITY MODE: Applied strict quality filtering")
+        print(f"    Input: {n_total} sources")
+        print(f"    Rejection breakdown:")
+
+        # Count sources rejected by each criterion
+        n_flag_rejected = ((sed_catalog["quality_flag"].astype(int) & STRICT_EXCLUDE_FLAGS) != 0).sum()
+        n_odds_rejected = (sed_catalog["odds_flag"] != 0).sum()
+        n_chi2_rejected = (sed_catalog["chi2_flag"] != 0).sum()
+        n_bimodal_rejected = sed_catalog["bimodal_flag"].sum()
+
+        print(f"      - Quality flags:     {n_flag_rejected} ({100*n_flag_rejected/n_total:.1f}%)")
+        print(f"      - ODDS < 0.9:        {n_odds_rejected} ({100*n_odds_rejected/n_total:.1f}%)")
+        print(f"      - Chi2 > 5:          {n_chi2_rejected} ({100*n_chi2_rejected/n_total:.1f}%)")
+        print(f"      - Bimodal redshift:  {n_bimodal_rejected} ({100*n_bimodal_rejected/n_total:.1f}%)")
+        print(f"    Result: {n_kept} high-confidence galaxies ({100*n_kept/n_total:.1f}% retained)")
+    else:
+        # Moderate filtering - excludes only clearly bad sources
+        EXCLUDE_FLAGS = FLAG_BAD_PHOTOZ | FLAG_PSF_LIKE | FLAG_MASKED
+        sed_catalog_filtered = sed_catalog[
+            (sed_catalog["quality_flag"].astype(int) & EXCLUDE_FLAGS) == 0
+        ]
+        print(f"\n  MODERATE MODE: Basic quality filtering")
+        print(f"    - After filtering (excluding bad_photoz, psf_like, masked): {len(sed_catalog_filtered)}")
 
     # Use filtered catalog for analysis
     sed_catalog_analysis = sed_catalog_filtered
@@ -2787,6 +2547,21 @@ def main(mode: str = "full"):
         theta_static_i = theta_static(z_model_i, R_static_i) * RAD_TO_ARCSEC
         theta_lcdm_i = theta_lcdm_flat(z_model_i, R_lcdm_i, Omega_m_i) * RAD_TO_ARCSEC
 
+        # Compute chi2/ndf for both models
+        def static_func_i(z, R=R_static_i):
+            return theta_static(z, R) * RAD_TO_ARCSEC
+        def lcdm_func_i(z, R=R_lcdm_i, Om=Omega_m_i):
+            return theta_lcdm_flat(z, R, Om) * RAD_TO_ARCSEC
+
+        stats_static_i = compute_chi2_stats(
+            binned_data.z_mid.values, binned_data.theta_med.values,
+            binned_data.theta_err.values, static_func_i, n_params=1
+        )
+        stats_lcdm_i = compute_chi2_stats(
+            binned_data.z_mid.values, binned_data.theta_med.values,
+            binned_data.theta_err.values, lcdm_func_i, n_params=2
+        )
+
         # Plot individual galaxies as background
         ax_main.scatter(
             sed_catalog_analysis["redshift"],
@@ -2809,7 +2584,7 @@ def main(mode: str = "full"):
             markeredgewidth=0.8,
             elinewidth=0.8,
             color=colors[name],
-            label=f"Binned (n={[int(x) for x in binned_data['n'].values]})",
+            label="Binned",
             zorder=3,
         )
 
@@ -2823,7 +2598,14 @@ def main(mode: str = "full"):
 
         ax_main.set_ylabel(r"Angular size $\theta$ (arcsec)", fontsize=11)
         ax_main.set_title(
-            f"{name} Binning\n" + r"($\Omega_m$" + f"={Omega_m_i:.2f}, " + r"$R_{\Lambda \rm CDM}$" + f"={R_lcdm_i:.4f} Mpc)", fontsize=12
+            f"{name} ({len(binned_data)} bins)\n"
+            + r"$\Lambda$CDM: $R$" + f"={R_lcdm_i*1000:.1f} kpc, "
+            + r"$\chi^2/{\rm ndf}$" + f"={stats_lcdm_i['chi2_ndf']:.2f}, "
+            + f"P={stats_lcdm_i['p_value']:.3f}\n"
+            + r"Static: $R$" + f"={R_static_i*1000:.1f} kpc, "
+            + r"$\chi^2/{\rm ndf}$" + f"={stats_static_i['chi2_ndf']:.2f}, "
+            + f"P={stats_static_i['p_value']:.3f}",
+            fontsize=10
         )
         ax_main.legend(fontsize=8, loc="upper right")
         ax_main.grid(True, alpha=0.3)
@@ -2857,7 +2639,7 @@ def main(mode: str = "full"):
         max_resid = max(0.05, np.max(np.abs(residuals_lcdm) + binned_data["theta_err"].values) * 1.2)
         ax_resid.set_ylim(-max_resid, max_resid)
 
-    fig.suptitle(r"Comparison of Binning Strategies", fontsize=14, fontweight="bold")
+    fig.suptitle(r"Binning Strategies: $\Lambda$CDM vs Static", fontsize=14, fontweight="bold")
     plt.savefig(f"{output_dir}/binning_comparison.pdf", dpi=300, bbox_inches="tight")
     plt.close()
     print(f"  Saved: {output_dir}/binning_comparison.pdf")
@@ -2921,32 +2703,32 @@ def main(mode: str = "full"):
     plt.close()
     print(f"  Saved: {output_dir}/binning_overlay.pdf")
 
-    # Plot 5: Redshift histogram
+    # Plot 5: Redshift histogram with dynamic y-axis
     _fig, ax = plt.subplots(figsize=(8, 5))
     hist_bins = np.linspace(z_data_min, z_data_max, 15)
-    ax.hist(sed_catalog_analysis["redshift"], bins=hist_bins, edgecolor="black", alpha=0.7, color="steelblue")
+    counts, _, _ = ax.hist(sed_catalog_analysis["redshift"], bins=hist_bins, edgecolor="black", alpha=0.7, color="steelblue")
     ax.set_xlabel(r"Redshift $z$", fontsize=12)
     ax.set_ylabel(r"Number of galaxies", fontsize=12)
     ax.set_title(f"Redshift Distribution (N={len(sed_catalog_analysis)}, quality-filtered)", fontsize=14)
     ax.grid(True, alpha=0.3)
     ax.set_xlim(z_lim)
+    ax.set_ylim(0, np.max(counts) * 1.1)
 
     plt.tight_layout()
     plt.savefig(f"{output_dir}/redshift_histogram.pdf", dpi=300, bbox_inches="tight")
     plt.close()
     print(f"  Saved: {output_dir}/redshift_histogram.pdf")
 
-    # Plot 5b: Photo-z quality metrics (ODDS and chi-squared distributions)
-    plot_photoz_quality(sed_catalog_analysis, output_dir)
-
-    # Plot 6: Galaxy type distribution
+    # Plot 6: Galaxy type distribution with dynamic y-axis
     __fig, ax = plt.subplots(figsize=(10, 5))
     type_counts = sed_catalog_analysis["galaxy_type"].value_counts()
-    type_counts.plot(kind="bar", ax=ax, edgecolor="black", alpha=0.7)
+    type_counts.plot(kind="bar", ax=ax, edgecolor="black", alpha=0.7, color="steelblue")
     ax.set_xlabel(r"Galaxy Type", fontsize=12)
     ax.set_ylabel(r"Count", fontsize=12)
     ax.set_title(r"Galaxy Type Distribution (quality-filtered)", fontsize=14)
     ax.yaxis.set_major_locator(MaxNLocator(integer=True))
+    max_count = type_counts.max()
+    ax.set_ylim(0, max_count * 1.1)
     ax.grid(True, alpha=0.3, axis="y")
     plt.xticks(rotation=45, ha="right")
 
@@ -2955,37 +2737,13 @@ def main(mode: str = "full"):
     plt.close()
     print(f"  Saved: {output_dir}/galaxy_types.pdf")
 
-    # Plot 6b: Color-color diagram
-    plot_color_color_diagram(
-        sed_catalog_analysis,
-        f"{output_dir}/color_color_diagram.pdf",
-        title_suffix="",
-        show_templates=True,
-        spectra_path="./spectra",
-    )
-    print(f"  Saved: {output_dir}/color_color_diagram.pdf")
-
-    # Plot 6c: Physical size distribution
-    # Use the fitted Omega_m from the LCDM model
-    physical_size_stats = plot_physical_size_distribution(
-        sed_catalog_analysis,
-        f"{output_dir}/physical_size_distribution.pdf",
-        Omega_m=Omega_m_fit,
-        Omega_L=1.0 - Omega_m_fit,
-        title_suffix="",
-        by_type=False,
-        by_redshift_bin=False,
-    )
-    print(f"  Physical size statistics:")
-    print(f"    Mean: {physical_size_stats.get('mean_kpc', 0):.2f} kpc")
-    print(f"    Median: {physical_size_stats.get('median_kpc', 0):.2f} kpc")
-    print(f"    Std: {physical_size_stats.get('std_kpc', 0):.2f} kpc")
-
-    # Plot 7: Angular diameter distance comparison
+    # Plot 7: Angular diameter distance comparison with dynamic limits
     __fig, ax = plt.subplots(figsize=(10, 7))
 
-    # Extend z_range slightly beyond data for context
-    z_range = np.linspace(0.01, z_data_max + 0.3, 200)
+    # Extend z_range with dynamic epsilon padding
+    z_plot_padding = (z_data_max - z_data_min) * 0.15
+    z_plot_max = z_data_max + z_plot_padding
+    z_range = np.linspace(0.01, z_plot_max, 200)
     D_A_static = (c / H0) * z_range  # Linear Hubble law
     D_A_lcdm = np.array([D_A_LCDM_vectorized(z) for z in z_range])
 
@@ -3000,7 +2758,10 @@ def main(mode: str = "full"):
     ax.set_title(r"Angular Diameter Distance vs Redshift" + "\n" + r"(Model Comparison)", fontsize=14)
     ax.legend(fontsize=10)
     ax.grid(True, alpha=0.3)
-    ax.set_xlim(0, z_data_max + 0.3)
+    # Dynamic axis limits
+    D_A_max = max(np.max(D_A_static), np.max(D_A_lcdm))
+    ax.set_xlim(0, z_plot_max * 1.02)
+    ax.set_ylim(0, D_A_max * 1.1)
 
     plt.tight_layout()
     plt.savefig(f"{output_dir}/angular_diameter_distance.pdf", dpi=300, bbox_inches="tight")
@@ -3017,8 +2778,8 @@ def main(mode: str = "full"):
     is_detected_star = ((cross_matched_catalog["quality_flag"] & FLAG_PSF_LIKE) != 0) & ~is_in_mask
     is_galaxy = ((cross_matched_catalog["quality_flag"] & FLAG_PSF_LIKE) == 0) & ~is_in_mask
 
-    n_mask_stars = is_in_mask.sum()
-    n_detected_stars = is_detected_star.sum()
+    is_in_mask.sum()
+    is_detected_star.sum()
     n_galaxies = is_galaxy.sum()
 
     _fig, axes = plt.subplots(2, 2, figsize=(12, 12))
@@ -3038,51 +2799,20 @@ def main(mode: str = "full"):
                 linewidth=0.5,
             )
 
-        # Blue: stars detected by stellarity/concentration (not in mask)
-        if n_detected_stars > 0:
-            ax.scatter(
-                cross_matched_catalog.loc[is_detected_star, "xcentroid"],
-                cross_matched_catalog.loc[is_detected_star, "ycentroid"],
-                s=10,
-                facecolors="none",
-                edgecolors="blue",
-                linewidth=0.5,
-            )
-
-        # Yellow: sources inside mask (stars by mask from course staff)
-        if n_mask_stars > 0:
-            ax.scatter(
-                cross_matched_catalog.loc[is_in_mask, "xcentroid"],
-                cross_matched_catalog.loc[is_in_mask, "ycentroid"],
-                s=80,
-                facecolors="none",
-                edgecolors="yellow",
-                linewidth=2.0,
-            )
-
-        # Green squares: ALL mask region centers (regardless of detection)
-        if star_mask_centers:
-            mask_x = [c[0] for c in star_mask_centers]
-            mask_y = [c[1] for c in star_mask_centers]
-            ax.scatter(mask_x, mask_y, s=200, marker='s', facecolors="none",
-                      edgecolors="lime", linewidth=2.5)
-
         ax.set_title(
-            f"Band {image.band.upper()} -- {n_galaxies} galaxies (red), "
-            f"{n_detected_stars} detected stars (blue), {len(star_mask_centers)} mask regions (green sq)",
+            f"Band {image.band.upper()} -- {n_galaxies} galaxies",
             fontsize=9,
         )
         ax.set_xlabel(r"X (pixels)")
         ax.set_ylabel(r"Y (pixels)")
 
-    plt.suptitle("Source Detection (red=galaxies, blue=stars, green sq=mask regions)", fontsize=14, fontweight="bold", y=1.01)
+    plt.suptitle(f"Source Detection ({n_galaxies} galaxies)", fontsize=14, fontweight="bold", y=1.01)
     plt.tight_layout()
     plt.savefig(f"{output_dir}/source_detection.pdf", dpi=150, bbox_inches="tight")
     plt.close()
     print(f"  Saved: {output_dir}/source_detection.pdf")
 
     # Plot 9: Final selection (cross-matched sources in all 4 bands)
-    # Uses same categories as Plot 8: yellow=mask stars, blue=detected stars, red=galaxies
 
     _fig, axes = plt.subplots(2, 2, figsize=(12, 12))
     for idx, image in enumerate(images):
@@ -3101,44 +2831,14 @@ def main(mode: str = "full"):
                 linewidth=0.5,
             )
 
-        # Blue: stars detected by stellarity/concentration (not in mask)
-        if n_detected_stars > 0:
-            ax.scatter(
-                cross_matched_catalog.loc[is_detected_star, "xcentroid"],
-                cross_matched_catalog.loc[is_detected_star, "ycentroid"],
-                s=10,
-                facecolors="none",
-                edgecolors="blue",
-                linewidth=0.5,
-            )
-
-        # Yellow: sources inside mask (stars by mask from course staff)
-        if n_mask_stars > 0:
-            ax.scatter(
-                cross_matched_catalog.loc[is_in_mask, "xcentroid"],
-                cross_matched_catalog.loc[is_in_mask, "ycentroid"],
-                s=80,
-                facecolors="none",
-                edgecolors="yellow",
-                linewidth=2.0,
-            )
-
-        # Green squares: ALL mask region centers (regardless of detection)
-        if star_mask_centers:
-            mask_x = [c[0] for c in star_mask_centers]
-            mask_y = [c[1] for c in star_mask_centers]
-            ax.scatter(mask_x, mask_y, s=200, marker='s', facecolors="none",
-                      edgecolors="lime", linewidth=2.5)
-
         ax.set_title(
-            f"Band {image.band.upper()} -- {n_galaxies} galaxies (red), "
-            f"{n_detected_stars} detected stars (blue), {len(star_mask_centers)} mask regions (green sq)",
+            f"Band {image.band.upper()} -- {n_galaxies} galaxies",
             fontsize=9,
         )
         ax.set_xlabel(r"X (pixels)")
         ax.set_ylabel(r"Y (pixels)")
 
-    plt.suptitle("Final Selection (red=galaxies, blue=stars, green sq=mask regions)", fontsize=14, fontweight="bold", y=1.01)
+    plt.suptitle(f"Final Selection ({n_galaxies} galaxies)", fontsize=14, fontweight="bold", y=1.01)
     plt.tight_layout()
     plt.savefig(f"{output_dir}/final_selection.pdf", dpi=150, bbox_inches="tight")
     plt.close()
@@ -3179,470 +2879,6 @@ def main(mode: str = "full"):
     return sed_catalog, sed_catalog_analysis, binned, binned_results, star_mask_centers
 
 
-def plot_example_seds(
-    catalog: pd.DataFrame,
-    output_dir: str = "./output/full",
-    spectra_path: str = "./spectra",
-) -> None:
-    """
-    Plot example SED fits for representative galaxies.
-
-    Creates a 2x2 subplot showing observed photometry and best-fit template SEDs
-    for 3-4 representative galaxies of different types (elliptical/S0, spiral, starburst).
-
-    Parameters
-    ----------
-    catalog : pd.DataFrame
-        Galaxy catalog with columns: galaxy_type, redshift, photo_z_odds,
-        flux_u, flux_b, flux_v, flux_i, error_u, error_b, error_v, error_i
-    output_dir : str
-        Output directory for saving the plot
-    spectra_path : str
-        Path to directory containing template spectra files
-    """
-    from mpl_toolkits.axes_grid1.inset_locator import inset_axes
-    from classify import (
-        classify_galaxy_with_pdf,
-        _load_spectrum,
-        _WL_GRID,
-        igm_absorption,
-    )
-
-    os.makedirs(output_dir, exist_ok=True)
-
-    # Filter bandpass definitions (from classify.py)
-    # U, B, V, I bands with their effective wavelengths and widths
-    filter_info = {
-        'U': {'center': 3000, 'width': 1521, 'color': 'purple'},
-        'B': {'center': 4500, 'width': 1501, 'color': 'blue'},
-        'V': {'center': 6060, 'width': 951, 'color': 'green'},
-        'I': {'center': 8140, 'width': 766, 'color': 'red'},
-    }
-
-    # Define representative galaxy types to select
-    # Priority: elliptical/S0 (early-type), Sa/Sb (spiral), sbt1-6 (starburst)
-    target_types = [
-        ('elliptical', 'S0'),           # Early-type (elliptical or S0)
-        ('Sa', 'Sb'),                   # Spiral
-        ('sbt1', 'sbt2', 'sbt3'),       # Starburst (intense)
-        ('sbt4', 'sbt5', 'sbt6'),       # Starburst (moderate)
-    ]
-
-    # Select representative galaxies with good ODDS values
-    selected_galaxies = []
-    min_odds = 0.8  # Require good photo-z quality
-
-    for type_group in target_types:
-        # Find galaxies of this type with good ODDS
-        mask = catalog['galaxy_type'].isin(type_group) & (catalog['photo_z_odds'] >= min_odds)
-        candidates = catalog[mask].copy()
-
-        if len(candidates) == 0:
-            # Try with lower ODDS threshold
-            mask = catalog['galaxy_type'].isin(type_group) & (catalog['photo_z_odds'] >= 0.6)
-            candidates = catalog[mask].copy()
-
-        if len(candidates) > 0:
-            # Sort by ODDS (best first) and select the best one
-            candidates = candidates.sort_values('photo_z_odds', ascending=False)
-            selected_galaxies.append(candidates.iloc[0])
-
-        if len(selected_galaxies) >= 4:
-            break
-
-    # If we don't have 4 galaxies, fill with any good galaxies
-    if len(selected_galaxies) < 4:
-        remaining = catalog[catalog['photo_z_odds'] >= min_odds].copy()
-        remaining = remaining.sort_values('photo_z_odds', ascending=False)
-        for _, row in remaining.iterrows():
-            if len(selected_galaxies) >= 4:
-                break
-            # Check if this galaxy type is already represented
-            already_have = [g['galaxy_type'] for g in selected_galaxies]
-            if row['galaxy_type'] not in already_have:
-                selected_galaxies.append(row)
-
-    if len(selected_galaxies) == 0:
-        print("  Warning: No suitable galaxies found for SED plot")
-        return
-
-    # Create 2x2 subplot figure
-    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
-    axes = axes.flatten()
-
-    for idx, galaxy in enumerate(selected_galaxies[:4]):
-        ax = axes[idx]
-
-        # Extract galaxy properties
-        gtype = galaxy['galaxy_type']
-        z_best = galaxy['redshift']
-        odds = galaxy['photo_z_odds']
-
-        # Get observed photometry (in flux units)
-        obs_flux = np.array([
-            galaxy['flux_u'],
-            galaxy['flux_b'],
-            galaxy['flux_v'],
-            galaxy['flux_i'],
-        ])
-        obs_err = np.array([
-            galaxy['error_u'],
-            galaxy['error_b'],
-            galaxy['error_v'],
-            galaxy['error_i'],
-        ])
-
-        # Filter effective wavelengths (observer frame)
-        filter_wavelengths = np.array([3000, 4500, 6060, 8140])  # U, B, V, I
-
-        # Load the best-fit template spectrum
-        try:
-            wl_template, spec_template = _load_spectrum(spectra_path, gtype)
-        except FileNotFoundError:
-            # Try base type if interpolated name
-            base_type = gtype.split('_')[0] if '_' in gtype else gtype
-            wl_template, spec_template = _load_spectrum(spectra_path, base_type)
-
-        # Redshift the template to observer frame
-        wl_redshifted = wl_template * (1 + z_best)
-
-        # Apply IGM absorption for high-z sources
-        if z_best > 0.5:
-            igm_trans = igm_absorption(wl_template, z_best, model="madau95")
-            spec_with_igm = spec_template * igm_trans
-        else:
-            spec_with_igm = spec_template
-
-        # Interpolate template to common grid for synthetic photometry
-        spec_interp = np.interp(_WL_GRID, wl_redshifted, spec_with_igm, left=0, right=0)
-
-        # Compute synthetic photometry to normalize template to data
-        syn_flux = []
-        for band_name in ['U', 'B', 'V', 'I']:
-            info = filter_info[band_name]
-            center, width = info['center'], info['width'] / 2
-            fmask = (_WL_GRID >= center - width) & (_WL_GRID <= center + width)
-            syn_flux.append(np.mean(spec_interp[fmask]) if np.any(fmask) else 0)
-        syn_flux = np.array(syn_flux)
-
-        # Normalize template to match observed data (median normalization)
-        obs_median = np.median(obs_flux[obs_flux > 0])
-        syn_median = np.median(syn_flux[syn_flux > 0])
-        if syn_median > 0 and obs_median > 0:
-            norm_factor = obs_median / syn_median
-        else:
-            norm_factor = 1.0
-
-        spec_normalized = spec_with_igm * norm_factor
-
-        # Plot the normalized template SED
-        valid_mask = (wl_redshifted >= 2000) & (wl_redshifted <= 10000) & (spec_normalized > 0)
-        if np.any(valid_mask):
-            ax.plot(
-                wl_redshifted[valid_mask],
-                spec_normalized[valid_mask],
-                '-', color='gray', linewidth=1.5, alpha=0.8,
-                label=f'Best-fit template ({gtype})'
-            )
-
-        # Plot observed photometry with error bars
-        band_names = ['U', 'B', 'V', 'I']
-        for i, (wl, flux, err, band_name) in enumerate(zip(filter_wavelengths, obs_flux, obs_err, band_names)):
-            color = filter_info[band_name]['color']
-            ax.errorbar(
-                wl, flux, yerr=err,
-                fmt='o', markersize=10, capsize=4, capthick=1.5,
-                color=color, markeredgecolor='black', markeredgewidth=0.8,
-                label=f'{band_name} band' if idx == 0 else None,
-                zorder=10
-            )
-
-        # Add filter transmission curves (scaled and offset for visibility)
-        flux_range = np.max(obs_flux) - np.min(obs_flux[obs_flux > 0])
-        baseline = np.min(obs_flux[obs_flux > 0]) * 0.3
-        for band_name in ['U', 'B', 'V', 'I']:
-            info = filter_info[band_name]
-            center, width = info['center'], info['width'] / 2
-            # Simple box filter representation
-            filter_wl = np.array([center - width, center - width, center + width, center + width])
-            filter_trans = np.array([0, 1, 1, 0]) * flux_range * 0.15 + baseline
-            ax.fill(filter_wl, filter_trans, color=info['color'], alpha=0.15)
-
-        # Create inset for P(z) PDF
-        ax_inset = inset_axes(ax, width="35%", height="30%", loc='upper right')
-
-        # Recompute PDF for this galaxy to get z_grid and pdf
-        fluxes = [galaxy['flux_b'], galaxy['flux_i'], galaxy['flux_u'], galaxy['flux_v']]
-        errors = [galaxy['error_b'], galaxy['error_i'], galaxy['error_u'], galaxy['error_v']]
-        try:
-            result = classify_galaxy_with_pdf(fluxes, errors, spectra_path=spectra_path)
-            z_grid = result.z_grid
-            pdf = result.pdf
-
-            # Plot PDF
-            ax_inset.fill_between(z_grid, pdf, alpha=0.5, color='steelblue')
-            ax_inset.plot(z_grid, pdf, '-', color='steelblue', linewidth=1)
-            ax_inset.axvline(z_best, color='red', linestyle='--', linewidth=1.5, label=f'$z$={z_best:.2f}')
-
-            # Mark 68% confidence interval
-            z_lo, z_hi = result.z_lo, result.z_hi
-            ax_inset.axvspan(z_lo, z_hi, alpha=0.2, color='red')
-
-            ax_inset.set_xlabel(r'$z$', fontsize=8)
-            ax_inset.set_ylabel(r'$P(z)$', fontsize=8)
-            ax_inset.set_xlim(0, min(3.5, z_best + 1.5))
-            ax_inset.tick_params(axis='both', which='major', labelsize=7)
-            ax_inset.set_title(r'$P(z)$ PDF', fontsize=8)
-        except Exception:
-            ax_inset.text(0.5, 0.5, 'PDF unavailable', transform=ax_inset.transAxes,
-                         ha='center', va='center', fontsize=8)
-
-        # Labels and title
-        ax.set_xlabel(r'Wavelength (\AA)', fontsize=11)
-        ax.set_ylabel(r'Flux (erg s$^{-1}$ cm$^{-2}$ \AA$^{-1}$)', fontsize=11)
-
-        # Format galaxy type for display
-        type_display = {
-            'elliptical': 'Elliptical',
-            'S0': 'S0 (Lenticular)',
-            'Sa': 'Sa Spiral',
-            'Sb': 'Sb Spiral',
-            'sbt1': 'Starburst 1',
-            'sbt2': 'Starburst 2',
-            'sbt3': 'Starburst 3',
-            'sbt4': 'Starburst 4',
-            'sbt5': 'Starburst 5',
-            'sbt6': 'Starburst 6',
-        }.get(gtype, gtype)
-
-        ax.set_title(
-            f'{type_display}\n' + r'$z_{\rm phot}$' + f' = {z_best:.3f}, ODDS = {odds:.2f}',
-            fontsize=11
-        )
-
-        ax.set_xlim(2000, 10000)
-        ax.grid(True, alpha=0.3)
-
-        # Set y-axis to show positive fluxes only
-        ymin = min(0, np.min(obs_flux - obs_err) * 0.9)
-        ymax = np.max(obs_flux + obs_err) * 1.3
-        ax.set_ylim(ymin, ymax)
-
-        # Use scientific notation for y-axis
-        ax.ticklabel_format(axis='y', style='scientific', scilimits=(-2, 2))
-
-    # Add legend to first subplot only
-    if len(selected_galaxies) > 0:
-        handles, labels = axes[0].get_legend_handles_labels()
-        # Filter unique labels
-        unique = {}
-        for h, l in zip(handles, labels):
-            if l not in unique:
-                unique[l] = h
-        axes[0].legend(unique.values(), unique.keys(), loc='upper left', fontsize=8)
-
-    # Hide unused subplots
-    for idx in range(len(selected_galaxies), 4):
-        axes[idx].set_visible(False)
-
-    fig.suptitle(r'Example SED Fits for Representative HDF Galaxies', fontsize=14, fontweight='bold')
-    plt.subplots_adjust(top=0.93, hspace=0.3, wspace=0.25)
-    plt.savefig(f"{output_dir}/example_seds.pdf", dpi=300, bbox_inches="tight")
-    plt.close()
-    print(f"  Saved: {output_dir}/example_seds.pdf")
-
-
-def plot_galaxy_type_vs_redshift(
-    catalog: pd.DataFrame,
-    output_dir: str,
-    title_suffix: str = "",
-    n_bins: int = None,
-) -> None:
-    """
-    Create a visualization showing the distribution of galaxy types as a function of redshift.
-
-    This plot reveals:
-    - Which galaxy types dominate at different redshifts
-    - Selection effects (e.g., are starbursts preferentially detected at high-z?)
-    - The evolution of the galaxy population with cosmic time
-
-    Uses a stacked bar chart with both absolute counts and fractional representation,
-    plus annotations showing selection effects and population statistics.
-
-    Parameters
-    ----------
-    catalog : pd.DataFrame
-        Galaxy catalog with 'galaxy_type', 'z' or 'redshift', and optionally 'r_half_arcsec' columns
-    output_dir : str
-        Directory to save the output plot
-    title_suffix : str, optional
-        Suffix to add to plot title (e.g., " (Chip 3)")
-    n_bins : int, optional
-        Number of redshift bins. If None, uses adaptive binning based on sample size.
-    """
-    os.makedirs(output_dir, exist_ok=True)
-
-    # Handle both 'z' and 'redshift' column names
-    z_col = 'z' if 'z' in catalog.columns else 'redshift'
-    if z_col not in catalog.columns:
-        print(f"  Warning: No redshift column found in catalog. Skipping galaxy type vs redshift plot.")
-        return
-
-    # Filter to valid data
-    valid_mask = catalog[z_col].notna() & catalog['galaxy_type'].notna()
-    data = catalog[valid_mask].copy()
-
-    if len(data) < 10:
-        print(f"  Warning: Only {len(data)} galaxies with valid type and redshift. Skipping plot.")
-        return
-
-    # Determine number of bins adaptively
-    if n_bins is None:
-        n_bins = get_adaptive_n_bins(len(data), min_per_bin=3)
-        n_bins = min(n_bins, 10)  # Cap at 10 bins for readability
-
-    # Create redshift bins
-    z_min, z_max = data[z_col].min(), data[z_col].max()
-    z_edges = np.linspace(z_min, z_max, n_bins + 1)
-    data['z_bin'] = pd.cut(data[z_col], bins=z_edges, include_lowest=True)
-
-    # Get unique galaxy types and sort them logically
-    # Group starburst types together, then spirals, then ellipticals
-    all_types = data['galaxy_type'].unique()
-
-    def type_sort_key(t):
-        """Sort galaxy types: elliptical/S0 first, then spirals, then starbursts."""
-        t_lower = t.lower()
-        if t_lower == 'elliptical':
-            return (0, t)
-        elif t_lower == 's0':
-            return (1, t)
-        elif t_lower.startswith('s') and t_lower[1:].isalpha():  # Sa, Sb, Sc, etc.
-            return (2, t)
-        elif t_lower.startswith('sbt'):  # Starburst types
-            return (3, t)
-        else:
-            return (4, t)
-
-    sorted_types = sorted(all_types, key=type_sort_key)
-
-    # Create pivot table for counts
-    pivot_counts = data.groupby(['z_bin', 'galaxy_type'], observed=False).size().unstack(fill_value=0)
-
-    # Reorder columns by sorted types (only include types present in data)
-    pivot_counts = pivot_counts[[t for t in sorted_types if t in pivot_counts.columns]]
-
-    # Calculate fractions for the second panel
-    pivot_fractions = pivot_counts.div(pivot_counts.sum(axis=1), axis=0).fillna(0)
-
-    # Get bin centers for x-axis
-    bin_centers = [(interval.left + interval.right) / 2 for interval in pivot_counts.index]
-
-    # Define color palette - using tab10 extended for more types
-    n_types = len(pivot_counts.columns)
-    if n_types <= 10:
-        cmap = plt.cm.tab10
-        colors = [cmap(i) for i in range(n_types)]
-    else:
-        cmap = plt.cm.tab20
-        colors = [cmap(i) for i in range(n_types)]
-
-    type_colors = dict(zip(pivot_counts.columns, colors))
-
-    # Create figure with two panels: counts and fractions
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10), sharex=True,
-                                    gridspec_kw={'height_ratios': [1, 1], 'hspace': 0.08})
-
-    # Panel 1: Stacked bar chart (counts)
-    bar_width = (z_max - z_min) / n_bins * 0.85
-    bottoms = np.zeros(len(bin_centers))
-
-    for gtype in pivot_counts.columns:
-        counts = pivot_counts[gtype].values
-        ax1.bar(bin_centers, counts, bar_width, bottom=bottoms,
-                label=gtype, color=type_colors[gtype], edgecolor='white', linewidth=0.5)
-        bottoms += counts
-
-    ax1.set_ylabel(r'Number of galaxies', fontsize=12)
-    ax1.set_title(r'Galaxy Type Distribution vs Redshift' + title_suffix, fontsize=14, fontweight='bold')
-    ax1.legend(loc='upper right', fontsize=9, ncol=min(3, (n_types + 2) // 3),
-               title='Galaxy Type', title_fontsize=10)
-    ax1.grid(True, alpha=0.3, axis='y')
-
-    # Add total count annotations on top of each bar
-    for i, (x, total) in enumerate(zip(bin_centers, pivot_counts.sum(axis=1).values)):
-        if total > 0:
-            ax1.annotate(f'{int(total)}', xy=(x, total), ha='center', va='bottom',
-                        fontsize=8, color='black')
-
-    # Panel 2: Stacked bar chart (fractions)
-    bottoms_frac = np.zeros(len(bin_centers))
-
-    for gtype in pivot_fractions.columns:
-        fracs = pivot_fractions[gtype].values
-        ax2.bar(bin_centers, fracs, bar_width, bottom=bottoms_frac,
-                color=type_colors[gtype], edgecolor='white', linewidth=0.5)
-        bottoms_frac += fracs
-
-    ax2.set_xlabel(r'Redshift $z$', fontsize=12)
-    ax2.set_ylabel(r'Fraction', fontsize=12)
-    ax2.set_ylim(0, 1)
-    ax2.grid(True, alpha=0.3, axis='y')
-
-    # Add horizontal lines at key fractions
-    for frac in [0.25, 0.5, 0.75]:
-        ax2.axhline(frac, color='gray', linestyle=':', linewidth=0.5, alpha=0.5)
-
-    # Set x-axis limits with padding
-    z_padding = (z_max - z_min) * 0.05
-    ax2.set_xlim(z_min - z_padding, z_max + z_padding)
-
-    # Add redshift bin edge labels
-    ax2.set_xticks(bin_centers)
-    bin_labels = [f'{bc:.2f}' for bc in bin_centers]
-    ax2.set_xticklabels(bin_labels, rotation=45, ha='right')
-
-    # Calculate and display selection effect statistics
-    # Check if starburst types dominate at high-z
-    starburst_types = [t for t in sorted_types if t.lower().startswith('sbt')]
-    early_types = [t for t in sorted_types if t.lower() in ['elliptical', 's0']]
-
-    if len(bin_centers) >= 2:
-        z_median = np.median(data[z_col])
-
-        # Low-z vs high-z fractions
-        low_z_mask = data[z_col] < z_median
-        high_z_mask = data[z_col] >= z_median
-
-        low_z_count = low_z_mask.sum()
-        high_z_count = high_z_mask.sum()
-
-        if low_z_count > 0 and high_z_count > 0:
-            # Starburst fraction at low vs high z
-            if starburst_types:
-                sb_low = data.loc[low_z_mask, 'galaxy_type'].isin(starburst_types).sum() / low_z_count
-                sb_high = data.loc[high_z_mask, 'galaxy_type'].isin(starburst_types).sum() / high_z_count
-
-                # Add text annotation about selection effects
-                selection_text = (
-                    f"Selection effects:\n"
-                    f"Starburst fraction:\n"
-                    f"  $z < {z_median:.2f}$: {sb_low:.1%}\n"
-                    f"  $z \\geq {z_median:.2f}$: {sb_high:.1%}"
-                )
-
-                # Add annotation box
-                ax2.text(0.02, 0.02, selection_text, transform=ax2.transAxes,
-                        fontsize=9, verticalalignment='bottom',
-                        bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
-
-    # Use subplots_adjust instead of tight_layout for better compatibility
-    fig.subplots_adjust(left=0.08, right=0.95, top=0.95, bottom=0.1)
-    plt.savefig(f"{output_dir}/galaxy_type_vs_redshift.pdf", dpi=300, bbox_inches='tight')
-    plt.close()
-    print(f"  Saved: {output_dir}/galaxy_type_vs_redshift.pdf")
-
-
 def extract_chip3_from_full(full_catalog: pd.DataFrame, full_catalog_filtered: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     Extract chip3 sources from full mosaic catalog.
@@ -3666,15 +2902,64 @@ def extract_chip3_from_full(full_catalog: pd.DataFrame, full_catalog_filtered: p
     return chip3_catalog, chip3_catalog_filtered
 
 
+def run_quality_control(
+    catalog: pd.DataFrame,
+    output_dir: str,
+    reference_catalog_path: str | None = None,
+) -> None:
+    """Run quality control pipeline on classification results.
+
+    Parameters
+    ----------
+    catalog : pd.DataFrame
+        Galaxy catalog with classification results
+    output_dir : str
+        Output directory for QC results
+    reference_catalog_path : str, optional
+        Path to external reference catalog (CSV with ra, dec, z_phot columns)
+    """
+    from quality_control import QualityControlPipeline
+
+    print("\n" + "=" * 60)
+    print("RUNNING QUALITY CONTROL PIPELINE")
+    print("=" * 60)
+
+    # Load reference catalog if provided
+    reference_catalog = None
+    if reference_catalog_path:
+        try:
+            reference_catalog = pd.read_csv(reference_catalog_path)
+            print(f"  Loaded reference catalog: {reference_catalog_path}")
+            print(f"  Reference sources: {len(reference_catalog)}")
+        except Exception as e:
+            print(f"  Warning: Could not load reference catalog: {e}")
+
+    # Create QC output directory
+    qc_output_dir = f"{output_dir}/qc"
+
+    # Run QC pipeline
+    qc = QualityControlPipeline(
+        catalog=catalog,
+        output_dir=qc_output_dir,
+        reference_catalog=reference_catalog,
+    )
+
+    qc.run_full_validation(generate_plots=True)
+    qc.save_report()
+
+    print(f"\nQC results saved to: {qc_output_dir}/")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Angular size test analysis pipeline",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-    python run_analysis.py full    # Run on entire 4096x4096 image
-    python run_analysis.py chip3   # Run on chip3 only (2048x2048)
-    python run_analysis.py both    # Run full, then extract chip3 (most efficient)
+    python run_analysis.py full                          # Run analysis on full mosaic
+    python run_analysis.py chip3                         # Run analysis on chip3 only
+    python run_analysis.py both                          # Run full and extract chip3
+    python run_analysis.py full --run-qc                 # Run with quality control
         """
     )
     parser.add_argument(
@@ -3682,14 +2967,37 @@ Examples:
         choices=["full", "chip3", "both"],
         help="Analysis mode: 'full' for entire image, 'chip3' for chip3 only, 'both' to run full and extract chip3"
     )
+    parser.add_argument(
+        "--run-qc",
+        action="store_true",
+        help="Run quality control pipeline after classification"
+    )
+    parser.add_argument(
+        "--qc-reference",
+        type=str,
+        default=None,
+        metavar="PATH",
+        help="Path to external reference catalog for QC validation (CSV with ra, dec, z_phot columns)"
+    )
     args = parser.parse_args()
+
+    print("=" * 60)
+    print("ANGULAR SIZE TEST ANALYSIS")
+    print(f"Mode: {args.mode}")
+    print("=" * 60)
 
     if args.mode == "both":
         # Run full analysis first
-        print("Running full analysis...")
+        print("\n" + "=" * 60)
+        print("RUNNING ANALYSIS (FULL)")
+        print("=" * 60)
         sed_catalog, sed_catalog_analysis, binned, binned_results, star_mask_centers = main("full")
 
-        # Extract chip3 from full results (reuses classification - no re-computation!)
+        # Run QC if requested
+        if args.run_qc:
+            run_quality_control(sed_catalog, "./output/full_HDF", args.qc_reference)
+
+        # Extract chip3 from full results
         print("\n" + "=" * 60)
         print("EXTRACTING CHIP3 SUBSET FROM FULL RESULTS")
         print("=" * 60)
@@ -3714,16 +3022,159 @@ Examples:
             data, header, _ = read_fits(path)
             chip3_images.append(AstroImage(data=data, header=header, band=band, weight=None))
 
-        # Generate chip3 plots from extracted catalog (reuses classification!)
+        # Generate chip3 plots
         print("\n" + "=" * 60)
-        print("GENERATING CHIP3 PLOTS FROM EXTRACTED DATA")
+        print("GENERATING CHIP3 PLOTS")
         print("=" * 60)
-        chip3_output_dir = "./output/chip3"
+        chip3_output_dir = "./output/chip3_HDF"
         crop_bounds = (CHIP3_X_MIN, CHIP3_X_MAX, CHIP3_Y_MIN, CHIP3_Y_MAX)
         analyze_and_plot_catalog(
             chip3_catalog, chip3_catalog_filtered, chip3_output_dir,
             title_suffix=" (Chip 3)", images=chip3_images, crop_bounds=crop_bounds,
             star_mask_centers=star_mask_centers
         )
+
+        # Generate plots for both full and chip3
+        try:
+            from generate_filtered_binning import (
+                MIN_GALAXIES_PER_TYPE,
+                generate_angular_size_plot,
+                generate_binning_plot,
+                generate_galaxy_type_histogram,
+                generate_overlay_plot,
+                generate_per_type_fit_plot,
+                generate_redshift_histogram,
+                generate_size_distribution_by_type,
+                generate_type_comparison_overlay,
+                get_types_with_enough_statistics,
+            )
+            print("\n" + "=" * 60)
+            print("GENERATING PLOTS")
+            print("=" * 60)
+
+            for mode_name, output_dir in [
+                ("Full Field", "./output/full_HDF"),
+                ("Chip3", "./output/chip3_HDF")
+            ]:
+                # All types combined plots
+                generate_binning_plot(data_dir=output_dir,
+                    output_path=f"{output_dir}/binning_comparison.pdf",
+                    dataset_name=mode_name, apply_z_filter=False)
+                generate_overlay_plot(data_dir=output_dir,
+                    output_path=f"{output_dir}/binning_overlay.pdf",
+                    dataset_name=mode_name, apply_z_filter=False)
+
+                # Angular size vs redshift (main science plot)
+                generate_angular_size_plot(data_dir=output_dir,
+                    output_path=f"{output_dir}/angular_size_vs_redshift.pdf",
+                    dataset_name=mode_name, apply_z_filter=False)
+
+                # Redshift distribution histograms
+                generate_redshift_histogram(data_dir=output_dir,
+                    output_path=f"{output_dir}/redshift_histogram.pdf",
+                    dataset_name=mode_name, apply_z_filter=False)
+
+                # Galaxy type histograms
+                generate_galaxy_type_histogram(data_dir=output_dir,
+                    output_path=f"{output_dir}/galaxy_types.pdf",
+                    dataset_name=mode_name, apply_z_filter=False)
+
+                # Per-galaxy-type analysis
+                print(f"\n--- Per-Galaxy-Type Analysis ({mode_name}) ---")
+                catalog_path = f"{output_dir}/galaxy_catalog.csv"
+                if os.path.exists(catalog_path):
+                    type_catalog = pd.read_csv(catalog_path)
+                    type_catalog = type_catalog.dropna(subset=["redshift", "r_half_arcsec", "r_half_arcsec_error"])
+                    type_catalog = type_catalog[np.isfinite(type_catalog["r_half_arcsec_error"])]
+
+                    valid_types = get_types_with_enough_statistics(type_catalog)
+                    print(f"  Galaxy types with N >= {MIN_GALAXIES_PER_TYPE}: {valid_types}")
+                    if len(valid_types) > 0:
+                        generate_size_distribution_by_type(output_dir, output_dir, mode_name)
+                        generate_type_comparison_overlay(output_dir, output_dir, mode_name)
+                        print(f"  Generating individual θ(z) fits for {len(valid_types)} types...")
+                        for gtype in valid_types:
+                            generate_per_type_fit_plot(output_dir, output_dir, mode_name, gtype)
+                    else:
+                        print("  No galaxy types have enough statistics for per-type analysis.")
+
+            print("\nPlots saved to: ./output/full_HDF/ and ./output/chip3_HDF/")
+        except ImportError as e:
+            print(f"\nWarning: Could not generate plots: {e}")
+
     else:
+        # Single mode (full or chip3)
         sed_catalog, sed_catalog_analysis, binned, binned_results, star_mask_centers = main(args.mode)
+
+        # Run QC if requested
+        if args.run_qc:
+            output_dir = f"./output/{args.mode}_HDF"
+            run_quality_control(sed_catalog, output_dir, args.qc_reference)
+
+        # Generate plots
+        try:
+            from generate_filtered_binning import (
+                MIN_GALAXIES_PER_TYPE,
+                generate_angular_size_plot,
+                generate_binning_plot,
+                generate_galaxy_type_histogram,
+                generate_overlay_plot,
+                generate_per_type_fit_plot,
+                generate_redshift_histogram,
+                generate_size_distribution_by_type,
+                generate_type_comparison_overlay,
+                get_types_with_enough_statistics,
+            )
+            output_dir = f"./output/{args.mode}_HDF"
+            dataset_name = "Full Field" if args.mode == "full" else "Chip3"
+            print("\n" + "=" * 60)
+            print("GENERATING PLOTS")
+            print("=" * 60)
+
+            # Binning comparison (all types)
+            generate_binning_plot(data_dir=output_dir,
+                output_path=f"{output_dir}/binning_comparison.pdf",
+                dataset_name=dataset_name, apply_z_filter=False)
+
+            # Overlay (all types)
+            generate_overlay_plot(data_dir=output_dir,
+                output_path=f"{output_dir}/binning_overlay.pdf",
+                dataset_name=dataset_name, apply_z_filter=False)
+
+            # Angular size vs redshift (main science plot)
+            generate_angular_size_plot(data_dir=output_dir,
+                output_path=f"{output_dir}/angular_size_vs_redshift.pdf",
+                dataset_name=dataset_name, apply_z_filter=False)
+
+            # Redshift distribution histograms
+            generate_redshift_histogram(data_dir=output_dir,
+                output_path=f"{output_dir}/redshift_histogram.pdf",
+                dataset_name=dataset_name, apply_z_filter=False)
+
+            # Galaxy type histograms
+            generate_galaxy_type_histogram(data_dir=output_dir,
+                output_path=f"{output_dir}/galaxy_types.pdf",
+                dataset_name=dataset_name, apply_z_filter=False)
+
+            # Per-galaxy-type analysis
+            catalog_path = f"{output_dir}/galaxy_catalog.csv"
+            if os.path.exists(catalog_path):
+                type_catalog = pd.read_csv(catalog_path)
+                type_catalog = type_catalog.dropna(subset=["redshift", "r_half_arcsec", "r_half_arcsec_error"])
+                type_catalog = type_catalog[np.isfinite(type_catalog["r_half_arcsec_error"])]
+
+                print(f"\n--- Per-Galaxy-Type Analysis ({dataset_name}) ---")
+                valid_types = get_types_with_enough_statistics(type_catalog)
+                print(f"  Galaxy types with N >= {MIN_GALAXIES_PER_TYPE}: {valid_types}")
+                if len(valid_types) > 0:
+                    generate_size_distribution_by_type(output_dir, output_dir, dataset_name)
+                    generate_type_comparison_overlay(output_dir, output_dir, dataset_name)
+                    print(f"  Generating individual θ(z) fits for {len(valid_types)} types...")
+                    for gtype in valid_types:
+                        generate_per_type_fit_plot(output_dir, output_dir, dataset_name, gtype)
+                else:
+                    print("  No galaxy types have enough statistics for per-type analysis.")
+
+            print(f"\nPlots saved to: {output_dir}/")
+        except ImportError as e:
+            print(f"\nWarning: Could not generate plots: {e}")

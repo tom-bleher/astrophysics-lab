@@ -49,8 +49,8 @@ def query_vizier_catalog(
 
     try:
         if center_ra is not None and center_dec is not None:
-            from astropy.coordinates import SkyCoord
             import astropy.units as u
+            from astropy.coordinates import SkyCoord
 
             coord = SkyCoord(ra=center_ra * u.deg, dec=center_dec * u.deg)
             result = Vizier.query_region(
@@ -175,6 +175,7 @@ def load_fernandez_soto_local(
         Catalog data
     """
     from pathlib import Path
+
     import numpy as np
 
     path = Path(local_path)

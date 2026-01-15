@@ -15,7 +15,7 @@ References:
 """
 
 import numpy as np
-from numpy.typing import ArrayLike, NDArray
+from numpy.typing import ArrayLike
 
 
 def photoz_metrics(
@@ -58,7 +58,7 @@ def photoz_metrics(
     dz = (z_phot - z_true) / (1 + z_true)
 
     # NMAD: Normalized Median Absolute Deviation
-    # σ_NMAD = 1.48 × median(|Δz - median(Δz)|)
+    # sigma_NMAD = 1.48 * median(|dz - median(dz)|)
     nmad = 1.48 * np.median(np.abs(dz - np.median(dz)))
 
     # Bias: systematic offset
@@ -338,14 +338,14 @@ def format_metrics_table(metrics_list: list[dict], method_names: list[str]) -> s
         Formatted table string
     """
     header = (
-        f"{'Method':<20} {'N':>6} {'NMAD':>8} {'Bias':>8} {'σ':>8} "
+        f"{'Method':<20} {'N':>6} {'NMAD':>8} {'Bias':>8} {'sigma':>8} "
         f"{'Out%':>8} {'Cat%':>8}"
     )
     separator = "-" * len(header)
 
     lines = [header, separator]
 
-    for name, metrics in zip(method_names, metrics_list):
+    for name, metrics in zip(method_names, metrics_list, strict=False):
         if "error" in metrics:
             lines.append(f"{name:<20} {'ERROR':>6}")
             continue
@@ -494,15 +494,9 @@ def binned_metrics_2d(
     z_true = np.asarray(z_true)
     magnitude = np.asarray(magnitude)
 
-    if z_bins is None:
-        z_bins = np.array([0, 0.5, 1.0, 1.5, 2.0, 3.0])
-    else:
-        z_bins = np.asarray(z_bins)
+    z_bins = np.array([0, 0.5, 1.0, 1.5, 2.0, 3.0]) if z_bins is None else np.asarray(z_bins)
 
-    if mag_bins is None:
-        mag_bins = np.array([18, 22, 24, 26, 28, 30])
-    else:
-        mag_bins = np.asarray(mag_bins)
+    mag_bins = np.array([18, 22, 24, 26, 28, 30]) if mag_bins is None else np.asarray(mag_bins)
 
     # Filter valid values
     valid = (
@@ -597,3 +591,178 @@ def format_confusion_matrix(cm_dict: dict) -> str:
     ]
 
     return "\n".join(lines)
+
+
+def load_fernandez_soto_catalog(
+    catalog_path: str = "data/external/fernandez_soto_1999.csv",
+) -> dict:
+    """Load Fernandez-Soto 1999 HDF catalog with spectroscopic redshifts.
+
+    Parameters
+    ----------
+    catalog_path : str
+        Path to the CSV file
+
+    Returns
+    -------
+    dict
+        Catalog with RA, Dec, z_spec, z_phot columns
+    """
+    import pandas as pd
+    from pathlib import Path
+
+    path = Path(catalog_path)
+    if not path.exists():
+        print(f"Catalog not found: {catalog_path}")
+        return {"ra": np.array([]), "dec": np.array([]), "z_spec": np.array([]), "z_phot": np.array([])}
+
+    df = pd.read_csv(path)
+
+    # Parse sexagesimal coordinates to decimal degrees
+    def parse_ra(ra_str):
+        """Convert RA from 'HH MM SS.sss' to decimal degrees."""
+        parts = ra_str.split()
+        h, m, s = float(parts[0]), float(parts[1]), float(parts[2])
+        return 15.0 * (h + m/60.0 + s/3600.0)
+
+    def parse_dec(dec_str):
+        """Convert Dec from '+DD MM SS.ss' to decimal degrees."""
+        dec_str = dec_str.strip()
+        sign = 1 if dec_str[0] == '+' else -1
+        parts = dec_str[1:].split()
+        d, m, s = float(parts[0]), float(parts[1]), float(parts[2])
+        return sign * (d + m/60.0 + s/3600.0)
+
+    ra = np.array([parse_ra(r) for r in df['RAJ2000']])
+    dec = np.array([parse_dec(d) for d in df['DEJ2000']])
+    z_spec = df['z_spec'].values
+    z_phot = df['z_phot'].values
+
+    return {
+        "ra": ra,
+        "dec": dec,
+        "z_spec": z_spec,
+        "z_phot": z_phot,
+        "type": df['Type'].values,
+        "abmag": df['ABmag'].values,
+    }
+
+
+def cross_match_catalogs(
+    ra1: ArrayLike,
+    dec1: ArrayLike,
+    ra2: ArrayLike,
+    dec2: ArrayLike,
+    max_sep_arcsec: float = 1.0,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Cross-match two catalogs by position.
+
+    Parameters
+    ----------
+    ra1, dec1 : array-like
+        RA and Dec of first catalog (degrees)
+    ra2, dec2 : array-like
+        RA and Dec of second catalog (degrees)
+    max_sep_arcsec : float
+        Maximum separation for a match (arcseconds)
+
+    Returns
+    -------
+    idx1, idx2 : ndarray
+        Matched indices in each catalog
+    sep_arcsec : ndarray
+        Separation of each match in arcseconds
+    """
+    from scipy.spatial import cKDTree
+
+    ra1 = np.asarray(ra1)
+    dec1 = np.asarray(dec1)
+    ra2 = np.asarray(ra2)
+    dec2 = np.asarray(dec2)
+
+    # Convert to Cartesian for faster matching
+    # Approximate flat-sky projection (valid for small fields)
+    cos_dec1 = np.cos(np.radians(dec1))
+    cos_dec2 = np.cos(np.radians(dec2))
+
+    x1 = ra1 * cos_dec1
+    y1 = dec1
+    x2 = ra2 * cos_dec2
+    y2 = dec2
+
+    # Build KD-tree from second catalog
+    tree = cKDTree(np.column_stack([x2, y2]))
+
+    # Query nearest neighbors
+    max_sep_deg = max_sep_arcsec / 3600.0
+    distances, indices = tree.query(
+        np.column_stack([x1, y1]),
+        k=1,
+        distance_upper_bound=max_sep_deg,
+    )
+
+    # Filter valid matches
+    valid = np.isfinite(distances)
+    idx1 = np.where(valid)[0]
+    idx2 = indices[valid]
+    sep_arcsec = distances[valid] * 3600.0
+
+    return idx1, idx2, sep_arcsec
+
+
+def validate_against_specz(
+    our_catalog: dict,
+    specz_catalog: dict,
+    max_sep_arcsec: float = 1.0,
+    outlier_threshold: float = 0.15,
+) -> dict:
+    """Validate our photo-z against spectroscopic redshifts.
+
+    Parameters
+    ----------
+    our_catalog : dict
+        Our catalog with 'ra', 'dec', 'redshift' keys
+    specz_catalog : dict
+        Spectroscopic catalog with 'ra', 'dec', 'z_spec' keys
+    max_sep_arcsec : float
+        Maximum separation for a match
+    outlier_threshold : float
+        Threshold for outlier definition in Δz/(1+z)
+
+    Returns
+    -------
+    dict
+        Validation results including metrics, matched sources, and comparison arrays
+    """
+    # Cross-match catalogs
+    idx_ours, idx_spec, separations = cross_match_catalogs(
+        our_catalog['ra'], our_catalog['dec'],
+        specz_catalog['ra'], specz_catalog['dec'],
+        max_sep_arcsec=max_sep_arcsec,
+    )
+
+    # Filter to sources with valid spec-z
+    z_spec = specz_catalog['z_spec'][idx_spec]
+    valid_specz = np.isfinite(z_spec) & (z_spec > 0)
+
+    idx_ours = idx_ours[valid_specz]
+    idx_spec = idx_spec[valid_specz]
+    z_spec = z_spec[valid_specz]
+    separations = separations[valid_specz]
+
+    # Get our photo-z for matched sources
+    z_phot = our_catalog['redshift'][idx_ours]
+
+    # Compute metrics
+    metrics = photoz_metrics(z_phot, z_spec, outlier_threshold)
+
+    return {
+        "n_matched": len(idx_ours),
+        "n_with_specz": len(z_spec),
+        "metrics": metrics,
+        "z_phot": z_phot,
+        "z_spec": z_spec,
+        "separations_arcsec": separations,
+        "idx_ours": idx_ours,
+        "idx_spec": idx_spec,
+    }

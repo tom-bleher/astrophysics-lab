@@ -14,7 +14,6 @@ Usage:
     python download_hdf_data.py
 """
 
-import os
 import sys
 from pathlib import Path
 
@@ -61,16 +60,15 @@ def download_file(url: str, dest_path: Path, description: str = "") -> bool:
 
         total_size = int(response.headers.get("content-length", 0))
 
-        with open(dest_path, "wb") as f:
-            with tqdm(
-                total=total_size,
-                unit="B",
-                unit_scale=True,
-                desc=description or dest_path.name,
-            ) as pbar:
-                for chunk in response.iter_content(chunk_size=8192):
-                    f.write(chunk)
-                    pbar.update(len(chunk))
+        with open(dest_path, "wb") as f, tqdm(
+            total=total_size,
+            unit="B",
+            unit_scale=True,
+            desc=description or dest_path.name,
+        ) as pbar:
+            for chunk in response.iter_content(chunk_size=8192):
+                f.write(chunk)
+                pbar.update(len(chunk))
 
         return True
     except requests.RequestException as e:
@@ -94,7 +92,7 @@ def download_hdf_mosaics(output_dir: Path, bands: list[str] | None = None) -> di
     print("\n" + "=" * 60)
     print("DOWNLOADING HDF-N v2 MOSAICS FROM STScI")
     print("=" * 60)
-    print(f"Resolution: 4096x4096 pixels, 0.04\"/pixel")
+    print("Resolution: 4096x4096 pixels, 0.04\"/pixel")
     print(f"Output directory: {output_dir}")
     print()
 
@@ -117,7 +115,7 @@ def download_hdf_mosaics(output_dir: Path, bands: list[str] | None = None) -> di
         if sci_path.exists():
             print(f"  Science image already exists: {sci_path}")
         else:
-            print(f"  Downloading science image...")
+            print("  Downloading science image...")
             if not download_file(sci_url, sci_path, f"{band}_sci"):
                 continue
 
@@ -125,7 +123,7 @@ def download_hdf_mosaics(output_dir: Path, bands: list[str] | None = None) -> di
         if wht_path.exists():
             print(f"  Weight map already exists: {wht_path}")
         else:
-            print(f"  Downloading weight map...")
+            print("  Downloading weight map...")
             if not download_file(wht_url, wht_path, f"{band}_wht"):
                 continue
 
@@ -197,18 +195,17 @@ def query_gaia_stars(
             parallax = row["parallax"]
             parallax_error = row["parallax_error"]
 
-            # Accept if parallax is significant and positive
-            if parallax is not None and parallax > 0.1:
-                # Check if parallax is statistically significant
-                if parallax_error is not None and parallax / parallax_error > 2:
-                    stars.append({
-                        "source_id": row["source_id"],
-                        "ra": float(row["ra"]),
-                        "dec": float(row["dec"]),
-                        "gmag": float(row["phot_g_mean_mag"]),
-                        "parallax": float(parallax),
-                        "parallax_error": float(parallax_error) if parallax_error else 0,
-                    })
+            # Accept if parallax is significant, positive, and statistically significant
+            if (parallax is not None and parallax > 0.1 and
+                    parallax_error is not None and parallax / parallax_error > 2):
+                stars.append({
+                    "source_id": row["source_id"],
+                    "ra": float(row["ra"]),
+                    "dec": float(row["dec"]),
+                    "gmag": float(row["phot_g_mean_mag"]),
+                    "parallax": float(parallax),
+                    "parallax_error": float(parallax_error) if parallax_error else 0,
+                })
 
         print(f"  Found {len(stars)} foreground stars with significant parallax")
         return stars
@@ -323,7 +320,7 @@ def create_star_mask(
 
     # Create circular masks
     stars_in_image = 0
-    for i, (x, y) in enumerate(zip(x_pixels, y_pixels)):
+    for _i, (x, y) in enumerate(zip(x_pixels, y_pixels, strict=False)):
         # Check if star is within image bounds
         if 0 <= x < shape[1] and 0 <= y < shape[0]:
             # Create circular mask using photutils aperture
@@ -421,7 +418,7 @@ def transform_mask_wcs(
         target_wcs = WCS(target_header)
     except Exception as e:
         print(f"  WCS creation failed: {e}")
-        print(f"  Falling back to simple upscaling")
+        print("  Falling back to simple upscaling")
         return upscale_mask(mask, target_shape)
 
     # Get masked pixel positions
@@ -461,14 +458,14 @@ def transform_mask_wcs(
 
     # Convert world coords to target pixel coords
     try:
-        from astropy.coordinates import SkyCoord
         from astropy import units as u
+        from astropy.coordinates import SkyCoord
 
         coords = SkyCoord(ra=ra * u.deg, dec=dec * u.deg)
         x_tgt, y_tgt = target_wcs.world_to_pixel(coords)
         x_tgt = np.array(x_tgt)
         y_tgt = np.array(y_tgt)
-        print(f"  Target WCS transformation successful")
+        print("  Target WCS transformation successful")
         print(f"  Target coords range: x=[{x_tgt.min():.1f}, {x_tgt.max():.1f}], y=[{y_tgt.min():.1f}, {y_tgt.max():.1f}]")
 
     except Exception as e:
@@ -673,7 +670,7 @@ def create_morphological_star_mask(
     star_catalog = []
 
     n_stars = 0
-    for i, (rh, label) in enumerate(zip(r_half, catalog.labels)):
+    for i, (rh, label) in enumerate(zip(r_half, catalog.labels, strict=False)):
         if np.isfinite(rh) and float(rh) < star_r_half_max and float(rh) > 0.5:
             # This is likely a star - add to mask
             star_mask |= (segm.data == label)
@@ -785,7 +782,7 @@ def create_full_combined_mask(
                     existing_mask, source_fits, fits_path, mask_radius_pix=3.0
                 )
             else:
-                print(f"  No matching source FITS found, using simple upscaling")
+                print("  No matching source FITS found, using simple upscaling")
                 existing_mask = upscale_mask(existing_mask, target_shape)
 
         combined_mask |= existing_mask
@@ -957,7 +954,7 @@ def main():
         # Determine which FITS file to use as reference
         if downloaded:
             # Use newly downloaded files
-            ref_band = list(downloaded.keys())[0]
+            ref_band = next(iter(downloaded.keys()))
             ref_fits = downloaded[ref_band][0]
         else:
             # Use existing files
@@ -981,7 +978,7 @@ def main():
         star_mask_path = data_dir / "star_mask.fits"
         combined_mask_path = data_dir / "combined_mask.fits"
 
-        print(f"\nCreating star mask...")
+        print("\nCreating star mask...")
         star_mask = create_star_mask(
             ref_fits,
             stars,
@@ -989,7 +986,7 @@ def main():
             output_path=star_mask_path,
         )
 
-        print(f"\nCreating combined mask...")
+        print("\nCreating combined mask...")
         combined_mask = create_combined_mask(
             ref_fits,
             stars,
@@ -998,7 +995,7 @@ def main():
             output_path=combined_mask_path,
         )
 
-        print(f"\nMask statistics:")
+        print("\nMask statistics:")
         print(f"  Star mask: {np.sum(star_mask)} pixels ({100*np.mean(star_mask):.2f}%)")
         print(f"  Combined mask: {np.sum(combined_mask)} pixels ({100*np.mean(combined_mask):.2f}%)")
 
@@ -1028,7 +1025,7 @@ def main():
         combined_mask_path = data_dir / "combined_mask.fits"
 
         # Create comprehensive mask with all methods
-        combined_mask, stats = create_full_combined_mask(
+        combined_mask, _stats = create_full_combined_mask(
             ref_fits,
             existing_mask_path=existing_mask,
             use_gaia=True,

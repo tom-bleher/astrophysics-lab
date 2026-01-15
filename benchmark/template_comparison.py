@@ -319,7 +319,7 @@ def plot_template_comparison_scatter(
     if reference_name not in results:
         raise ValueError(f"Reference '{reference_name}' not in results")
 
-    other_names = [n for n in results.keys() if n != reference_name]
+    other_names = [n for n in results if n != reference_name]
 
     if not other_names:
         raise ValueError("Need at least 2 template sets to compare")
@@ -341,8 +341,13 @@ def plot_template_comparison_scatter(
 
         ax.scatter(ref_z[valid], other_z[valid], alpha=0.3, s=10, c="steelblue")
 
-        z_max = max(ref_z[valid].max(), other_z[valid].max()) * 1.1
-        ax.plot([0, z_max], [0, z_max], "k--", lw=1.5)
+        # Dynamic limits with epsilon padding
+        z_min = min(ref_z[valid].min(), other_z[valid].min())
+        z_max = max(ref_z[valid].max(), other_z[valid].max())
+        z_padding = (z_max - z_min) * 0.08
+        z_lo = max(0, z_min - z_padding)
+        z_hi = z_max + z_padding
+        ax.plot([z_lo, z_hi], [z_lo, z_hi], "k--", lw=1.5)
 
         # Compute scatter
         dz = (other_z[valid] - ref_z[valid]) / (1 + ref_z[valid])
@@ -351,8 +356,8 @@ def plot_template_comparison_scatter(
         ax.set_xlabel(f"{reference_name} z")
         ax.set_ylabel(f"{name} z")
         ax.set_title(f"NMAD = {nmad:.4f}")
-        ax.set_xlim([0, z_max])
-        ax.set_ylim([0, z_max])
+        ax.set_xlim([z_lo, z_hi])
+        ax.set_ylim([z_lo, z_hi])
         ax.set_aspect("equal")
         ax.grid(True, alpha=0.3)
 
