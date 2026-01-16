@@ -1,79 +1,58 @@
 """Morphology module for galaxy size and shape measurements.
 
-This module provides tools for:
-- Sérsic profile fitting using PetroFit
+Provides:
 - Concentration index calculation
-- Star/galaxy classification (classical and ML-based)
 - Half-light radius measurements
-- Petrosian radius analysis
+- Zoobot deep learning morphology classification
 
 Example usage:
-    from morphology import measure_sersic_params, concentration_index
-    from morphology.star_galaxy import classify_star_galaxy
+    from morphology import concentration_index, half_light_radius
 
-    # Measure Sérsic parameters
-    params = measure_sersic_params(image, segm_map, source_id)
-    print(f"Effective radius: {params['r_eff']:.2f} pixels")
+    # Calculate concentration index
+    c = concentration_index(image, x, y)
 
-    # Classify stars vs galaxies (classical method)
-    is_galaxy = classify_star_galaxy(image, catalog)
+    # Calculate half-light radius
+    r = half_light_radius(image, x, y)
 
-    # ML-based classification
-    from morphology import MLStarGalaxyClassifier
-    clf = MLStarGalaxyClassifier.load("model.joblib")
-    results = clf.predict(features)
+    # Train morphology classifier from Zoobot embeddings
+    from morphology import ZoobotMorphologyClassifier, train_morphology_classifier
+    clf = train_morphology_classifier(catalog, label_column="visual_type")
+    catalog = clf.classify_catalog(catalog)
 """
 
 from morphology.concentration import (
     compute_morphology,
     compute_morphology_batch,
-    compute_morphology_batch_parallel,
     concentration_index,
     concentration_index_batch,
-    concentration_index_batch_parallel,
     half_light_radius,
     half_light_radius_batch,
-    half_light_radius_batch_parallel,
 )
-from morphology.ml_classifier import (
-    ClassificationResult,
-    ClassifierMetrics,
-    MLStarGalaxyClassifier,
-    extract_features_from_catalog,
-    extract_features_from_photometry,
+from morphology.zoobot_classify import (
+    ZOOBOT_AVAILABLE,
+    ZoobotMorphologyClassifier,
+    classify_by_sed_type,
+    classify_morphology,
+    extract_cutouts,
+    extract_embeddings,
+    train_morphology_classifier,
 )
-from morphology.sersic_fitting import (
-    SersicParams,
-    fit_sersic_profile,
-    measure_sersic_params,
-)
-from morphology.star_galaxy import (
-    classify_star_galaxy,
-    get_stellarity_index,
-)
+from morphology.star_classifier import classify_stars
 
 __all__ = [
-    # ML star-galaxy classification
-    "ClassificationResult",
-    "ClassifierMetrics",
-    "MLStarGalaxyClassifier",
-    "SersicParams",
-    # Classical star-galaxy classification
-    "classify_star_galaxy",
-    # Concentration and morphology
     "compute_morphology",
     "compute_morphology_batch",
-    "compute_morphology_batch_parallel",
     "concentration_index",
     "concentration_index_batch",
-    "concentration_index_batch_parallel",
     "half_light_radius",
     "half_light_radius_batch",
-    "half_light_radius_batch_parallel",
-    "extract_features_from_catalog",
-    "extract_features_from_photometry",
-    "fit_sersic_profile",
-    "get_stellarity_index",
-    # Sérsic fitting
-    "measure_sersic_params",
+    "classify_morphology",
+    "extract_cutouts",
+    "classify_stars",
+    # Zoobot embedding classification
+    "ZOOBOT_AVAILABLE",
+    "ZoobotMorphologyClassifier",
+    "train_morphology_classifier",
+    "extract_embeddings",
+    "classify_by_sed_type",
 ]

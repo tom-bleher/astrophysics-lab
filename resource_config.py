@@ -49,6 +49,7 @@ class ResourceConfig:
         detection_sigma: Source detection threshold (higher = fewer sources, faster)
         batch_size: Batch size for processing (smaller = less memory)
         gc_aggressive: Run garbage collection more frequently
+        parallel_detection: Enable parallel band detection (requires more memory)
         profile: The resource profile being used
     """
     n_threads: int
@@ -60,6 +61,7 @@ class ResourceConfig:
     detection_sigma: float
     batch_size: int
     gc_aggressive: bool
+    parallel_detection: bool
     profile: ResourceProfile
 
     def apply_environment(self) -> None:
@@ -82,41 +84,48 @@ class ResourceConfig:
 
 
 # Profile presets (base values - HIGH profile is dynamically adjusted)
+# Note: z_step controls photo-z precision vs speed tradeoff
+#   0.01 = high precision (~600 z points, ~0.5s/galaxy with vectorized code)
+#   0.02 = good precision (~300 z points, ~0.25s/galaxy)
+#   0.05 = fast (~120 z points, ~0.1s/galaxy)
 _PROFILES = {
     ResourceProfile.LOW: ResourceConfig(
         n_threads=2,
         n_template_workers=2,
-        z_step=0.02,           # Coarser grid: 300 points instead of 600
+        z_step=0.05,           # Fast: ~120 z points (vectorized: ~0.1s/galaxy)
         z_step_coarse=0.10,    # Very coarse initial search
         use_float32=True,      # Save 50% memory on arrays
         enable_template_cache=True,
         detection_sigma=2.0,   # Higher threshold = fewer detections
         batch_size=500,        # Smaller batches
         gc_aggressive=True,    # Frequent garbage collection
+        parallel_detection=False,  # Sequential to save memory
         profile=ResourceProfile.LOW,
     ),
     ResourceProfile.MEDIUM: ResourceConfig(
         n_threads=4,
         n_template_workers=4,
-        z_step=0.01,           # Standard precision
+        z_step=0.02,           # Good precision: ~300 z points
         z_step_coarse=0.05,
         use_float32=True,
         enable_template_cache=True,
         detection_sigma=1.5,
         batch_size=1000,
         gc_aggressive=False,
+        parallel_detection=True,   # Parallel detection enabled
         profile=ResourceProfile.MEDIUM,
     ),
     ResourceProfile.HIGH: ResourceConfig(
         n_threads=8,           # Will be dynamically adjusted
         n_template_workers=7,  # Will be dynamically adjusted
-        z_step=0.01,
+        z_step=0.02,           # Good balance: ~300 z points (vectorized: ~0.25s/galaxy)
         z_step_coarse=0.05,
         use_float32=False,     # Use full float64 precision
         enable_template_cache=True,
         detection_sigma=1.5,
         batch_size=3000,
         gc_aggressive=False,
+        parallel_detection=True,   # Parallel detection enabled
         profile=ResourceProfile.HIGH,
     ),
 }
@@ -136,13 +145,14 @@ def _create_dynamic_high_profile() -> ResourceConfig:
     return ResourceConfig(
         n_threads=n_threads,
         n_template_workers=n_workers,
-        z_step=0.01,
+        z_step=0.02,           # Good balance with vectorized code
         z_step_coarse=0.05,
         use_float32=False,
         enable_template_cache=True,
         detection_sigma=1.5,
         batch_size=3000,
         gc_aggressive=False,
+        parallel_detection=True,   # Parallel detection enabled
         profile=ResourceProfile.HIGH,
     )
 

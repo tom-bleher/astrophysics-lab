@@ -63,6 +63,7 @@ from photutils.segmentation import (
 from photutils.utils import calc_total_error
 from scipy import ndimage
 from scipy.spatial import cKDTree
+from tqdm.auto import tqdm
 
 from classify import (
     classify_batch_ultrafast,
@@ -80,8 +81,6 @@ from generate_filtered_binning import (
     generate_type_comparison_overlay,
     get_types_with_enough_statistics,
 )
-from morphology.professional_classification import classify_professional
-from morphology.star_galaxy import query_gaia_for_classification
 from scientific import (
     H0,
     D_A_LCDM_vectorized,
@@ -93,111 +92,27 @@ from scientific import (
     theta_lcdm_flat,
     theta_static,
 )
-from validation.external_crossmatch import apply_spectroscopic_redshifts, crossmatch_with_3dhst
+from morphology.zoobot_classify import extract_cutouts, classify_morphology
+from morphology.star_classifier import classify_stars
 
-# =============================================================================
-# Modern Methods Configuration (Optional Upgrades)
-# =============================================================================
-# These settings enable modern ML-enhanced methods for improved analysis.
-# Each can be toggled independently. Disabled by default for reproducibility.
-
-# Hybrid Photo-z: Combine template fitting with ML for improved redshifts
-# Requires training on spectroscopic sample (will auto-train if spec-z available)
-USE_HYBRID_PHOTOZ = True  # ML-enhanced photo-z enabled
-
-# Zoobot Morphology Validation: Cross-validate SED types with deep learning morphology
-USE_ZOOBOT_VALIDATION = True  # Enabled - validates galaxy morphologies with deep learning
-
-# Deep Learning Detection: Use CNN-enhanced source detection with artifact rejection
-# Provides star/galaxy/artifact classification at detection stage
-USE_DEEP_DETECTION = False  # Disabled - needs pre-trained weights to be useful
-
-# Hybrid Star-Galaxy Classification: Combine multiple methods (SPREAD_MODEL, ML, colors)
-# for more robust star-galaxy separation
-USE_HYBRID_CLASSIFICATION = True  # Enabled - combines multiple classification methods
-
-# Completeness Priority Mode: Use relaxed thresholds to prioritize galaxy completeness
-# over purity. Less harsh on faint sources - better for deep surveys.
-USE_COMPLETENESS_PRIORITY = True  # Enabled - less harsh, catches more faint galaxies
-
-# XGBoost ML Classifier: Use XGBoost instead of Random Forest for ML classification
-# XGBoost often outperforms RF for star-galaxy separation (Aguilar-Argüello et al. 2025)
-USE_XGBOOST_CLASSIFIER = True  # Enabled - better performance than Random Forest
-
-# Deep Learning Cosmic Ray Removal: Use deepCR neural network for CR detection
-# Superior to LACosmic for faint sources and single exposures (Zhang & Bloom 2020)
-USE_DEEPCR = False  # Disabled - requires CUDA GPU (enable if GPU available)
-
-# Morpheus Pixel-Level Segmentation: Per-pixel star/galaxy/artifact classification
-# Excellent for crowded fields and identifying merger components (Hausen & Robertson 2020)
-USE_MORPHEUS = True  # Enabled - pixel-level morphological classification
-
-# Import modules when enabled
-if USE_HYBRID_PHOTOZ:
-    from classify_hybrid import HybridPhotoZEstimator, train_hybrid_photoz_from_specz
-
-if USE_ZOOBOT_VALIDATION:
-    from validation.zoobot_morphology import (
-        extract_cutouts,
-        run_zoobot_predictions,
-        interpret_zoobot_predictions,
-        validate_morphology_with_zoobot,
-    )
-
-if USE_DEEP_DETECTION:
-    from detection import DeepSourceDetector, detect_sources_deep
-
-if USE_HYBRID_CLASSIFICATION:
-    from morphology.hybrid_classifier import (
-        HybridStarGalaxyClassifier,
-        HybridClassifierConfig,
-        create_hybrid_classifier,
-    )
-
-if USE_XGBOOST_CLASSIFIER:
-    from morphology.ml_classifier import create_classifier, XGBoostStarGalaxyClassifier
-
-# Import Zoobot star-galaxy classifier for hybrid classification (optional)
+# SEP detection backend (optional, faster alternative to photutils)
 try:
-    from morphology.deep_learning_classifier import (
-        ZoobotStarGalaxyClassifier,
-        check_zoobot_availability,
-    )
-    ZOOBOT_AVAILABLE = check_zoobot_availability()
+    from detection import SEP_AVAILABLE, detect_and_measure as sep_detect_and_measure
 except ImportError:
-    ZOOBOT_AVAILABLE = False
+    SEP_AVAILABLE = False
 
-# Import preprocessing modules (deepCR, Morpheus)
-if USE_DEEPCR:
-    try:
-        from preprocessing.cosmic_ray_removal import (
-            clean_cosmic_rays,
-            check_deepcr_availability,
-        )
-        DEEPCR_AVAILABLE = check_deepcr_availability()
-    except ImportError:
-        DEEPCR_AVAILABLE = False
-else:
-    DEEPCR_AVAILABLE = False
-
-if USE_MORPHEUS:
-    try:
-        from preprocessing.morpheus_segmentation import (
-            segment_image,
-            check_morpheus_availability,
-        )
-        MORPHEUS_AVAILABLE = check_morpheus_availability()
-    except ImportError:
-        MORPHEUS_AVAILABLE = False
-else:
-    MORPHEUS_AVAILABLE = False
-
-# Professional star-galaxy classification (research-standard)
-USE_PROFESSIONAL_CLASSIFICATION = True  # Set to False to use basic classification only
+# =============================================================================
+# Configuration
+# =============================================================================
 
 # Configuration
 PIXEL_SCALE = 0.04  # arcsec/pixel
 RAD_TO_ARCSEC = 180.0 * 3600.0 / np.pi  # ~206265 arcsec/radian
+
+# Photo-z redshift grid boundaries
+# z_min=0.05 prevents boundary pileup at z=0 from template fitting failures
+Z_MIN = 0.05  # Minimum redshift for photo-z fitting
+Z_MAX = 6.0   # Maximum redshift for photo-z fitting
 
 # Chip3 bounds within the 4096x4096 mosaic (from template matching)
 # Chip3 is 2048x2048, placed at offset (127, 184) after 180° rotation
@@ -212,9 +127,11 @@ CHIP3_Y_MIN, CHIP3_Y_MAX = 184, 2232  # 184 + 2048
 # - DrizzlePac Handbook: https://hst-docs.stsci.edu/drizzpac
 # - WFPC2 Instrument Handbook
 
-# WFPC2 gain for HDF observations (electrons per DN)
-# WF chips: 7 e-/DN, PC chip: 7 e-/DN (standard gain setting)
-WFPC2_GAIN = 7.0  # electrons per DN
+# WFPC2 gain for HDF observations
+# Note: The HDF v2 drizzled mosaics are in units of electrons/second, not DN
+# For drizzled data, gain should be None (background noise dominates)
+# Setting gain=None tells SEP to use only the background RMS for noise estimation
+WFPC2_GAIN = None  # None for drizzled e-/s data (not raw DN)
 
 # Drizzle correlated noise correction factor
 # HDF v2 used pixfrac=0.6, scale=0.5 (output pixel = 0.5x input)
@@ -298,6 +215,7 @@ FLAG_MASKED = 128       # Partially overlaps with masked region
 FLAG_UNRELIABLE_Z = 256 # Redshift error exceeds redshift (σ_z > z)
 FLAG_VERY_LOW_SNR = 512 # Very low SNR (median < 0.5) - unreliable photometry
 FLAG_HIGH_Z_UNRELIABLE = 1024  # High redshift (z > 2) with large uncertainty
+FLAG_CATASTROPHIC_PHOTOZ = 2048  # Photo-z catastrophic outlier (|Δz/(1+z)| > 0.15 vs spec-z)
 
 # Human-readable flag descriptions
 FLAG_DESCRIPTIONS = {
@@ -312,6 +230,7 @@ FLAG_DESCRIPTIONS = {
     FLAG_UNRELIABLE_Z: "unreliable_z",
     FLAG_VERY_LOW_SNR: "very_low_snr",
     FLAG_HIGH_Z_UNRELIABLE: "high_z_unreliable",
+    FLAG_CATASTROPHIC_PHOTOZ: "catastrophic_photoz",
 }
 
 
@@ -456,13 +375,18 @@ def check_stellar_colors_vectorized(
     # Shape: (n_sources, 3)
     colors = np.column_stack([color_ub, color_bv, color_vi])
 
-    # Compute scatter (std) and max color per source
-    # Use nanstd/nanmax to handle NaN values
-    color_scatter = np.nanstd(colors, axis=1)
-    max_color = np.nanmax(np.abs(colors), axis=1)
-
-    # Handle case where all colors are NaN (return 0 score)
+    # Handle case where all colors are NaN (check before computing stats)
     all_nan = np.all(np.isnan(colors), axis=1)
+
+    # Compute scatter (std) and max color per source
+    # Use nanstd/nanmax to handle NaN values, suppress expected warnings for all-NaN rows
+    with np.errstate(all='ignore'):
+        import warnings
+        with warnings.catch_warnings():
+            warnings.filterwarnings('ignore', 'All-NaN slice encountered')
+            warnings.filterwarnings('ignore', 'Degrees of freedom <= 0 for slice')
+            color_scatter = np.nanstd(colors, axis=1)
+            max_color = np.nanmax(np.abs(colors), axis=1)
 
     # Compute color score: 1 if flat colors, 0 if strong colors
     color_score = np.maximum(0, 1.0 - color_scatter / 1.0) * np.maximum(0, 1.0 - max_color / 2.0)
@@ -623,6 +547,76 @@ def aggregate_bins(sed_catalog):
     return binned
 
 
+class SEPCatalogWrapper:
+    """Wrapper to make SEP catalog output compatible with photutils SourceCatalog interface.
+
+    Provides the same interface expected by the cross-matching code:
+    - to_table().to_pandas() -> returns the catalog DataFrame
+    - fluxfrac_radius(frac) -> returns radius containing frac of flux
+    - labels -> segment labels
+    """
+
+    def __init__(
+        self,
+        catalog_df: pd.DataFrame,
+        segmentation: np.ndarray | None = None,
+        r_half: np.ndarray | None = None,
+        r_90: np.ndarray | None = None,
+    ):
+        self._catalog = catalog_df
+        self._segm = segmentation
+        if r_half is not None:
+            self._r_half = r_half
+        elif 'r_half' in catalog_df.columns:
+            self._r_half = catalog_df['r_half'].values
+        else:
+            self._r_half = np.full(len(catalog_df), np.nan)
+        if r_90 is not None:
+            self._r_90 = r_90
+        elif 'r_90' in catalog_df.columns:
+            self._r_90 = catalog_df['r_90'].values
+        else:
+            self._r_90 = np.full(len(catalog_df), np.nan)
+        # Labels are 1-indexed sequential for SEP
+        self._labels = np.arange(1, len(catalog_df) + 1)
+
+    def to_table(self):
+        """Return self to allow chaining .to_pandas()."""
+        return self
+
+    def to_pandas(self):
+        """Return the catalog as a pandas DataFrame."""
+        df = self._catalog.copy()
+        # Rename SEP columns to match photutils convention
+        if 'x' in df.columns and 'xcentroid' not in df.columns:
+            df = df.rename(columns={'x': 'xcentroid', 'y': 'ycentroid'})
+        return df
+
+    def fluxfrac_radius(self, fraction: float) -> np.ndarray:
+        """Return radius containing specified fraction of flux."""
+        if fraction <= 0.5:
+            return self._r_half
+        else:
+            return self._r_90
+
+    @property
+    def labels(self) -> np.ndarray:
+        """Return segment labels."""
+        return self._labels
+
+    def __len__(self):
+        return len(self._catalog)
+
+
+class SEPBackgroundWrapper:
+    """Wrapper to make SEP background compatible with photutils Background2D interface."""
+
+    def __init__(self, sep_background):
+        self.background = sep_background.background
+        self.background_rms = sep_background.background_rms
+        self.background_rms_median = float(np.median(sep_background.background_rms))
+
+
 @dataclass
 class AstroImage:
     data: np.ndarray
@@ -630,8 +624,8 @@ class AstroImage:
     band: str = ""
     weight: np.ndarray | None = None  # Inverse variance weight map
     segm: object | None = None
-    catalog: SourceCatalog | None = None
-    bkg: Background2D | None = None
+    catalog: SourceCatalog | SEPCatalogWrapper | None = None
+    bkg: Background2D | SEPBackgroundWrapper | None = None
 
     def get_variance(self) -> np.ndarray:
         """Get per-pixel variance from weight map (inverse variance)."""
@@ -673,31 +667,24 @@ def read_fits(file_path, weight_path=None, clean_cosmic_rays_flag=None, instrume
         Path to science FITS file
     weight_path : str, optional
         Path to weight (inverse variance) FITS file
-    clean_cosmic_rays_flag : bool, optional
-        Whether to clean cosmic rays. If None, uses USE_DEEPCR setting.
-    instrument : str, optional
-        HST instrument for deepCR threshold optimization. Default 'WFPC2'.
 
     Returns
     -------
     data : np.ndarray
-        Science image data (cleaned if CR removal enabled)
+        Science image data
     header : fits.Header
         FITS header
     weight : np.ndarray or None
         Weight map (inverse variance) if provided
     """
     # Use memory mapping for large files to reduce memory footprint
-    # memmap='r' loads data lazily, only reading chunks as needed
     with fits.open(file_path, memmap=True) as hdul:
         data = hdul[0].data
         header = hdul[0].header
         # Use native byte order for efficient numpy operations
-        # Note: This copies the data, but ensures optimal memory layout
         if data.dtype.byteorder == ">":
             data = data.astype(data.dtype.newbyteorder("="), copy=False)
         else:
-            # Force copy from mmap to regular array for subsequent operations
             data = np.array(data)
         data = adjust_data(data)
 
@@ -715,19 +702,6 @@ def read_fits(file_path, weight_path=None, clean_cosmic_rays_flag=None, instrume
         except FileNotFoundError:
             print(f"  Warning: Weight file not found: {weight_path}")
             weight = None
-
-    # Clean cosmic rays if enabled
-    do_cr_cleaning = clean_cosmic_rays_flag if clean_cosmic_rays_flag is not None else USE_DEEPCR
-    if do_cr_cleaning and DEEPCR_AVAILABLE:
-        print(f"  Cleaning cosmic rays from {Path(file_path).name}...")
-        data, cr_mask = clean_cosmic_rays(
-            data,
-            instrument=instrument,
-            verbose=True,
-        )
-        # Update weight map to downweight CR-affected pixels
-        if weight is not None:
-            weight[cr_mask] *= 0.1  # Reduce weight of inpainted pixels
 
     return data, header, weight
 
@@ -766,6 +740,14 @@ def analyze_and_plot_catalog(
     os.makedirs(output_dir, exist_ok=True)
 
     sed_catalog_analysis = sed_catalog_filtered
+
+    # Exclude z_boundary_flag sources from analysis (photo-z boundary failures)
+    if "z_boundary_flag" in sed_catalog_analysis.columns:
+        n_before = len(sed_catalog_analysis)
+        sed_catalog_analysis = sed_catalog_analysis[sed_catalog_analysis["z_boundary_flag"] == False].copy()
+        n_excluded = n_before - len(sed_catalog_analysis)
+        if n_excluded > 0:
+            print(f"  Excluded {n_excluded} sources with z_boundary_flag=True (photo-z boundary failures)")
 
     if len(sed_catalog_analysis) == 0:
         print("  No sources to analyze after filtering!")
@@ -1336,22 +1318,16 @@ def analyze_and_plot_catalog(
 
     # Plot 8 & 9: Source detection and final selection (if images provided)
     if images is not None and len(images) > 0:
-        # Prepare catalog for plotting - adjust coordinates if cropping
-        plot_catalog = sed_catalog.copy()
+        # Prepare catalog for plotting - use FILTERED catalog to match saved CSV
+        plot_catalog = sed_catalog_analysis.copy()
         if crop_bounds is not None:
             x_min, x_max, y_min, y_max = crop_bounds
             plot_catalog["xcentroid"] = plot_catalog["xcentroid"] - x_min
             plot_catalog["ycentroid"] = plot_catalog["ycentroid"] - y_min
 
-        # Classify sources for plotting
-        is_in_mask = plot_catalog["in_star_mask"] if "in_star_mask" in plot_catalog.columns else pd.Series([False] * len(plot_catalog))
-        is_psf_like = (plot_catalog["quality_flag"].astype(int) & FLAG_PSF_LIKE) != 0
-        is_detected_star = is_psf_like & ~is_in_mask
-        is_galaxy = ~is_psf_like & ~is_in_mask
-
-        n_galaxies = is_galaxy.sum()
-        is_detected_star.sum()
-        is_in_mask.sum()
+        # Count galaxies from the filtered catalog (all sources in filtered catalog are galaxies)
+        # since FLAG_PSF_LIKE sources are already excluded by quality filtering
+        n_galaxies = len(plot_catalog)
 
         # Crop images if bounds provided
         plot_images = []
@@ -1368,28 +1344,67 @@ def analyze_and_plot_catalog(
             else:
                 plot_images.append(img)
 
-        # Plot 8: Final selection
+        # Plot 8: Final selection showing galaxies, detected stars, and mask stars
+        # Prepare full catalog for star plotting (need to identify stars from full catalog)
+        plot_full_catalog = sed_catalog.copy()
+        if crop_bounds is not None:
+            x_min, x_max, y_min, y_max = crop_bounds
+            plot_full_catalog["xcentroid"] = plot_full_catalog["xcentroid"] - x_min
+            plot_full_catalog["ycentroid"] = plot_full_catalog["ycentroid"] - y_min
+
+        # Identify different source types from the FULL catalog
+        in_mask = plot_full_catalog["in_star_mask"].fillna(False).astype(bool) if "in_star_mask" in plot_full_catalog.columns else pd.Series([False] * len(plot_full_catalog))
+        has_psf_flag = (plot_full_catalog["quality_flag"].astype(int) & FLAG_PSF_LIKE) != 0
+
+        # Mask stars: sources in star mask
+        mask_stars = plot_full_catalog[in_mask]
+        n_mask_stars = len(mask_stars)
+
+        # Detected stars: sources with PSF-like flag but NOT in mask
+        detected_stars = plot_full_catalog[has_psf_flag & ~in_mask]
+        n_detected_stars = len(detected_stars)
+
         _fig, axes = plt.subplots(2, 2, figsize=(12, 12))
         for idx, image in enumerate(plot_images):
             ax = axes[idx // 2, idx % 2]
             vmin, vmax = np.percentile(image.data, [20, 99])
             ax.imshow(image.data, cmap="gray_r", vmin=vmin, vmax=vmax, origin="lower")
 
+            # Plot galaxies (green)
             if n_galaxies > 0:
                 ax.scatter(
-                    plot_catalog.loc[is_galaxy, "xcentroid"],
-                    plot_catalog.loc[is_galaxy, "ycentroid"],
-                    s=10, facecolors="none", edgecolors="red", linewidth=0.5,
+                    plot_catalog["xcentroid"],
+                    plot_catalog["ycentroid"],
+                    s=10, facecolors="none", edgecolors="green", linewidth=0.5,
+                    label=f"Galaxies ({n_galaxies})"
                 )
 
-            ax.set_title(
-                f"Band {image.band.upper()} -- {n_galaxies} galaxies",
-                fontsize=9,
-            )
+            # Plot detected stars (blue)
+            if n_detected_stars > 0:
+                ax.scatter(
+                    detected_stars["xcentroid"],
+                    detected_stars["ycentroid"],
+                    s=15, facecolors="none", edgecolors="blue", linewidth=0.7,
+                    label=f"Detected stars ({n_detected_stars})"
+                )
+
+            # Plot mask stars (red)
+            if n_mask_stars > 0:
+                ax.scatter(
+                    mask_stars["xcentroid"],
+                    mask_stars["ycentroid"],
+                    s=20, facecolors="none", edgecolors="red", linewidth=0.9,
+                    label=f"Mask stars ({n_mask_stars})"
+                )
+
+            ax.set_title(f"Band {image.band.upper()}", fontsize=9)
             ax.set_xlabel(r"X (pixels)")
             ax.set_ylabel(r"Y (pixels)")
+            if idx == 0:
+                ax.legend(loc="upper right", fontsize=7)
 
-        plt.suptitle(f"Final Selection{title_suffix} ({n_galaxies} galaxies)", fontsize=14, fontweight="bold", y=1.01)
+        plt.suptitle(f"Final Selection{title_suffix}\n({n_galaxies} galaxies, {n_detected_stars} detected stars, {n_mask_stars} mask stars)",
+                     fontsize=12, fontweight="bold", y=1.02)
         plt.tight_layout()
         plt.savefig(f"{output_dir}/final_selection.pdf", dpi=150, bbox_inches="tight")
         plt.close()
@@ -1749,13 +1764,21 @@ def aperture_photometry_with_local_background(
     }
 
 
-def main(mode: str = "full", output_subdir: str | None = None):
+def main(
+    mode: str = "full",
+    output_subdir: str | None = None,
+    use_additional_star_detection: bool = True,
+    detection_backend: str = "photutils",
+):
     """
     Run the analysis pipeline.
 
     Args:
         mode: "full" for entire 4096x4096 image, "chip3" for 2048x2048 chip3 only
         output_subdir: Optional subdirectory within output/{mode}_HDF/ (e.g., "full_z")
+        use_additional_star_detection: If True, use stellarity/morphology criteria in addition
+            to the star mask. If False, only use the star mask for star identification.
+        detection_backend: "photutils" (default) or "sep" for SExtractor-based detection.
     """
     # Set output directory based on mode and optional subdirectory
     # Mode naming: full -> full_HDF, chip3 -> chip3_HDF
@@ -1766,6 +1789,11 @@ def main(mode: str = "full", output_subdir: str | None = None):
     print("=" * 60)
     print("ANGULAR SIZE TEST ANALYSIS")
     print(f"Mode: {mode}")
+    if use_additional_star_detection:
+        star_detection_mode = "mask + detection everywhere"
+    else:
+        star_detection_mode = "mask only in chip3, detection outside"
+    print(f"Star detection: {star_detection_mode}")
     if output_subdir:
         print(f"Output: {output_dir}")
     print("=" * 60)
@@ -1859,8 +1887,15 @@ def main(mode: str = "full", output_subdir: str | None = None):
             star_mask_centers.append((cx, cy))
         print(f"  Star mask has {n_regions} regions (course staff identified stars)")
 
-    # No detection mask - sources in star regions are detected and flagged via star_mask
-    mask = np.zeros(image_shape, dtype=bool)
+    # Create mask for zero-coverage regions in drizzled mosaic
+    # These are regions where no input images contributed (exactly 0 in all bands)
+    # Mask pixels that are zero in ALL bands (no coverage)
+    zero_coverage_mask = np.ones(image_shape, dtype=bool)
+    for img in images:
+        zero_coverage_mask &= (img.data == 0)
+    n_masked = zero_coverage_mask.sum()
+    print(f"  Zero-coverage mask: {n_masked} pixels ({100*n_masked/zero_coverage_mask.size:.1f}% of image)")
+    mask = zero_coverage_mask
 
     # Step 2: Source detection using adaptive PSF-based parameters
     print("\n[2/6] Detecting sources (adaptive PSF-based method)...")
@@ -1882,8 +1917,10 @@ def main(mode: str = "full", output_subdir: str | None = None):
     # Scale npixels with image resolution (larger images have more pixels per source)
     def get_adaptive_npixels(image_shape, base_npixels):
         """Calculate adaptive npixels based on image resolution."""
-        # Scale factor: 1.0 for 2048, 2.0 for 4096
-        scale = image_shape[0] / 2048.0
+        # Use sqrt scaling - linear scaling (2x for 4096) was too aggressive
+        # and caused zero detections in low-SNR bands like UV (f300)
+        # sqrt scaling: 1.0 for 2048, 1.41 for 4096
+        scale = np.sqrt(image_shape[0] / 2048.0)
         return int(base_npixels * scale)
 
     # Detection threshold: sigma above background RMS
@@ -1906,8 +1943,8 @@ def main(mode: str = "full", output_subdir: str | None = None):
 
     # Process bands SEQUENTIALLY to minimize memory usage
     # (Parallel processing requires holding multiple convolved arrays in memory)
-    def process_band(image):
-        """Process a single band for source detection."""
+    def process_band_photutils(image):
+        """Process a single band for source detection using photutils."""
         import gc as gc_local
 
         bkg_estimator = MedianBackground()
@@ -1936,7 +1973,7 @@ def main(mode: str = "full", output_subdir: str | None = None):
         image.segm = finder(convolved_data, threshold, mask=mask)
 
         if image.segm is not None and mask is not None:
-            masked_labels = np.unique(image.segm.data[mask])
+            masked_labels = np.unique(np.asarray(image.segm)[mask])
             masked_labels = masked_labels[masked_labels != 0]
             if len(masked_labels) > 0:
                 image.segm.remove_labels(masked_labels)
@@ -1950,11 +1987,154 @@ def main(mode: str = "full", output_subdir: str | None = None):
 
         return image.band, len(image.catalog), npixels
 
-    # Process bands sequentially to minimize peak memory usage
-    print(f"  Processing {len(images)} bands sequentially (memory-optimized)...")
+    # Reference band for statmorph computation (best S/N band)
+    STATMORPH_BAND = "f450"  # B band - deepest for morphology
+
+    def process_band_sep(image):
+        """Process a single band for source detection using SEP (SExtractor)."""
+        import gc as gc_local
+        from detection import detect_sources_sep, kron_photometry, compute_half_light_radius
+
+        box_size = 128 if image.data.shape[0] > 2048 else 64
+        npixels = get_adaptive_npixels(image.data.shape, BASE_NPIXELS)
+
+        # Run SEP detection
+        result = detect_sources_sep(
+            image.data,
+            threshold=DETECTION_SIGMA,
+            min_area=npixels,
+            mask=mask.astype(np.uint8) if mask is not None else None,
+            gain=WFPC2_GAIN,
+            box_size=box_size,
+            filter_size=5,
+            deblend_nthresh=NLEVELS,
+            deblend_cont=CONTRAST,
+            segmentation_map=True,
+        )
+
+        if result.n_sources == 0:
+            # Add expected columns to empty catalog for compatibility
+            empty_catalog = result.catalog.copy()
+            for col in ['flux_auto', 'flux_auto_err', 'segment_flux', 'segment_fluxerr', 'r_half']:
+                if col not in empty_catalog.columns:
+                    empty_catalog[col] = pd.Series(dtype=np.float64)
+            image.bkg = SEPBackgroundWrapper(result.background)
+            image.segm = result.segmentation
+            image.catalog = SEPCatalogWrapper(empty_catalog)
+            return image.band, 0, npixels
+
+        # Get background-subtracted data for photometry
+        data_sub = image.data - result.background.background
+
+        # Compute Kron photometry (AUTO magnitudes)
+        catalog = kron_photometry(
+            data_sub,
+            result.catalog,
+            result.background.background_rms,
+            gain=WFPC2_GAIN,
+            mask=mask.astype(np.uint8) if mask is not None else None,
+        )
+
+        # Compute r_half and r_90 together using vectorized function
+        # This computes both radii efficiently by reusing the flux grid
+        from detection.sep_detection import compute_flux_radii
+        flux_radii = compute_flux_radii(
+            data_sub,
+            catalog,
+            result.background.background_rms,
+            fractions=(0.5, 0.9),
+            mask=mask.astype(np.uint8) if mask is not None else None,
+        )
+        catalog['r_half'] = flux_radii[0.5]
+        r_90 = flux_radii[0.9]
+
+        # Compute statmorph morphology for reference band only
+        # This provides gini, m20, sersic_n for star/galaxy classification
+        if image.band == STATMORPH_BAND and result.segmentation is not None:
+            from detection import compute_statmorph, STATMORPH_AVAILABLE
+            if STATMORPH_AVAILABLE:
+                print(f"  Computing statmorph morphology for {image.band} band...")
+                # Use gain=1.0 for drizzled e-/s data (WFPC2_GAIN is None for drizzled)
+                # Statmorph needs gain for noise estimation; 1.0 is reasonable for e-/s units
+                statmorph_gain = WFPC2_GAIN if WFPC2_GAIN is not None else 1.0
+                catalog = compute_statmorph(
+                    data_sub,
+                    result.segmentation,
+                    catalog,
+                    gain=statmorph_gain,
+                    psf_fwhm=PSF_FWHM_PIX,
+                )
+
+        # Add columns expected by rest of pipeline
+        catalog['segment_flux'] = catalog['flux_auto']
+        catalog['segment_fluxerr'] = catalog['flux_auto_err']
+
+        # Wrap in compatible interface
+        image.bkg = SEPBackgroundWrapper(result.background)
+        image.segm = result.segmentation
+        image.catalog = SEPCatalogWrapper(
+            catalog,
+            segmentation=result.segmentation,
+            r_half=catalog['r_half'].values,
+            r_90=r_90,
+        )
+
+        del data_sub
+        gc_local.collect()
+
+        return image.band, len(image.catalog), npixels
+
+    # Choose detection backend
+    if detection_backend == "sep" and SEP_AVAILABLE:
+        process_band = process_band_sep
+        print(f"  Using SEP (SExtractor) detection backend")
+    else:
+        process_band = process_band_photutils
+        print(f"  Using photutils detection backend")
+
+    # DEBUG: Print data statistics to diagnose detection issues
+    print("  DEBUG: Data statistics before detection:")
     for img in images:
-        band, n_sources, npixels = process_band(img)
-        print(f"  Band {band}: {n_sources} sources (npixels={npixels})")
+        data = img.data
+        finite_data = data[np.isfinite(data)]
+        n_finite = len(finite_data)
+        n_positive = (finite_data > 0).sum()
+        n_zero = (data == 0).sum()
+        print(f"    {img.band}: shape={data.shape}, finite={n_finite}/{data.size} ({100*n_finite/data.size:.1f}%), "
+              f">0={n_positive}, zero={n_zero}, min={np.nanmin(data):.2f}, max={np.nanmax(data):.2f}, "
+              f"median={np.nanmedian(data):.4f}, std={np.nanstd(data):.4f}")
+
+    # Check if parallel detection is enabled (based on resource profile)
+    if _RESOURCE_CONFIG.parallel_detection and len(images) > 1:
+        # Parallel band detection using ThreadPoolExecutor
+        # ThreadPool is preferred over ProcessPool here because:
+        # 1. numpy/sep release the GIL during computation
+        # 2. Avoids serialization overhead for large image arrays
+        # 3. Shared memory access to image data
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        n_workers = min(len(images), _RESOURCE_CONFIG.n_threads)
+        print(f"  Processing {len(images)} bands in parallel ({n_workers} workers)...")
+
+        results = {}
+        with ThreadPoolExecutor(max_workers=n_workers) as executor:
+            future_to_img = {executor.submit(process_band, img): img for img in images}
+            for future in tqdm(as_completed(future_to_img), total=len(images),
+                               desc="  Detecting sources", unit="band"):
+                img = future_to_img[future]
+                try:
+                    band, n_sources, npixels = future.result()
+                    results[band] = (n_sources, npixels)
+                    tqdm.write(f"  Band {band}: {n_sources} sources (npixels={npixels})")
+                except Exception as e:
+                    tqdm.write(f"  Band {img.band}: FAILED - {e}")
+                    raise
+    else:
+        # Sequential processing to minimize peak memory usage
+        print(f"  Processing {len(images)} bands sequentially (memory-optimized)...")
+        for img in tqdm(images, desc="  Detecting sources", unit="band"):
+            band, n_sources, npixels = process_band(img)
+            tqdm.write(f"  Band {band}: {n_sources} sources (npixels={npixels})")
 
     # Step 3: Cross-match sources
     print("\n[3/6] Cross-matching sources across bands...")
@@ -1971,8 +2151,8 @@ def main(mode: str = "full", output_subdir: str | None = None):
 
     # Process each image and IMMEDIATELY release its heavy data to save memory
     # This is critical for low-memory systems
-    for image in images:
-        print(f"    Processing {image.band} band catalog...")
+    for image in tqdm(images, desc="  Processing bands", unit="band"):
+        tqdm.write(f"    Processing {image.band} band catalog...")
 
         # Extract catalog data to pandas
         cat = image.catalog.to_table().to_pandas()
@@ -2000,7 +2180,7 @@ def main(mode: str = "full", output_subdir: str | None = None):
         # The weight map provides per-pixel inverse variance from drizzle combination
 
         labels = image.catalog.labels
-        segm_data = image.segm.data
+        segm_data = np.asarray(image.segm)
         bkg_rms = image.bkg.background_rms_median
 
         # Count pixels per segment using bincount
@@ -2024,7 +2204,8 @@ def main(mode: str = "full", output_subdir: str | None = None):
             # HDF weight maps are inverse variance, but we add explicit Poisson term
             # to ensure shot noise is properly accounted for
             source_flux = np.abs(cat["segment_flux"].to_numpy())
-            poisson_var = source_flux / WFPC2_GAIN
+            # Skip Poisson term for drizzled data (WFPC2_GAIN=None) - already in e-/s units
+            poisson_var = source_flux / WFPC2_GAIN if WFPC2_GAIN is not None else 0.0
 
             # Component 2: Sky variance in aperture
             sky_var = segment_areas * bkg_rms**2
@@ -2048,7 +2229,8 @@ def main(mode: str = "full", output_subdir: str | None = None):
             source_flux = np.abs(cat["segment_flux"].to_numpy())
             segment_areas = cat["area"].to_numpy()
 
-            poisson_var = source_flux / WFPC2_GAIN
+            # Skip Poisson term for drizzled data (WFPC2_GAIN=None) - already in e-/s units
+            poisson_var = source_flux / WFPC2_GAIN if WFPC2_GAIN is not None else 0.0
             sky_var = segment_areas * bkg_rms**2
             nsky = segment_areas * SKY_ANNULUS_FACTOR
             sky_uncertainty_var = (segment_areas**2 * bkg_rms**2) / np.maximum(nsky, 1.0)
@@ -2070,20 +2252,23 @@ def main(mode: str = "full", output_subdir: str | None = None):
             cat["ellipticity"] = np.float32(np.nan)
 
         # Store only the columns we need (float32 to save memory)
-        band_catalogs[image.band] = cat[
-            [
-                "xcentroid",
-                "ycentroid",
-                "source_sky",
-                "source_error",
-                "r_half_pix",
-                "r_half_pix_error",
-                "r_90_pix",
-                "concentration",
-                "snr",
-                "ellipticity",
-            ]
-        ].copy()
+        # Include statmorph columns if they exist
+        base_cols = [
+            "xcentroid",
+            "ycentroid",
+            "source_sky",
+            "source_error",
+            "r_half_pix",
+            "r_half_pix_error",
+            "r_90_pix",
+            "concentration",
+            "snr",
+            "ellipticity",
+        ]
+        # Add statmorph columns if present (only for reference band)
+        statmorph_cols = ['gini', 'm20', 'sersic_n', 'asymmetry', 'smoothness', 'statmorph_flag']
+        cols_to_store = base_cols + [c for c in statmorph_cols if c in cat.columns]
+        band_catalogs[image.band] = cat[cols_to_store].copy()
 
         # CRITICAL: Release heavy memory from this image immediately
         # This frees ~500MB per image (weight map, segm, catalog, bkg)
@@ -2122,9 +2307,9 @@ def main(mode: str = "full", output_subdir: str | None = None):
     image_shape = images[0].data.shape
 
     # Minimum number of bands required for a valid detection
-    # For reliable photo-z, we need all 4 bands (U, B, V, I)
-    # 3-band detections have much higher photo-z failure rates
-    MIN_BANDS_REQUIRED = 4  # Require all 4 bands for reliable photo-z
+    # 3 bands (B, V, I) sufficient for basic photo-z; UV (f300) often too shallow
+    # Sources with all 4 bands will have more reliable photo-z estimates
+    MIN_BANDS_REQUIRED = 3  # Accept 3+ bands; flag 4-band sources as higher quality
 
     # ==========================================================================
     # OPTIMIZATION: Vectorized batch KD-tree queries (2-3x faster than loop)
@@ -2146,6 +2331,15 @@ def main(mode: str = "full", output_subdir: str | None = None):
     ref_concentration = ref_cat["concentration"].values
     ref_snr = ref_cat["snr"].values
     ref_ellipticity = ref_cat["ellipticity"].values
+
+    # Statmorph columns from reference band (may not exist if statmorph unavailable)
+    statmorph_cols = ['gini', 'm20', 'sersic_n', 'asymmetry', 'smoothness', 'statmorph_flag']
+    ref_statmorph = {}
+    for col in statmorph_cols:
+        if col in ref_cat.columns:
+            ref_statmorph[col] = ref_cat[col].values
+        else:
+            ref_statmorph[col] = None
 
     # Pre-extract other band arrays
     band_arrays = {}
@@ -2215,6 +2409,13 @@ def main(mode: str = "full", output_subdir: str | None = None):
             matches["snr_median"] = np.median(snr_values)
             matches["snr_min"] = np.min(snr_values)  # Weakest detection
 
+            # Add statmorph morphology from reference band (if available)
+            for col in statmorph_cols:
+                if ref_statmorph[col] is not None:
+                    matches[col] = ref_statmorph[col][idx]
+                else:
+                    matches[col] = np.nan
+
             # Apply PSF correction to half-light radius
             # r_intrinsic² ≈ r_measured² - r_psf² (quadrature subtraction)
             r_half_corrected = correct_radius_for_psf(matches["r_half_pix"], PSF_SIGMA_PIX)
@@ -2263,30 +2464,33 @@ def main(mode: str = "full", output_subdir: str | None = None):
 
             is_star = False
 
-            # PSF half-light radius (Gaussian approximation: r_half ≈ 0.42 * FWHM)
-            psf_r_half_pix = PSF_FWHM_PIX * 0.42  # ~0.95 pixels for HST ACS
+            # Additional star detection via morphology/stellarity
+            if use_additional_star_detection:
+                # PSF half-light radius (Gaussian approximation: r_half ≈ 0.42 * FWHM)
+                psf_r_half_pix = PSF_FWHM_PIX * 0.42  # ~0.95 pixels for HST ACS
 
-            # Size ratio: how many times larger than PSF
-            size_ratio = matches["r_half_pix"] / psf_r_half_pix if psf_r_half_pix > 0 else 999
+                # Size ratio: how many times larger than PSF
+                size_ratio = matches["r_half_pix"] / psf_r_half_pix if psf_r_half_pix > 0 else 999
 
-            # Criterion 1: Very high stellarity (confident star classification)
-            # SExtractor recommends > 0.95, we use 0.8 as compromise
-            if matches["stellarity"] > 0.8:
-                is_star = True
-
-            # Criterion 2: Compact + round + concentrated (all three required)
-            # This catches stars that have moderate stellarity but clear point-source morphology
-            elif size_ratio < 1.8:  # Very compact (within 1.8x PSF size)
-                is_round = matches["ellipticity"] < 0.2  # Stars are very round
-                is_concentrated = matches["concentration"] > 0.45  # High light concentration
-                if is_round and is_concentrated:
+                # Criterion 1: High stellarity (star classification)
+                # Our stellarity metric ranges 0-0.5 for this data, so use 0.35 threshold
+                # (SExtractor CLASS_STAR uses 0.8-0.95, but our metric is different)
+                if matches["stellarity"] > 0.35:
                     is_star = True
 
-            # Criterion 3: Stellar colors + compact morphology
-            # (handled separately in color_stellarity check later)
+                # Criterion 2: Compact + round + concentrated (all three required)
+                # This catches stars that have moderate stellarity but clear point-source morphology
+                elif size_ratio < 2.5:  # Compact (within 2.5x PSF size, relaxed from 1.8)
+                    is_round = matches["ellipticity"] < 0.25  # Stars are fairly round
+                    is_concentrated = matches["concentration"] > 0.40  # Moderate light concentration
+                    if is_round and is_concentrated:
+                        is_star = True
 
-            if is_star:
-                flag |= FLAG_PSF_LIKE
+                # Criterion 3: Stellar colors + compact morphology
+                # (handled separately in color_stellarity check later)
+
+                if is_star:
+                    flag |= FLAG_PSF_LIKE
 
             # Check if source is inside star mask OR near a mask region center
             # Sources in/near these regions are forced to be classified as stars
@@ -2314,6 +2518,21 @@ def main(mode: str = "full", output_subdir: str | None = None):
             matched_sources.append(matches)
 
     cross_matched_catalog = pd.DataFrame(matched_sources)
+
+    # Guard against empty cross-match results
+    if len(cross_matched_catalog) == 0:
+        print(f"  WARNING: No sources matched across ≥{MIN_BANDS_REQUIRED} bands!")
+        print("  Detection counts per band:")
+        for band, cat in band_catalogs.items():
+            print(f"    {band}: {len(cat)} sources")
+        raise ValueError(
+            f"Cross-matching produced 0 sources. This typically means:\n"
+            f"  1. Too few detections in one or more bands (especially UV/f300)\n"
+            f"  2. MIN_BANDS_REQUIRED={MIN_BANDS_REQUIRED} is too strict\n"
+            f"  3. Detection parameters (npixels, threshold) are too conservative\n"
+            f"Try reducing MIN_BANDS_REQUIRED to 3, or check detection parameters."
+        )
+
     n_4band = (cross_matched_catalog["n_bands"] == 4).sum()
     n_3band = (cross_matched_catalog["n_bands"] == 3).sum()
     print(f"  Cross-matched: {len(cross_matched_catalog)} sources (≥{MIN_BANDS_REQUIRED} bands)")
@@ -2328,6 +2547,9 @@ def main(mode: str = "full", output_subdir: str | None = None):
     print(f"  Quality flags: {n_clean} clean, {n_low_snr} low_snr, {n_edge} edge, {n_psf_like} psf_like")
     if n_in_star_mask > 0:
         print(f"  Star mask: {n_in_star_mask} sources flagged as stars (from course staff mask)")
+    # Debug: show detected stars breakdown
+    n_detected_stars = n_psf_like - n_in_star_mask
+    print(f"  Detected stars (morphology, not in mask): {n_detected_stars}")
 
     # Add FLAG_MASKED to sources inside the star mask (known stars from class)
     if "in_star_mask" in cross_matched_catalog.columns:
@@ -2347,11 +2569,22 @@ def main(mode: str = "full", output_subdir: str | None = None):
     }
 
     # Build SED catalog using vectorized operations (much faster than iterrows)
-    sed_catalog = cross_matched_catalog[[
+    # Include statmorph columns if available
+    base_cols = [
         "r_half_pix", "r_half_pix_error", "r_half_pix_corrected",
         "xcentroid", "ycentroid", "concentration", "ellipticity", "stellarity",
         "snr_median", "snr_min", "quality_flag", "in_star_mask"
-    ]].copy()
+    ]
+    # Add statmorph columns if they exist in cross_matched_catalog
+    statmorph_cols_to_add = ['gini', 'm20', 'sersic_n', 'asymmetry', 'smoothness', 'statmorph_flag']
+    for col in statmorph_cols_to_add:
+        if col in cross_matched_catalog.columns:
+            base_cols.append(col)
+
+    sed_catalog = cross_matched_catalog[base_cols].copy()
+
+    # Add half_light_radius column for star classifier (alias for r_half_pix)
+    sed_catalog["half_light_radius"] = sed_catalog["r_half_pix"]
 
     # Vectorized flux conversion for all bands
     for band in ["f450", "f814", "f300", "f606"]:
@@ -2383,6 +2616,74 @@ def main(mode: str = "full", output_subdir: str | None = None):
         sed_catalog["dec"] = HDF_CENTER_DEC + (sed_catalog["ycentroid"] - center_y) * PIXEL_SCALE / 3600.0
         print("  Added approximate sky coordinates (no WCS available)")
 
+    # ==========================================================================
+    # ZEROPOINT CALIBRATION (using spectroscopic redshifts)
+    # This corrects systematic offsets in the photometry before photo-z fitting
+    # NOTE: Testing showed offsets are <0.05 mag (well-calibrated), so this is
+    # disabled by default. The poor photo-z quality is due to template/degeneracy
+    # issues with only 4 bands, not zeropoint calibration.
+    # ==========================================================================
+    USE_ZEROPOINT_CALIBRATION = True  # Enable zeropoint calibration
+
+    if USE_ZEROPOINT_CALIBRATION:
+        try:
+            from validation.specz_validation import load_specz_catalogs, cross_match_with_specz
+            from validation.zeropoint_calibration import (
+                derive_zeropoint_offsets,
+                apply_zeropoint_corrections,
+                save_zeropoint_file,
+            )
+
+            print("\n  === Photometric Zeropoint Calibration ===")
+
+            # Load spectroscopic catalogs for calibration
+            specz_catalogs_cal = load_specz_catalogs()
+
+            if specz_catalogs_cal:
+                # Cross-match to get spec-z for calibration
+                sed_catalog = cross_match_with_specz(sed_catalog, specz_catalogs_cal, match_radius=1.0)
+
+                # Check if we have enough calibrators
+                n_specz = sed_catalog["z_spec"].notna().sum()
+                print(f"  Found {n_specz} spec-z matches for zeropoint calibration")
+
+                if n_specz >= 20:  # Need minimum calibrators
+                    # Derive zeropoint offsets
+                    flux_cols = ("flux_f300", "flux_f450", "flux_f606", "flux_f814")
+                    error_cols = ("error_f300", "error_f450", "error_f606", "error_f814")
+
+                    offsets = derive_zeropoint_offsets(
+                        sed_catalog,
+                        flux_columns=flux_cols,
+                        z_spec_column="z_spec",
+                        template_path="./spectra",
+                        min_calibrators=10,
+                    )
+
+                    if offsets.converged:
+                        # Apply corrections to ALL sources
+                        print("  Applying zeropoint corrections to photometry...")
+                        sed_catalog = apply_zeropoint_corrections(
+                            sed_catalog, offsets, flux_cols, error_cols
+                        )
+
+                        # Save offsets for reference
+                        save_zeropoint_file(offsets, f"{output_dir}/zeropoint_offsets.txt",
+                                          comment=f"Derived from {n_specz} spec-z calibrators")
+                    else:
+                        print("  Zeropoint calibration did not converge, using uncorrected photometry")
+                else:
+                    print(f"  Insufficient spec-z calibrators ({n_specz} < 20), skipping zeropoint calibration")
+            else:
+                print("  No spectroscopic catalogs available for calibration")
+
+        except ImportError as e:
+            print(f"  Zeropoint calibration skipped (missing module): {e}")
+        except Exception as e:
+            print(f"  Zeropoint calibration failed: {e}")
+            import traceback
+            traceback.print_exc()
+
     # Force garbage collection before heavy computation
     gc.collect()
 
@@ -2408,13 +2709,15 @@ def main(mode: str = "full", output_subdir: str | None = None):
 
     # Template fitting with configurable redshift step
     # z_step from resource config: larger steps for faster processing on constrained machines
+    # z_min=0.05 prevents boundary pileup at z=0 from template fitting failures
     import time
     t0 = time.perf_counter()
     results = classify_batch_ultrafast(
         flux_array, error_array,
         spectra_path="./spectra",
         z_step=_RESOURCE_CONFIG.z_step,
-        z_step_coarse=_RESOURCE_CONFIG.z_step_coarse
+        z_step_coarse=_RESOURCE_CONFIG.z_step_coarse,
+        z_min=Z_MIN,
     )
     t1 = time.perf_counter()
     print(f"    Classified {n_galaxies} galaxies in {t1-t0:.4f}s ({n_galaxies/(t1-t0):.0f} galaxies/sec)")
@@ -2436,13 +2739,14 @@ def main(mode: str = "full", output_subdir: str | None = None):
     sed_catalog["reduced_chi2"] = results['reduced_chi2']
     sed_catalog["second_best_template"] = results['second_best_template']
     sed_catalog["delta_chi2_templates"] = results['delta_chi2_templates']
+    sed_catalog["best_A_V"] = results['best_A_V']  # Dust extinction (Calzetti law)
 
     # Add boundary flag (sources at z_min or z_max - fitting likely failed)
     if 'z_boundary_flag' in results:
         sed_catalog["z_boundary_flag"] = results['z_boundary_flag']
     else:
-        # Fallback: compute from redshift values
-        sed_catalog["z_boundary_flag"] = (results['redshift'] <= 0.01) | (results['redshift'] >= 5.99)
+        # Fallback: compute from redshift values (use Z_MIN + tolerance)
+        sed_catalog["z_boundary_flag"] = (results['redshift'] <= Z_MIN + 0.01) | (results['redshift'] >= Z_MAX - 0.01)
 
     # Track number of valid bands used in photo-z fitting
     if 'n_valid_bands' in results:
@@ -2451,6 +2755,30 @@ def main(mode: str = "full", output_subdir: str | None = None):
         # Fallback: count non-NaN flux values
         flux_cols = [f"flux_{b}" for b in ["f300", "f450", "f606", "f814"]]
         sed_catalog["n_valid_bands"] = sed_catalog[flux_cols].notna().sum(axis=1)
+
+    # ==========================================================================
+    # PHOTO-Z RELIABILITY FLAG BASED ON BAND COUNT
+    # Sources with <4 bands (especially missing U-band/F300W) suffer from severe
+    # color-redshift degeneracy. Only 4-band sources have reliable photo-z.
+    # See: Fernandez-Soto et al. 1999, Benitez 2000
+    # ==========================================================================
+    n_4band = (sed_catalog["n_valid_bands"] >= 4).sum()
+    n_3band = (sed_catalog["n_valid_bands"] == 3).sum()
+    n_fewer = (sed_catalog["n_valid_bands"] < 3).sum()
+
+    # Flag for photo-z reliability: True = reliable (4+ bands)
+    sed_catalog["photoz_reliable"] = sed_catalog["n_valid_bands"] >= 4
+
+    # Check U-band specifically (critical for breaking degeneracy)
+    has_uband = sed_catalog["flux_f300"].notna() & (sed_catalog["flux_f300"] > 0)
+    sed_catalog["has_uband"] = has_uband
+
+    print(f"  Photo-z band coverage:")
+    print(f"    4 bands (reliable): {n_4band} ({100*n_4band/len(sed_catalog):.1f}%)")
+    print(f"    3 bands (degenerate): {n_3band} ({100*n_3band/len(sed_catalog):.1f}%)")
+    if n_fewer > 0:
+        print(f"    <3 bands (unreliable): {n_fewer} ({100*n_fewer/len(sed_catalog):.1f}%)")
+    print(f"    U-band (F300W) detections: {has_uband.sum()} ({100*has_uband.sum()/len(sed_catalog):.1f}%)")
 
     # Use PSF-corrected radius for angular size (vectorized)
     sed_catalog["r_half_arcsec"] = sed_catalog["r_half_pix_corrected"] * PIXEL_SCALE
@@ -2475,9 +2803,6 @@ def main(mode: str = "full", output_subdir: str | None = None):
         )
         print(f"  Flagged {n_unreliable_z} sources with unreliable redshifts (σ_z > z)")
 
-    # NOTE: High-z flag (FLAG_HIGH_Z_UNRELIABLE) is set later after hybrid classifier
-    # runs, since it requires z_ml and confidence_hybrid columns
-
     # Add color-based stellar contamination check
     # Stars have flat SEDs (small color scatter), galaxies have strong colors
     # Using vectorized computation (100-700x faster than iterrows)
@@ -2501,428 +2826,131 @@ def main(mode: str = "full", output_subdir: str | None = None):
 
     print(f"  Classified {len(sed_catalog)} galaxies")
 
-    # =========================================================================
-    # PROFESSIONAL STAR-GALAXY CLASSIFICATION (Research Standard)
-    # Uses multi-tier approach: Gaia → SPREAD_MODEL → ML → Color-color
-    # With optional hybrid classification combining multiple methods
-    # =========================================================================
-    if USE_PROFESSIONAL_CLASSIFICATION:
-        print("\n  Running professional star-galaxy classification...")
-        if USE_COMPLETENESS_PRIORITY:
-            print("    Mode: COMPLETENESS PRIORITY (relaxed thresholds for faint sources)")
-        if USE_HYBRID_CLASSIFICATION:
-            print("    Mode: HYBRID CLASSIFICATION (combining multiple methods)")
-        if USE_XGBOOST_CLASSIFIER:
-            print("    ML Backend: XGBoost")
-
-        try:
-            # Query Gaia DR3 for foreground stars
-            HDF_CENTER_RA = 189.228621
-            HDF_CENTER_DEC = 62.212572
-            print("    Querying Gaia DR3 for foreground stars...")
-            gaia_catalog = query_gaia_for_classification(
-                ra_center=HDF_CENTER_RA,
-                dec_center=HDF_CENTER_DEC,
-                radius_arcmin=3.0,
-                magnitude_limit=21.0,
-            )
-            if len(gaia_catalog) > 0:
-                print(f"    Retrieved {len(gaia_catalog)} Gaia sources")
-            else:
-                print("    Warning: No Gaia sources retrieved (proceeding without Gaia)")
-                gaia_catalog = None
-
-            # Get reference image for morphological analysis (use I-band)
-            ref_image = None
-            for img in images:
-                if img.band == 'f814':  # I band
-                    ref_image = img.data
-                    break
-            if ref_image is None:
-                ref_image = images[0].data
-
-            # Initialize ML classifier if enabled
-            ml_classifier = None
-            if USE_XGBOOST_CLASSIFIER:
-                try:
-                    ml_classifier = create_classifier('xgboost')
-                    print("    Initialized XGBoost classifier")
-                except Exception as e:
-                    print(f"    Warning: Could not initialize XGBoost: {e}")
-                    # Fall back to no ML classifier
-
-            # Run professional classification with all enabled features
-            classification_results = classify_professional(
-                catalog=sed_catalog,
-                image=ref_image,
-                wcs=reference_wcs,
-                gaia_catalog=gaia_catalog,
-                ml_classifier=ml_classifier,
-                x_col="xcentroid",
-                y_col="ycentroid",
-                ra_col="ra",
-                dec_col="dec",
-                completeness_priority=USE_COMPLETENESS_PRIORITY,
-                verbose=True,
-            )
-
-            # If hybrid classification is enabled, run additional ensemble voting
-            if USE_HYBRID_CLASSIFICATION and 'spread_model' in classification_results.columns:
-                print("    Running hybrid ensemble classification...")
-                try:
-                    # Initialize deep learning classifier if available
-                    dl_classifier = None
-                    if ZOOBOT_AVAILABLE:
-                        try:
-                            dl_classifier = ZoobotStarGalaxyClassifier()
-                            dl_classifier.load_pretrained()
-                            print("    Deep learning: Zoobot loaded")
-                        except Exception as e:
-                            print(f"    Deep learning: Zoobot not available ({e})")
-                            dl_classifier = None
-
-                    hybrid_config = HybridClassifierConfig(
-                        use_bayesian=False,  # Weighted voting
-                        min_confidence=0.3,
-                        min_agreeing_methods=2,
-                    )
-                    hybrid_clf = HybridStarGalaxyClassifier(
-                        config=hybrid_config,
-                        ml_classifier=ml_classifier,
-                        deep_learning_classifier=dl_classifier,
-                    )
-
-                    # Run hybrid classification
-                    hybrid_results = hybrid_clf.classify(
-                        catalog=sed_catalog,
-                        spread_model=classification_results['spread_model'].values,
-                        spread_model_err=classification_results.get('spread_model_err', pd.Series(np.full(len(sed_catalog), 0.003))).values,
-                        concentration=classification_results.get('concentration_c', pd.Series()).values if 'concentration_c' in classification_results.columns else None,
-                        magnitudes=sed_catalog['mag_auto'].values if 'mag_auto' in sed_catalog.columns else None,
-                        gaia_stars=classification_results['gaia_confirmed_star'].values if 'gaia_confirmed_star' in classification_results.columns else None,
-                    )
-
-                    # Merge hybrid results (prefix with 'hybrid_')
-                    for col in hybrid_results.columns:
-                        classification_results[f'hybrid_{col}'] = hybrid_results[col].values
-
-                    # Use hybrid classification as primary if confidence is high
-                    hybrid_conf = hybrid_results['confidence'].values
-                    use_hybrid = hybrid_conf > 0.5
-                    if use_hybrid.any():
-                        classification_results.loc[use_hybrid, 'is_galaxy'] = hybrid_results.loc[use_hybrid, 'is_galaxy'].values
-                        classification_results.loc[use_hybrid, 'is_star'] = hybrid_results.loc[use_hybrid, 'is_star'].values
-                        classification_results.loc[use_hybrid, 'probability_galaxy'] = hybrid_results.loc[use_hybrid, 'probability_galaxy'].values
-                        classification_results.loc[use_hybrid, 'confidence'] = hybrid_conf[use_hybrid]
-
-                    n_hybrid = use_hybrid.sum()
-                    print(f"    Hybrid classification applied to {n_hybrid} sources")
-
-                except Exception as e:
-                    print(f"    Warning: Hybrid classification failed: {e}")
-
-            # Merge professional classification results
-            pro_cols = ['is_galaxy', 'is_star', 'probability_galaxy', 'confidence',
-                       'classification_method', 'classification_tier', 'spread_model',
-                       'gaia_confirmed_star', 'concentration_c', 'half_light_radius']
-            for col in pro_cols:
-                if col in classification_results.columns:
-                    sed_catalog[f"pro_{col}"] = classification_results[col].values
-
-            # Update FLAG_PSF_LIKE based on professional classification
-            # Only flag sources that professional classification confirms as stars
-            if 'is_star' in classification_results.columns:
-                pro_stars = classification_results['is_star'].values
-                n_pro_stars = pro_stars.sum()
-
-                # Clear basic PSF_LIKE flags and use professional classification
-                # This replaces the basic heuristic with the professional result
-                sed_catalog.loc[pro_stars, "quality_flag"] = (
-                    sed_catalog.loc[pro_stars, "quality_flag"].astype(int) | FLAG_PSF_LIKE
-                )
-
-                # Sources confirmed as galaxies by professional classification
-                # can have their FLAG_PSF_LIKE cleared if it was set by basic method
-                pro_galaxies = classification_results['is_galaxy'].values
-                high_conf_galaxies = pro_galaxies & (classification_results['confidence'].values > 0.7)
-                sed_catalog.loc[high_conf_galaxies, "quality_flag"] = (
-                    sed_catalog.loc[high_conf_galaxies, "quality_flag"].astype(int) & ~FLAG_PSF_LIKE
-                )
-
-                print(f"    Professional classification: {n_pro_stars} stars, "
-                      f"{pro_galaxies.sum()} galaxies")
-
-                # Report classification by tier
-                if 'classification_tier' in classification_results.columns:
-                    tier_names = {1: "Gaia", 2: "SPREAD_MODEL", 3: "Morphology",
-                                 4: "ML", 5: "Color-color"}
-                    for tier, name in tier_names.items():
-                        n_tier = (classification_results['classification_tier'] == tier).sum()
-                        if n_tier > 0:
-                            print(f"      Tier {tier} ({name}): {n_tier} sources")
-
-        except Exception as e:
-            print(f"    Warning: Professional classification failed: {e}")
-            print("    Using basic classification only")
-
-    # Cross-match with 3D-HST catalog for additional star identification
-    # This catches stars our morphological methods miss
-    print("\n  Cross-matching with 3D-HST catalog (Skelton et al. 2014)...")
-    try:
-        sed_catalog = crossmatch_with_3dhst(sed_catalog, match_radius_arcsec=1.0)
-
-        # Flag sources identified as stars by 3D-HST
-        if 'star_3dhst' in sed_catalog.columns:
-            n_3dhst_stars = sed_catalog['star_3dhst'].sum()
-            if n_3dhst_stars > 0:
-                # Update FLAG_PSF_LIKE for 3D-HST identified stars
-                sed_catalog.loc[sed_catalog['star_3dhst'], "quality_flag"] = (
-                    sed_catalog.loc[sed_catalog['star_3dhst'], "quality_flag"].astype(int) | FLAG_PSF_LIKE
-                )
-                print(f"    Flagged {n_3dhst_stars} additional stars from 3D-HST")
-
-                # Update pro_is_star column if it exists
-                if 'pro_is_star' in sed_catalog.columns:
-                    sed_catalog.loc[sed_catalog['star_3dhst'], 'pro_is_star'] = True
-                    # Also update pro_is_galaxy to maintain consistency
-                    if 'pro_is_galaxy' in sed_catalog.columns:
-                        sed_catalog.loc[sed_catalog['star_3dhst'], 'pro_is_galaxy'] = False
-
-        # Apply spectroscopic redshifts from 3D-HST where available
-        # This fixes catastrophic photo-z failures
-        sed_catalog = apply_spectroscopic_redshifts(
-            sed_catalog,
-            z_col='redshift',
-            match_radius_arcsec=1.0,
-            flag_catastrophic=True,
-            catastrophic_threshold=0.15
-        )
-
-        # Report how many redshifts were updated
-        if 'has_specz' in sed_catalog.columns:
-            n_specz = sed_catalog['has_specz'].sum()
-            if n_specz > 0:
-                print(f"  Applied {n_specz} spectroscopic redshifts from 3D-HST")
-                if 'catastrophic_photoz' in sed_catalog.columns:
-                    n_catastrophic = sed_catalog['catastrophic_photoz'].sum()
-                    if n_catastrophic > 0:
-                        print(f"  Catastrophic photo-z outliers corrected: {n_catastrophic}")
-
-                # Clear bad photo-z flags for sources with spectroscopic redshifts
-                # Spec-z are trusted, so these sources should not be flagged as bad_photoz
-                specz_mask = sed_catalog['has_specz']
-                current_flags = sed_catalog.loc[specz_mask, "quality_flag"].astype(int)
-                # Clear FLAG_BAD_PHOTOZ (32) and FLAG_UNRELIABLE_Z (256)
-                cleared_flags = current_flags & ~(FLAG_BAD_PHOTOZ | FLAG_UNRELIABLE_Z)
-                sed_catalog.loc[specz_mask, "quality_flag"] = cleared_flags
-
-    except Exception as e:
-        print(f"    Warning: 3D-HST cross-match failed: {e}")
-
-    # ==========================================================================
-    # OPTIONAL: Hybrid Photo-z Enhancement (ML + Templates)
-    # ==========================================================================
-    if USE_HYBRID_PHOTOZ:
-        print("\n  Running hybrid photo-z enhancement...")
-        try:
-            # Check if we have enough spectroscopic redshifts for training
-            has_specz = 'has_specz' in sed_catalog.columns and sed_catalog['has_specz'].sum() >= 20
-
-            if has_specz:
-                print("    Training hybrid photo-z model on spectroscopic sample...")
-
-                # Determine the correct spec-z column
-                # z_spec_3dhst contains actual spectroscopic redshifts from 3D-HST
-                # 'redshift' may have been updated with spec-z values already
-                if 'z_spec_3dhst' in sed_catalog.columns:
-                    spec_z_column = 'z_spec_3dhst'
-                elif 'spec_z' in sed_catalog.columns:
-                    spec_z_column = 'spec_z'
-                else:
-                    spec_z_column = 'redshift'
-
-                # Train the hybrid estimator
-                hybrid_estimator, hybrid_metrics = train_hybrid_photoz_from_specz(
-                    sed_catalog,
-                    spec_z_col=spec_z_column,
-                    flux_cols=('flux_f300', 'flux_f450', 'flux_f606', 'flux_f814'),
-                    error_cols=('error_f300', 'error_f450', 'error_f606', 'error_f814'),
-                    ml_method='rf',
-                    spectra_path='./spectra',
-                    has_specz_col='has_specz',  # Use proper filter for spec-z sources
-                )
-
-                # Apply hybrid photo-z to all sources
-                print("    Applying hybrid photo-z to full catalog...")
-                flux_array_hybrid = np.column_stack([
-                    sed_catalog['flux_f300'].values,
-                    sed_catalog['flux_f450'].values,
-                    sed_catalog['flux_f606'].values,
-                    sed_catalog['flux_f814'].values,
-                ])
-                error_array_hybrid = np.column_stack([
-                    sed_catalog['error_f300'].values,
-                    sed_catalog['error_f450'].values,
-                    sed_catalog['error_f606'].values,
-                    sed_catalog['error_f814'].values,
-                ])
-
-                # Pass catalog values to ensure consistency between template and hybrid results
-                catalog_odds = sed_catalog['photo_z_odds'].values if 'photo_z_odds' in sed_catalog.columns else None
-                catalog_z_lo = sed_catalog['redshift_lo'].values if 'redshift_lo' in sed_catalog.columns else None
-                catalog_z_hi = sed_catalog['redshift_hi'].values if 'redshift_hi' in sed_catalog.columns else None
-                catalog_redshift = sed_catalog['redshift'].values if 'redshift' in sed_catalog.columns else None
-                has_specz_arr = sed_catalog['has_specz'].values if 'has_specz' in sed_catalog.columns else None
-
-                hybrid_results = hybrid_estimator.predict_batch(
-                    flux_array_hybrid, error_array_hybrid,
-                    catalog_odds=catalog_odds,
-                    catalog_z_lo=catalog_z_lo,
-                    catalog_z_hi=catalog_z_hi,
-                    catalog_redshift=catalog_redshift,
-                    has_specz=has_specz_arr,
-                )
-
-                # Add hybrid results to catalog
-                for key, values in hybrid_results.items():
-                    sed_catalog[key] = values
-
-                # Flag high-z sources (z > 2) as potentially unreliable
-                # These have higher catastrophic photo-z rates due to:
-                # - Lyman/Balmer break degeneracy
-                # - Limited template coverage at high-z
-                # - IGM absorption uncertainties
-                if 'z_ml' in sed_catalog.columns and 'z_template' in sed_catalog.columns:
-                    high_z_mask = (
-                        (sed_catalog["redshift"] > 2.0) &
-                        # Also require some uncertainty indicator (ml disagreement or low confidence)
-                        (
-                            (np.abs(sed_catalog["z_ml"] - sed_catalog["z_template"]) > 0.3) |
-                            (sed_catalog["confidence_hybrid"] < 0.92)
-                        )
-                    )
-                    n_high_z = high_z_mask.sum()
-                    if n_high_z > 0:
-                        sed_catalog.loc[high_z_mask, "quality_flag"] = (
-                            sed_catalog.loc[high_z_mask, "quality_flag"].astype(int) | FLAG_HIGH_Z_UNRELIABLE
-                        )
-                        print(f"    Flagged {n_high_z} high-z sources (z > 2) with uncertain redshifts")
-
-                print(f"    Hybrid photo-z improvement: {100*hybrid_metrics.get('improvement_nmad', 0):.1f}% NMAD reduction")
-            else:
-                print("    Skipping hybrid photo-z: insufficient spectroscopic training data")
-
-        except Exception as e:
-            print(f"    Warning: Hybrid photo-z failed: {e}")
-
-    # ==========================================================================
-    # OPTIONAL: Zoobot Morphology Validation
-    # ==========================================================================
-    if USE_ZOOBOT_VALIDATION:
-        print("\n  Running Zoobot morphology validation...")
-        try:
-            # Get reference image for cutout extraction (use I-band)
-            ref_image_zoobot = None
-            for img in images:
-                if img.band == 'f814':
-                    ref_image_zoobot = img.data
-                    break
-            if ref_image_zoobot is None:
-                ref_image_zoobot = images[0].data
-
-            # Filter to galaxies only for Zoobot validation
-            galaxy_mask = (sed_catalog["quality_flag"].astype(int) & FLAG_PSF_LIKE) == 0
-            galaxy_catalog = sed_catalog[galaxy_mask].copy()
-
-            if len(galaxy_catalog) > 10:
-                # Extract cutouts for Zoobot
-                print(f"    Extracting cutouts for {len(galaxy_catalog)} galaxies...")
-                cutouts = extract_cutouts(
-                    ref_image_zoobot,
-                    galaxy_catalog,
-                    size=128,
-                    output_dir=Path(output_dir) / 'zoobot_cutouts',
-                )
-
-                # Run Zoobot predictions
-                image_paths = [c[2] for c in cutouts if c[2] is not None]
-                if len(image_paths) > 0:
-                    print(f"    Running Zoobot on {len(image_paths)} cutouts...")
-                    zoobot_preds = run_zoobot_predictions(image_paths)
-                    zoobot_morphs = interpret_zoobot_predictions(zoobot_preds)
-
-                    # Validate against SED classifications
-                    if 'galaxy_type' in galaxy_catalog.columns:
-                        validation_report = validate_morphology_with_zoobot(
-                            galaxy_catalog, zoobot_morphs
-                        )
-                        print(validation_report)
-
-                        # Save validation report
-                        with open(f"{output_dir}/zoobot_validation.txt", "w") as f:
-                            f.write(str(validation_report))
-            else:
-                print("    Skipping Zoobot: insufficient galaxies for validation")
-
-        except Exception as e:
-            print(f"    Warning: Zoobot validation failed: {e}")
-
-    # ==========================================================================
-    # OPTIONAL: Morpheus Pixel-Level Segmentation
-    # ==========================================================================
-    if USE_MORPHEUS and MORPHEUS_AVAILABLE:
-        print("\n  Running Morpheus pixel-level segmentation...")
-        try:
-            # Get multi-band images for better segmentation
-            band_images = {}
-            for img in images:
-                if img.band == 'f814':
-                    band_images['H'] = img.data  # Use I-band as H proxy
-                elif img.band == 'f606':
-                    band_images['J'] = img.data  # Use V-band as J proxy
-
-            if len(band_images) == 0:
-                band_images['H'] = images[0].data
-
-            # Run Morpheus segmentation
-            morpheus_result = segment_image(band_images, verbose=True)
-
-            # Use Morpheus point source detection to refine star classification
-            morpheus_stars = morpheus_result.point_source > 0.7
-            n_morpheus_stars = 0
-            for idx, row in sed_catalog.iterrows():
-                x, y = int(row['xcentroid']), int(row['ycentroid'])
-                if 0 <= x < morpheus_stars.shape[1] and 0 <= y < morpheus_stars.shape[0]:
-                    # Check if source centroid is in point source region
-                    if morpheus_stars[y, x]:
-                        sed_catalog.loc[idx, 'morpheus_point_source'] = True
-                        n_morpheus_stars += 1
-                    else:
-                        sed_catalog.loc[idx, 'morpheus_point_source'] = False
-
-            print(f"    Morpheus identified {n_morpheus_stars} likely point sources")
-
-            # Save segmentation map
-            seg_path = Path(output_dir) / 'morpheus_segmentation.npy'
-            np.save(seg_path, morpheus_result.classification_map)
-            print(f"    Saved segmentation map to {seg_path}")
-
-        except Exception as e:
-            print(f"    Warning: Morpheus segmentation failed: {e}")
-
     # Report photo-z quality statistics
     odds_good = (sed_catalog["photo_z_odds"] >= 0.9).sum()
     odds_medium = ((sed_catalog["photo_z_odds"] >= 0.6) & (sed_catalog["photo_z_odds"] < 0.9)).sum()
     odds_poor = (sed_catalog["photo_z_odds"] < 0.6).sum()
     print(f"  Photo-z quality: {odds_good} excellent (ODDS>=0.9), {odds_medium} good (0.6<=ODDS<0.9), {odds_poor} poor (ODDS<0.6)")
 
+    # ML-based star classification using morphological features
+    # Required features: concentration, gini, half_light_radius, sersic_n (psf_ratio is computed)
+    required_morph_cols = ["concentration", "gini", "half_light_radius", "sersic_n"]
+    has_training_data = "in_star_mask" in sed_catalog.columns
+    has_morph_features = all(col in sed_catalog.columns for col in required_morph_cols)
+    missing_cols = [col for col in required_morph_cols if col not in sed_catalog.columns]
+
+    if has_training_data and has_morph_features:
+        try:
+            sed_catalog["star_prob_ml"] = classify_stars(sed_catalog, "in_star_mask")
+        except Exception as e:
+            print(f"  Star classifier skipped: {e}")
+    elif has_training_data and not has_morph_features:
+        print(f"  Star classifier skipped: missing morphology columns {missing_cols}")
+
+    # Optional: Zoobot deep learning morphology classification
+    try:
+        print("\n  Running Zoobot morphology classification...")
+        cutout_dir = Path(output_dir) / "cutouts"
+        # Use I-band (F814W) for cutouts - best depth and resolution
+        i_band_img = next((img for img in images if img.band == "f814"), images[-1])
+        cutout_paths = extract_cutouts(i_band_img.data, sed_catalog, cutout_dir)
+        if cutout_paths:
+            sed_catalog = classify_morphology(sed_catalog, cutout_paths)
+    except Exception as e:
+        print(f"  Zoobot skipped: {e}")
+
+    # Add SED-based morphology classification (baseline from template types)
+    from morphology.zoobot_classify import classify_by_sed_type
+    sed_catalog = classify_by_sed_type(sed_catalog)
+    print(f"  SED morphology distribution: {sed_catalog['sed_morphology'].value_counts().to_dict()}")
+
+    # === SPECTROSCOPIC VALIDATION AND IMPROVEMENT ===
+    # Cross-match with external spec-z catalogs (3D-HST, Hawaii Yang 2014, Fernandez-Soto 1999)
+    # to validate photo-z quality and optionally replace unreliable photo-z with spec-z
+    USE_SPECZ_VALIDATION = True  # Set to False to skip spec-z validation
+    APPLY_SPECZ_CORRECTIONS = True  # Set to False to only validate without replacing
+
+    if USE_SPECZ_VALIDATION:
+        try:
+            from validation.specz_validation import (
+                load_specz_catalogs,
+                cross_match_with_specz,
+                apply_spectroscopic_redshifts,
+                flag_catastrophic_outliers,
+                compute_photoz_metrics,
+                generate_validation_plots,
+            )
+
+            print("\n  === Spectroscopic Validation ===")
+
+            # Load external spectroscopic catalogs
+            specz_catalogs = load_specz_catalogs()
+
+            if specz_catalogs:
+                # Cross-match with 1 arcsec radius
+                sed_catalog = cross_match_with_specz(sed_catalog, specz_catalogs, match_radius=1.0)
+
+                # Compute and report validation metrics (before any corrections)
+                matched = sed_catalog[sed_catalog['z_spec'].notna()]
+                if len(matched) >= 5:
+                    metrics = compute_photoz_metrics(matched['redshift'], matched['z_spec'])
+                    print(f"\n  Photo-z validation metrics (N={metrics['n_matched']} matched):")
+                    print(f"    NMAD = {metrics['nmad']:.4f}")
+                    print(f"    Bias = {metrics['bias']:.4f}")
+                    print(f"    Outlier rate (>0.15) = {100*metrics['outlier_015']:.1f}%")
+                    print(f"    Catastrophic rate (>0.3) = {100*metrics['outlier_030']:.1f}%")
+
+                # Apply spec-z corrections (replace photo-z with spec-z when available)
+                if APPLY_SPECZ_CORRECTIONS:
+                    sed_catalog = apply_spectroscopic_redshifts(sed_catalog)
+                    sed_catalog = flag_catastrophic_outliers(sed_catalog)
+
+                # Generate validation plots
+                generate_validation_plots(sed_catalog, output_dir)
+
+                # Report final spec-z statistics
+                n_specz = (sed_catalog['redshift_source'] == 'spec').sum() if 'redshift_source' in sed_catalog.columns else 0
+                print(f"\n  Final redshift sources: {n_specz} spec-z, {len(sed_catalog) - n_specz} photo-z")
+            else:
+                print("  No spectroscopic catalogs available, skipping validation")
+
+        except Exception as e:
+            print(f"  Spec-z validation skipped: {e}")
+
     # Step 5: Analysis and plotting
     print("\n[5/6] Analyzing results...")
+
+    # Debug: Check data before filtering
+    print(f"  DEBUG: sed_catalog shape before filtering: {sed_catalog.shape}")
+    for col in ["redshift", "r_half_arcsec", "r_half_arcsec_error", "r_half_pix_corrected"]:
+        if col in sed_catalog.columns:
+            vals = sed_catalog[col]
+            finite_vals = vals[np.isfinite(vals)]
+            n_finite = len(finite_vals)
+            n_positive = (finite_vals > 0).sum() if n_finite > 0 else 0
+            min_val = finite_vals.min() if n_finite > 0 else float('nan')
+            max_val = finite_vals.max() if n_finite > 0 else float('nan')
+            print(f"  DEBUG: {col}: total={len(vals)}, finite={n_finite}, >0={n_positive}, min={min_val:.4f}, max={max_val:.4f}")
+        else:
+            print(f"  DEBUG: {col}: COLUMN MISSING")
+
     sed_catalog = sed_catalog.dropna(subset=["redshift", "r_half_arcsec", "r_half_arcsec_error"])
     # Filter out sources with inf errors (from zero-weight pixels)
     sed_catalog = sed_catalog[np.isfinite(sed_catalog["r_half_arcsec_error"])]
-    # Filter out sources with zero angular size (smaller than PSF)
-    sed_catalog = sed_catalog[sed_catalog["r_half_arcsec"] > 0]
+
+    # Flag unresolved sources (r_half_arcsec <= 0 after PSF correction) as PSF-like
+    # but keep them in catalog with a minimum floor value for analysis
+    n_unresolved = (sed_catalog["r_half_arcsec"] <= 0).sum()
+    if n_unresolved > 0:
+        print(f"  Found {n_unresolved} unresolved sources (r_half <= PSF), flagging as PSF-like")
+        unresolved_mask = sed_catalog["r_half_arcsec"] <= 0
+        sed_catalog.loc[unresolved_mask, "quality_flag"] = (
+            sed_catalog.loc[unresolved_mask, "quality_flag"].astype(int) | FLAG_PSF_LIKE
+        )
+        # Set minimum floor for unresolved sources (half the pixel scale)
+        MIN_ARCSEC = PIXEL_SCALE * 0.5
+        sed_catalog.loc[unresolved_mask, "r_half_arcsec"] = MIN_ARCSEC
+
     print(f"  Valid sources after basic filtering: {len(sed_catalog)}")
 
     # Report final quality flag distribution
@@ -2976,7 +3004,8 @@ def main(mode: str = "full", output_subdir: str | None = None):
             FLAG_CROWDED | FLAG_BAD_PHOTOZ | FLAG_PSF_LIKE | FLAG_MASKED |
             FLAG_UNRELIABLE_Z |  # Exclude sources where σ_z > z
             FLAG_VERY_LOW_SNR |  # Exclude sources with SNR < 0.5 (50% catastrophic rate)
-            FLAG_HIGH_Z_UNRELIABLE  # Exclude uncertain high-z sources
+            FLAG_HIGH_Z_UNRELIABLE |  # Exclude uncertain high-z sources
+            FLAG_CATASTROPHIC_PHOTOZ  # Exclude catastrophic photo-z outliers identified by spec-z
         )
 
         # Apply all quality cuts
@@ -3007,11 +3036,14 @@ def main(mode: str = "full", output_subdir: str | None = None):
         n_chi2_rejected = (sed_catalog["chi2_flag"] != 0).sum()
         n_bimodal_rejected = sed_catalog["bimodal_flag"].sum()
 
-        print(f"      - Quality flags:     {n_flag_rejected} ({100*n_flag_rejected/n_total:.1f}%)")
-        print(f"      - ODDS < 0.9:        {n_odds_rejected} ({100*n_odds_rejected/n_total:.1f}%)")
-        print(f"      - Chi2 > 5:          {n_chi2_rejected} ({100*n_chi2_rejected/n_total:.1f}%)")
-        print(f"      - Bimodal redshift:  {n_bimodal_rejected} ({100*n_bimodal_rejected/n_total:.1f}%)")
-        print(f"    Result: {n_kept} high-confidence galaxies ({100*n_kept/n_total:.1f}% retained)")
+        if n_total > 0:
+            print(f"      - Quality flags:     {n_flag_rejected} ({100*n_flag_rejected/n_total:.1f}%)")
+            print(f"      - ODDS < 0.9:        {n_odds_rejected} ({100*n_odds_rejected/n_total:.1f}%)")
+            print(f"      - Chi2 > 5:          {n_chi2_rejected} ({100*n_chi2_rejected/n_total:.1f}%)")
+            print(f"      - Bimodal redshift:  {n_bimodal_rejected} ({100*n_bimodal_rejected/n_total:.1f}%)")
+            print(f"    Result: {n_kept} high-confidence galaxies ({100*n_kept/n_total:.1f}% retained)")
+        else:
+            print("      No sources to analyze")
     else:
         # Moderate filtering - excludes only clearly bad sources
         EXCLUDE_FLAGS = FLAG_BAD_PHOTOZ | FLAG_PSF_LIKE | FLAG_MASKED
@@ -3046,6 +3078,17 @@ def main(mode: str = "full", output_subdir: str | None = None):
                 (sed_catalog["quality_flag"].astype(int) & MINIMAL_FLAGS) == 0
             ]
             print(f"  After minimal filtering: {len(sed_catalog_analysis)} sources")
+
+    # ALWAYS exclude z_boundary_flag sources from analysis
+    # These are photo-z fitting failures where the best-fit hit the z_min or z_max boundary
+    # Their confidence intervals often don't include the boundary value, indicating unreliable redshifts
+    if "z_boundary_flag" in sed_catalog_analysis.columns:
+        n_before = len(sed_catalog_analysis)
+        sed_catalog_analysis = sed_catalog_analysis[sed_catalog_analysis["z_boundary_flag"] == False].copy()
+        n_excluded = n_before - len(sed_catalog_analysis)
+        if n_excluded > 0:
+            print(f"\n  Excluded {n_excluded} sources with z_boundary_flag=True (photo-z boundary failures)")
+            print(f"  Remaining sources for analysis: {len(sed_catalog_analysis)}")
 
     # Print redshift distribution
     print("\n  Redshift statistics (filtered):")
@@ -3682,13 +3725,20 @@ def main(mode: str = "full", output_subdir: str | None = None):
     plt.close()
     print(f"  Saved: {output_dir}/angular_diameter_distance.pdf")
 
-    # Plot 8: Final selection (cross-matched sources in all 4 bands)
-    # Separate sources into categories:
-    # Red: galaxies (not flagged as stars)
+    # Plot 8: Final selection showing galaxies, detected stars, and mask stars
+    n_galaxies = len(sed_catalog_analysis)
 
-    is_in_mask = cross_matched_catalog["in_star_mask"]
-    is_galaxy = ((cross_matched_catalog["quality_flag"] & FLAG_PSF_LIKE) == 0) & ~is_in_mask
-    n_galaxies = is_galaxy.sum()
+    # Identify different source types from the FULL catalog
+    in_mask = sed_catalog["in_star_mask"].fillna(False).astype(bool) if "in_star_mask" in sed_catalog.columns else pd.Series([False] * len(sed_catalog))
+    has_psf_flag = (sed_catalog["quality_flag"].astype(int) & FLAG_PSF_LIKE) != 0
+
+    # Mask stars: sources in star mask
+    mask_stars = sed_catalog[in_mask]
+    n_mask_stars = len(mask_stars)
+
+    # Detected stars: sources with PSF-like flag but NOT in mask
+    detected_stars = sed_catalog[has_psf_flag & ~in_mask]
+    n_detected_stars = len(detected_stars)
 
     _fig, axes = plt.subplots(2, 2, figsize=(12, 12))
     for idx, image in enumerate(images):
@@ -3696,31 +3746,59 @@ def main(mode: str = "full", output_subdir: str | None = None):
         vmin, vmax = np.percentile(image.data, [20, 99])
         ax.imshow(image.data, cmap="gray_r", vmin=vmin, vmax=vmax, origin="lower")
 
-        # Red: galaxies (not flagged as stars)
+        # Plot galaxies (green)
         if n_galaxies > 0:
             ax.scatter(
-                cross_matched_catalog.loc[is_galaxy, "xcentroid"],
-                cross_matched_catalog.loc[is_galaxy, "ycentroid"],
-                s=10,
-                facecolors="none",
-                edgecolors="red",
-                linewidth=0.5,
+                sed_catalog_analysis["xcentroid"],
+                sed_catalog_analysis["ycentroid"],
+                s=10, facecolors="none", edgecolors="green", linewidth=0.5,
+                label=f"Galaxies ({n_galaxies})"
             )
 
-        ax.set_title(
-            f"Band {image.band.upper()} -- {n_galaxies} galaxies",
-            fontsize=9,
-        )
+        # Plot detected stars (blue)
+        if n_detected_stars > 0:
+            ax.scatter(
+                detected_stars["xcentroid"],
+                detected_stars["ycentroid"],
+                s=15, facecolors="none", edgecolors="blue", linewidth=0.7,
+                label=f"Detected stars ({n_detected_stars})"
+            )
+
+        # Plot mask stars (red)
+        if n_mask_stars > 0:
+            ax.scatter(
+                mask_stars["xcentroid"],
+                mask_stars["ycentroid"],
+                s=20, facecolors="none", edgecolors="red", linewidth=0.9,
+                label=f"Mask stars ({n_mask_stars})"
+            )
+
+        ax.set_title(f"Band {image.band.upper()}", fontsize=9)
         ax.set_xlabel(r"X (pixels)")
         ax.set_ylabel(r"Y (pixels)")
+        if idx == 0:
+            ax.legend(loc="upper right", fontsize=7)
 
-    plt.suptitle(f"Final Selection ({n_galaxies} galaxies)", fontsize=14, fontweight="bold", y=1.01)
+    plt.suptitle(f"Final Selection\n({n_galaxies} galaxies, {n_detected_stars} detected stars, {n_mask_stars} mask stars)",
+                 fontsize=12, fontweight="bold", y=1.02)
     plt.tight_layout()
     plt.savefig(f"{output_dir}/final_selection.pdf", dpi=150, bbox_inches="tight")
     plt.close()
     print(f"  Saved: {output_dir}/final_selection.pdf")
 
     # Save catalogs (both full and quality-filtered versions)
+    # Add is_star and is_galaxy columns for consistency with chip3 output
+    if "in_star_mask" in sed_catalog.columns:
+        in_mask = sed_catalog["in_star_mask"].fillna(False).astype(bool)
+        sed_catalog["is_star"] = in_mask
+        sed_catalog["is_galaxy"] = ~in_mask
+    if "in_star_mask" in sed_catalog_analysis.columns:
+        # Use .copy() to avoid SettingWithCopyWarning
+        sed_catalog_analysis = sed_catalog_analysis.copy()
+        in_mask_filtered = sed_catalog_analysis["in_star_mask"].fillna(False).astype(bool)
+        sed_catalog_analysis["is_star"] = in_mask_filtered
+        sed_catalog_analysis["is_galaxy"] = ~in_mask_filtered
+
     # Full catalog with all sources and flags
     sed_catalog.to_csv(f"{output_dir}/galaxy_catalog_full.csv", index=False)
     print(f"  Saved: {output_dir}/galaxy_catalog_full.csv (all {len(sed_catalog)} sources)")
@@ -3761,6 +3839,10 @@ def extract_chip3_from_full(full_catalog: pd.DataFrame, full_catalog_filtered: p
 
     Uses the known chip3 bounds within the 4096x4096 mosaic to filter sources.
     This avoids re-running detection and classification.
+
+    For chip3, star classification is simplified: only sources inside the
+    course staff star mask are classified as stars. This provides a cleaner
+    galaxy sample for the angular size analysis.
     """
     # Filter to chip3 region (columns are xcentroid/ycentroid)
     chip3_mask = (
@@ -3775,55 +3857,92 @@ def extract_chip3_from_full(full_catalog: pd.DataFrame, full_catalog_filtered: p
     )
     chip3_catalog_filtered = full_catalog_filtered[chip3_mask_filtered].copy()
 
+    # Override star classification for chip3: only star mask sources are stars
+    # This simplifies the classification to use the course staff's star mask
+    if "in_star_mask" in chip3_catalog.columns:
+        in_mask = chip3_catalog["in_star_mask"].fillna(False).astype(bool)
+        n_original_stars = chip3_catalog["is_star"].sum() if "is_star" in chip3_catalog.columns else 0
+        n_mask_stars = in_mask.sum()
+
+        # Set is_star = True only for sources in the star mask
+        chip3_catalog["is_star"] = in_mask
+        chip3_catalog["is_galaxy"] = ~in_mask
+
+        print(f"  Chip3 star classification override: {n_original_stars} -> {n_mask_stars} stars (mask only)")
+
+    if "in_star_mask" in chip3_catalog_filtered.columns:
+        in_mask_filtered = chip3_catalog_filtered["in_star_mask"].fillna(False).astype(bool)
+        chip3_catalog_filtered["is_star"] = in_mask_filtered
+        chip3_catalog_filtered["is_galaxy"] = ~in_mask_filtered
+
     return chip3_catalog, chip3_catalog_filtered
 
 
-def run_quality_control(
-    catalog: pd.DataFrame,
-    output_dir: str,
-    reference_catalog_path: str | None = None,
-) -> None:
-    """Run quality control pipeline on classification results.
+def generate_all_plots(output_dir: str, dataset_name: str):
+    """Generate all plots for a given output directory."""
+    # Binning comparison (all types)
+    generate_binning_plot(data_dir=output_dir,
+        output_path=f"{output_dir}/binning_comparison.pdf",
+        dataset_name=dataset_name)
 
-    Parameters
-    ----------
-    catalog : pd.DataFrame
-        Galaxy catalog with classification results
-    output_dir : str
-        Output directory for QC results
-    reference_catalog_path : str, optional
-        Path to external reference catalog (CSV with ra, dec, z_phot columns)
-    """
-    from quality_control import QualityControlPipeline
+    # Angular size vs redshift (main science plot)
+    generate_angular_size_plot(data_dir=output_dir,
+        output_path=f"{output_dir}/angular_size_vs_redshift.pdf",
+        dataset_name=dataset_name)
 
-    print("\n" + "=" * 60)
-    print("RUNNING QUALITY CONTROL PIPELINE")
-    print("=" * 60)
+    # Redshift distribution histograms
+    generate_redshift_histogram(data_dir=output_dir,
+        output_path=f"{output_dir}/redshift_histogram.pdf",
+        dataset_name=dataset_name)
 
-    # Load reference catalog if provided
-    reference_catalog = None
-    if reference_catalog_path:
-        try:
-            reference_catalog = pd.read_csv(reference_catalog_path)
-            print(f"  Loaded reference catalog: {reference_catalog_path}")
-            print(f"  Reference sources: {len(reference_catalog)}")
-        except Exception as e:
-            print(f"  Warning: Could not load reference catalog: {e}")
+    # Galaxy type histograms
+    generate_galaxy_type_histogram(data_dir=output_dir,
+        output_path=f"{output_dir}/galaxy_types.pdf",
+        dataset_name=dataset_name)
 
-    # Create QC output directory
-    qc_output_dir = f"{output_dir}/qc"
+    # Per-galaxy-type analysis
+    catalog_path = f"{output_dir}/galaxy_catalog.csv"
+    if os.path.exists(catalog_path):
+        type_catalog = pd.read_csv(catalog_path)
 
-    # Run QC pipeline
-    qc = QualityControlPipeline(
-        catalog=catalog,
-        output_dir=qc_output_dir,
-        reference_catalog=reference_catalog,
-    )
+        # Guard against empty catalog
+        if len(type_catalog) == 0:
+            print(f"\n--- Per-Galaxy-Type Analysis ({dataset_name}) ---")
+            print("  Catalog is empty. Skipping per-type analysis.")
+            return
 
-    qc.run_full_validation(generate_plots=True)
-    qc.save_report()
+        type_catalog = type_catalog.dropna(subset=["redshift", "r_half_arcsec", "r_half_arcsec_error"])
 
-    print(f"\nQC results saved to: {qc_output_dir}/")
+        if len(type_catalog) == 0:
+            print(f"\n--- Per-Galaxy-Type Analysis ({dataset_name}) ---")
+            print("  No valid sources after filtering. Skipping per-type analysis.")
+            return
+
+        type_catalog = type_catalog[np.isfinite(type_catalog["r_half_arcsec_error"])]
+        # Exclude z_boundary_flag sources (photo-z boundary failures)
+        if "z_boundary_flag" in type_catalog.columns:
+            type_catalog = type_catalog[type_catalog["z_boundary_flag"] == False]
+
+        print(f"\n--- Per-Galaxy-Type Analysis ({dataset_name}) ---")
+        valid_types = get_types_with_enough_statistics(type_catalog)
+        print(f"  Galaxy types with N >= {MIN_GALAXIES_PER_TYPE}: {valid_types}")
+        if len(valid_types) > 0:
+            generate_size_distribution_by_type(output_dir, output_dir, dataset_name)
+            generate_type_comparison_overlay(output_dir, output_dir, dataset_name)
+            print(f"  Generating individual θ(z) fits for {len(valid_types)} types...")
+            for gtype in valid_types:
+                generate_per_type_fit_plot(output_dir, output_dir, dataset_name, gtype)
+        else:
+            print("  No galaxy types have enough statistics for per-type analysis.")
+
+        # Per-type binning comparison plots (lower threshold for more types)
+        types_for_binning = get_types_with_enough_statistics(type_catalog, min_count=MIN_GALAXIES_PER_TYPE_BINNING)
+        print(f"\n--- Per-Type Binning Comparisons ({dataset_name}) ---")
+        print(f"  Galaxy types with N >= {MIN_GALAXIES_PER_TYPE_BINNING}: {types_for_binning}")
+        if len(types_for_binning) > 0:
+            print(f"  Generating binning comparison plots for {len(types_for_binning)} types...")
+            for gtype in types_for_binning:
+                generate_per_type_binning_comparison(output_dir, output_dir, dataset_name, gtype)
 
 
 if __name__ == "__main__":
@@ -3835,33 +3954,31 @@ Examples:
     python run_analysis.py full                          # Run analysis on full mosaic
     python run_analysis.py chip3                         # Run analysis on chip3 only
     python run_analysis.py both                          # Run full and extract chip3
-    python run_analysis.py full --run-qc                 # Run with quality control
     python run_analysis.py full --resource-profile low   # Run with low resource usage (constrained machines)
     python run_analysis.py full --resource-profile high  # Run with high resource usage (workstations)
+    python run_analysis.py full --detection-backend sep  # Use SEP (SExtractor) for faster detection
 
 Resource Profiles:
     low:    2-4GB RAM, 2 cores - uses coarser redshift grid (z_step=0.02), fewer threads
     medium: 4-8GB RAM, 4 cores - standard precision (z_step=0.01)
     high:   8GB+ RAM, 8+ cores - full precision with maximum parallelism
     auto:   Automatically detect based on available system resources (default)
+
+Detection Backends:
+    photutils: Astropy-affiliated photometry library (default, well-documented)
+    sep:       SEP (Source Extractor as Python library) - faster for large images,
+               produces SExtractor-compatible catalogs with Kron aperture photometry
+    auto:      Use SEP if available, otherwise photutils
+
+Output Structure:
+    Results are saved to output/{mode}_HDF/ directory.
+    Star identification uses both the star mask and morphology-based detection.
         """
     )
     parser.add_argument(
         "mode",
         choices=["full", "chip3", "both"],
         help="Analysis mode: 'full' for entire image, 'chip3' for chip3 only, 'both' to run full and extract chip3"
-    )
-    parser.add_argument(
-        "--run-qc",
-        action="store_true",
-        help="Run quality control pipeline after classification"
-    )
-    parser.add_argument(
-        "--qc-reference",
-        type=str,
-        default=None,
-        metavar="PATH",
-        help="Path to external reference catalog for QC validation (CSV with ra, dec, z_phot columns)"
     )
     parser.add_argument(
         "--resource-profile",
@@ -3871,6 +3988,15 @@ Resource Profiles:
         help="Resource usage profile: 'low' for constrained machines (2-4GB RAM), "
              "'medium' for typical laptops (4-8GB), 'high' for workstations (8GB+), "
              "'auto' to detect automatically (default)"
+    )
+    parser.add_argument(
+        "--detection-backend",
+        type=str,
+        choices=["photutils", "sep", "auto"],
+        default="auto",
+        help="Source detection backend: 'photutils' (default, Astropy-affiliated), "
+             "'sep' (SExtractor algorithm, faster for large images), "
+             "'auto' to use sep if available, else photutils"
     )
     args = parser.parse_args()
 
@@ -3883,173 +4009,65 @@ Resource Profiles:
     # Get the active config (may have been set by env var or command line)
     active_config = get_config()
 
+    # Determine detection backend
+    if args.detection_backend == "auto":
+        detection_backend = "sep" if SEP_AVAILABLE else "photutils"
+    elif args.detection_backend == "sep" and not SEP_AVAILABLE:
+        print("Warning: SEP not available, falling back to photutils")
+        detection_backend = "photutils"
+    else:
+        detection_backend = args.detection_backend
+
     print("=" * 60)
     print("ANGULAR SIZE TEST ANALYSIS")
     print(f"Mode: {args.mode}")
     print(f"Resource profile: {active_config.profile.value} "
           f"(threads={active_config.n_threads}, z_step={active_config.z_step})")
+    print(f"Detection backend: {detection_backend}")
     print("=" * 60)
 
+    # Determine which dataset modes to run
     if args.mode == "both":
-        # Run full analysis first
-        print("\n" + "=" * 60)
-        print("RUNNING ANALYSIS (FULL)")
-        print("=" * 60)
-        sed_catalog, sed_catalog_analysis, binned, binned_results, star_mask_centers = main("full")
-
-        # Run QC if requested
-        if args.run_qc:
-            run_quality_control(sed_catalog, "./output/full_HDF", args.qc_reference)
-
-        # Extract chip3 from full results
-        print("\n" + "=" * 60)
-        print("EXTRACTING CHIP3 SUBSET FROM FULL RESULTS")
-        print("=" * 60)
-
-        chip3_catalog, chip3_catalog_filtered = extract_chip3_from_full(
-            sed_catalog, sed_catalog_analysis
-        )
-
-        print(f"\nChip3 region in mosaic: X=[{CHIP3_X_MIN}, {CHIP3_X_MAX}], Y=[{CHIP3_Y_MIN}, {CHIP3_Y_MAX}]")
-        print(f"Extracted {len(chip3_catalog)} sources ({len(chip3_catalog_filtered)} quality-filtered)")
-
-        # Load full images for chip3 detection plots
-        print("\n  Loading full images for chip3 detection plots...")
-        full_files = {
-            "f300": "./data/hdf_north/mosaics/f300_mosaic_v2.fits",
-            "f450": "./data/hdf_north/mosaics/f450_mosaic_v2.fits",
-            "f606": "./data/hdf_north/mosaics/f606_mosaic_v2.fits",
-            "f814": "./data/hdf_north/mosaics/f814_mosaic_v2.fits",
-        }
-        chip3_images = []
-        for band, path in full_files.items():
-            data, header, _ = read_fits(path)
-            chip3_images.append(AstroImage(data=data, header=header, band=band, weight=None))
-
-        # Generate chip3 plots
-        print("\n" + "=" * 60)
-        print("GENERATING CHIP3 PLOTS")
-        print("=" * 60)
-        chip3_output_dir = "./output/chip3_HDF"
-        crop_bounds = (CHIP3_X_MIN, CHIP3_X_MAX, CHIP3_Y_MIN, CHIP3_Y_MAX)
-        analyze_and_plot_catalog(
-            chip3_catalog, chip3_catalog_filtered, chip3_output_dir,
-            title_suffix=" (Chip 3)", images=chip3_images, crop_bounds=crop_bounds,
-            star_mask_centers=star_mask_centers
-        )
-
-        # Generate plots for both full and chip3
-        print("\n" + "=" * 60)
-        print("GENERATING PLOTS")
-        print("=" * 60)
-
-        for mode_name, output_dir in [
-            ("Full Field", "./output/full_HDF"),
-            ("Chip3", "./output/chip3_HDF")
-        ]:
-            # All types combined plots
-            generate_binning_plot(data_dir=output_dir,
-                output_path=f"{output_dir}/binning_comparison.pdf",
-                dataset_name=mode_name)
-
-            # Angular size vs redshift (main science plot)
-            generate_angular_size_plot(data_dir=output_dir,
-                output_path=f"{output_dir}/angular_size_vs_redshift.pdf",
-                dataset_name=mode_name)
-
-            # Redshift distribution histograms
-            generate_redshift_histogram(data_dir=output_dir,
-                output_path=f"{output_dir}/redshift_histogram.pdf",
-                dataset_name=mode_name)
-
-            # Galaxy type histograms
-            generate_galaxy_type_histogram(data_dir=output_dir,
-                output_path=f"{output_dir}/galaxy_types.pdf",
-                dataset_name=mode_name)
-
-            # Per-galaxy-type analysis
-            print(f"\n--- Per-Galaxy-Type Analysis ({mode_name}) ---")
-            catalog_path = f"{output_dir}/galaxy_catalog.csv"
-            if os.path.exists(catalog_path):
-                type_catalog = pd.read_csv(catalog_path)
-                type_catalog = type_catalog.dropna(subset=["redshift", "r_half_arcsec", "r_half_arcsec_error"])
-                type_catalog = type_catalog[np.isfinite(type_catalog["r_half_arcsec_error"])]
-
-                valid_types = get_types_with_enough_statistics(type_catalog)
-                print(f"  Galaxy types with N >= {MIN_GALAXIES_PER_TYPE}: {valid_types}")
-                if len(valid_types) > 0:
-                    generate_size_distribution_by_type(output_dir, output_dir, mode_name)
-                    generate_type_comparison_overlay(output_dir, output_dir, mode_name)
-                    print(f"  Generating individual θ(z) fits for {len(valid_types)} types...")
-                    for gtype in valid_types:
-                        generate_per_type_fit_plot(output_dir, output_dir, mode_name, gtype)
-                else:
-                    print("  No galaxy types have enough statistics for per-type analysis.")
-
-        print("\nPlots saved to: ./output/full_HDF/ and ./output/chip3_HDF/")
-
+        dataset_modes = ["full", "chip3"]
     else:
-        # Single mode (full or chip3)
-        sed_catalog, sed_catalog_analysis, binned, binned_results, star_mask_centers = main(args.mode)
+        dataset_modes = [args.mode]
 
-        # Run QC if requested
-        if args.run_qc:
-            output_dir = f"./output/{args.mode}_HDF"
-            run_quality_control(sed_catalog, output_dir, args.qc_reference)
-
-        # Generate plots
-        output_dir = f"./output/{args.mode}_HDF"
-        dataset_name = "Full Field" if args.mode == "full" else "Chip3"
+    # Run analysis for each dataset mode
+    # Star detection always uses mask + morphology-based detection
+    all_output_dirs = []
+    for dataset_mode in dataset_modes:
         print("\n" + "=" * 60)
-        print("GENERATING PLOTS")
+        mode_desc = "Full Field" if dataset_mode == "full" else "Chip3"
+        print(f"RUNNING ANALYSIS: {mode_desc}")
         print("=" * 60)
 
-        # Binning comparison (all types)
-        generate_binning_plot(data_dir=output_dir,
-            output_path=f"{output_dir}/binning_comparison.pdf",
-            dataset_name=dataset_name)
+        # Run analysis with this configuration
+        sed_catalog, sed_catalog_analysis, binned, binned_results, star_mask_centers = main(
+            dataset_mode,
+            use_additional_star_detection=True,
+            detection_backend=detection_backend,
+        )
 
-        # Angular size vs redshift (main science plot)
-        generate_angular_size_plot(data_dir=output_dir,
-            output_path=f"{output_dir}/angular_size_vs_redshift.pdf",
-            dataset_name=dataset_name)
+        # Track output directory for plot generation
+        output_dir = f"./output/{dataset_mode}_HDF"
+        all_output_dirs.append((output_dir, mode_desc))
 
-        # Redshift distribution histograms
-        generate_redshift_histogram(data_dir=output_dir,
-            output_path=f"{output_dir}/redshift_histogram.pdf",
-            dataset_name=dataset_name)
+    # Generate plots for all output directories
+    print("\n" + "=" * 60)
+    print("GENERATING PLOTS FOR ALL CONFIGURATIONS")
+    print("=" * 60)
 
-        # Galaxy type histograms
-        generate_galaxy_type_histogram(data_dir=output_dir,
-            output_path=f"{output_dir}/galaxy_types.pdf",
-            dataset_name=dataset_name)
+    for output_dir, dataset_name in all_output_dirs:
+        print(f"\n--- Generating plots for {dataset_name} ---")
+        generate_all_plots(output_dir, dataset_name)
 
-        # Per-galaxy-type analysis
-        catalog_path = f"{output_dir}/galaxy_catalog.csv"
-        if os.path.exists(catalog_path):
-            type_catalog = pd.read_csv(catalog_path)
-            type_catalog = type_catalog.dropna(subset=["redshift", "r_half_arcsec", "r_half_arcsec_error"])
-            type_catalog = type_catalog[np.isfinite(type_catalog["r_half_arcsec_error"])]
-
-            print(f"\n--- Per-Galaxy-Type Analysis ({dataset_name}) ---")
-            valid_types = get_types_with_enough_statistics(type_catalog)
-            print(f"  Galaxy types with N >= {MIN_GALAXIES_PER_TYPE}: {valid_types}")
-            if len(valid_types) > 0:
-                generate_size_distribution_by_type(output_dir, output_dir, dataset_name)
-                generate_type_comparison_overlay(output_dir, output_dir, dataset_name)
-                print(f"  Generating individual θ(z) fits for {len(valid_types)} types...")
-                for gtype in valid_types:
-                    generate_per_type_fit_plot(output_dir, output_dir, dataset_name, gtype)
-            else:
-                print("  No galaxy types have enough statistics for per-type analysis.")
-
-            # Per-type binning comparison plots (lower threshold for more types)
-            types_for_binning = get_types_with_enough_statistics(type_catalog, min_count=MIN_GALAXIES_PER_TYPE_BINNING)
-            print(f"\n--- Per-Type Binning Comparisons ({dataset_name}) ---")
-            print(f"  Galaxy types with N >= {MIN_GALAXIES_PER_TYPE_BINNING}: {types_for_binning}")
-            if len(types_for_binning) > 0:
-                print(f"  Generating binning comparison plots for {len(types_for_binning)} types...")
-                for gtype in types_for_binning:
-                    generate_per_type_binning_comparison(output_dir, output_dir, dataset_name, gtype)
-
-        print(f"\nPlots saved to: {output_dir}/")
+    # Print summary of output locations
+    print("\n" + "=" * 60)
+    print("OUTPUT SUMMARY")
+    print("=" * 60)
+    for output_dir, dataset_name in all_output_dirs:
+        print(f"  {dataset_name}: {output_dir}/")
+    print("\nEach directory contains:")
+    print("  - galaxy_catalog.csv: Full catalog with all measurements")
+    print("  - galaxy_catalog_filtered.csv: Quality-filtered catalog for analysis")
+    print("  - Various PDF plots (binning, redshift histogram, angular size, etc.)")

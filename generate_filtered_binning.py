@@ -29,14 +29,13 @@ import builtins
 import contextlib
 
 from astropy.stats import bayesian_blocks
-from scipy.stats import chi2 as chi2_dist
 
 from scientific import (
+    compute_chi2_stats,
     get_radius,
     theta_lcdm,
     theta_static,
 )
-from validation.muse_specz import load_muse_catalog, print_validation_summary, validate_with_specz
 
 RAD_TO_ARCSEC = 180.0 * 3600.0 / np.pi
 ARCSEC_TO_RAD = np.pi / (180.0 * 3600.0)
@@ -56,17 +55,46 @@ R_PHYS_MIN_KPC = 0.3   # Minimum half-light radius
 R_PHYS_MAX_KPC = 15.0  # Maximum half-light radius (excludes obvious outliers)
 
 
-def compute_chi2_stats(z_data, theta_data, theta_err, model_func, n_params=1):
-    """Compute chi2/ndf and p-value for a model fit."""
-    theta_model = model_func(z_data)
-    residuals = (theta_data - theta_model) / theta_err
-    chi2 = np.sum(residuals**2)
-    ndf = len(z_data) - n_params
-    if ndf <= 0:
-        return {'chi2': chi2, 'ndf': ndf, 'chi2_ndf': np.nan, 'p_value': np.nan}
-    chi2_ndf = chi2 / ndf
-    p_value = 1.0 - chi2_dist.cdf(chi2, ndf)
-    return {'chi2': chi2, 'ndf': ndf, 'chi2_ndf': chi2_ndf, 'p_value': p_value}
+# =============================================================================
+# Catalog Loading Helper
+# =============================================================================
+
+def load_catalog_for_analysis(catalog_path, required_cols=None, exclude_boundary=True):
+    """Load catalog and apply standard filters including z_boundary_flag exclusion.
+
+    Parameters
+    ----------
+    catalog_path : str
+        Path to the galaxy_catalog.csv file
+    required_cols : list, optional
+        Columns that must be non-null. Default: ["redshift", "r_half_arcsec"]
+    exclude_boundary : bool
+        If True, exclude sources with z_boundary_flag=True (photo-z boundary failures)
+
+    Returns
+    -------
+    pd.DataFrame
+        Filtered catalog ready for analysis
+    """
+    if required_cols is None:
+        required_cols = ["redshift", "r_half_arcsec"]
+
+    sed_catalog = pd.read_csv(catalog_path)
+    n_loaded = len(sed_catalog)
+
+    # Drop rows with missing required columns
+    sed_catalog = sed_catalog.dropna(subset=required_cols)
+
+    # Exclude z_boundary_flag sources (photo-z fitting failures at z=0 boundary)
+    if exclude_boundary and "z_boundary_flag" in sed_catalog.columns:
+        n_before = len(sed_catalog)
+        sed_catalog = sed_catalog[sed_catalog["z_boundary_flag"] == False]
+        n_excluded = n_before - len(sed_catalog)
+        if n_excluded > 0:
+            print(f"    Excluded {n_excluded} sources with z_boundary_flag=True")
+
+    print(f"  Loaded {len(sed_catalog)} galaxies (from {n_loaded} total)")
+    return sed_catalog
 
 
 # =============================================================================
@@ -313,16 +341,26 @@ def generate_binning_plot(data_dir, output_path, dataset_name):
     print(f"Generating binning plot for: {dataset_name}")
     print(f"{'='*60}")
 
-    # Load catalog
+    # Load catalog with boundary exclusion
     catalog_path = f"{data_dir}/galaxy_catalog.csv"
     print(f"\nLoading catalog from: {catalog_path}")
-    sed_catalog = pd.read_csv(catalog_path)
-    sed_catalog = sed_catalog.dropna(subset=["redshift", "r_half_arcsec", "r_half_arcsec_error"])
-    sed_catalog = sed_catalog[np.isfinite(sed_catalog["r_half_arcsec_error"])]
-    n_total = len(sed_catalog)
-    print(f"  Loaded {n_total} galaxies")
+    sed_catalog = load_catalog_for_analysis(
+        catalog_path,
+        required_cols=["redshift", "r_half_arcsec", "r_half_arcsec_error"],
+        exclude_boundary=True
+    )
 
-    n_used = n_total
+    if len(sed_catalog) == 0:
+        print(f"  ERROR: Catalog is empty. Skipping.")
+        return
+
+    # Ensure numeric columns are properly typed
+    for col in ["redshift", "r_half_arcsec", "r_half_arcsec_error"]:
+        if col in sed_catalog.columns:
+            sed_catalog[col] = pd.to_numeric(sed_catalog[col], errors="coerce")
+
+    sed_catalog = sed_catalog[np.isfinite(sed_catalog["r_half_arcsec_error"])]
+    n_used = len(sed_catalog)
 
     if n_used < 10:
         print(f"  ERROR: Too few galaxies ({n_used}). Skipping.")
@@ -481,10 +519,19 @@ def generate_angular_size_plot(data_dir, output_path, dataset_name):
     """
     print("\n  Generating angular size vs redshift plot...")
 
-    # Load catalog
+    # Load catalog with boundary exclusion
     catalog_path = f"{data_dir}/galaxy_catalog.csv"
-    sed_catalog = pd.read_csv(catalog_path)
-    sed_catalog = sed_catalog.dropna(subset=["redshift", "r_half_arcsec", "r_half_arcsec_error"])
+    sed_catalog = load_catalog_for_analysis(
+        catalog_path,
+        required_cols=["redshift", "r_half_arcsec", "r_half_arcsec_error"],
+        exclude_boundary=True
+    )
+
+    # Guard against empty catalog before applying filters
+    if len(sed_catalog) == 0:
+        print("    ERROR: Catalog is empty. Skipping.")
+        return
+
     sed_catalog = sed_catalog[np.isfinite(sed_catalog["r_half_arcsec_error"])]
     n_used = len(sed_catalog)
 
@@ -1460,31 +1507,6 @@ def generate_validation_report(data_dir, output_dir):
     sed_catalog = pd.read_csv(catalog_path)
     sed_catalog = sed_catalog.dropna(subset=["redshift", "r_half_arcsec", "ra", "dec"])
 
-    # MUSE validation
-    try:
-        print("  Attempting MUSE spectroscopic validation...")
-        muse_catalog = load_muse_catalog(confidence_min=2)
-
-        if len(muse_catalog) > 0:
-            result = validate_with_specz(sed_catalog, muse_catalog, match_radius=1.0)
-            print_validation_summary(result)
-
-            # Save validation metrics
-            if 'metrics' in result:
-                metrics_path = f"{output_dir}/validation_muse_metrics.txt"
-                with open(metrics_path, 'w') as f:
-                    f.write("MUSE Spectroscopic Validation Results\n")
-                    f.write("=" * 50 + "\n\n")
-                    f.write(f"Matched sources: {result['n_matched']}\n")
-                    f.write(f"Valid redshifts: {result['n_valid']}\n\n")
-                    f.write("Metrics:\n")
-                    f.writelines(f"  {key}: {val:.4f}\n" for key, val in result['metrics'].items())
-                print(f"    Saved: {metrics_path}")
-        else:
-            print("    No MUSE catalog available")
-
-    except Exception as e:
-        print(f"    MUSE validation failed: {e}")
 
     # Try Fernandez-Soto validation
     fs_path = f"{os.path.dirname(data_dir)}/../../data/external/fernandez_soto_1999.csv"
@@ -1511,10 +1533,13 @@ def generate_redshift_histogram(data_dir, output_path, dataset_name):
     """Generate redshift distribution histogram."""
     print("  Generating redshift histogram...")
 
-    # Load catalog
+    # Load catalog with boundary exclusion
     catalog_path = f"{data_dir}/galaxy_catalog.csv"
-    sed_catalog = pd.read_csv(catalog_path)
-    sed_catalog = sed_catalog.dropna(subset=["redshift", "r_half_arcsec"])
+    sed_catalog = load_catalog_for_analysis(
+        catalog_path,
+        required_cols=["redshift", "r_half_arcsec"],
+        exclude_boundary=True
+    )
     n_used = len(sed_catalog)
     if n_used < 5:
         print(f"    Too few galaxies ({n_used}). Skipping.")
@@ -1564,10 +1589,13 @@ def generate_galaxy_type_histogram(data_dir, output_path, dataset_name):
     """Generate galaxy type distribution histogram."""
     print("  Generating galaxy type histogram...")
 
-    # Load catalog
+    # Load catalog with boundary exclusion
     catalog_path = f"{data_dir}/galaxy_catalog.csv"
-    sed_catalog = pd.read_csv(catalog_path)
-    sed_catalog = sed_catalog.dropna(subset=["redshift", "r_half_arcsec"])
+    sed_catalog = load_catalog_for_analysis(
+        catalog_path,
+        required_cols=["redshift", "r_half_arcsec"],
+        exclude_boundary=True
+    )
 
     if 'galaxy_type' not in sed_catalog.columns:
         print("    ERROR: No galaxy_type column. Skipping.")

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "astro-angular-size"
-version = "0.1.0"
+version = "0.2.0"
 description = "Angular size test analysis for comparing cosmological models using Hubble Deep Field data"
 readme = "README.md"
 license = "MIT"
@@ -28,92 +28,23 @@ dependencies = [
     "pandas>=2.0",
     "matplotlib>=3.7",
     "astropy>=5.3",
+    "photutils>=1.8",
+    "sep>=1.2",
+    "statmorph>=0.5",
+    "Pillow>=9.0",
+    "scikit-learn>=1.3",
+    "tqdm>=4.65",
 ]
 
 [project.optional-dependencies]
-# Photometry tools for source detection and aperture photometry
-photometry = [
-    "photutils>=1.8",
-    "sep>=1.2",
-]
+# Zoobot for deep learning morphology classification
+zoobot = ["zoobot[pytorch]>=2.0"]
 
-# Morphology analysis tools
-morphology = [
-    "statmorph>=0.5",
-    "petrofit>=0.4",
-]
-
-# Photometric redshift estimation
-photoz = [
-    "eazy>=1.0",
-]
-
-# Machine learning classification
-ml = [
-    "scikit-learn>=1.3",
-    "joblib>=1.3",
-]
-
-# MCMC sampling and analysis
-mcmc = [
-    "emcee>=3.1",
-    "corner>=2.2",
-    "arviz>=0.15",
-]
-
-# Deep learning models (heavy dependencies)
-deeplearning = [
-    "zoobot>=1.0",
-    "torch>=2.0",
-]
-
-# External catalog validation
-validation = [
-    "astroquery>=0.4",
-]
+# Numba for JIT compilation (2-5x faster photo-z fitting)
+fast = ["numba>=0.58"]
 
 # Development and testing tools
 dev = [
-    "pytest>=7.0",
-    "pytest-cov>=4.0",
-    "ruff>=0.1",
-    "mypy>=1.0",
-]
-
-# Full installation (everything except deeplearning which has heavy deps)
-full = [
-    "photutils>=1.8",
-    "sep>=1.2",
-    "statmorph>=0.5",
-    "petrofit>=0.4",
-    "eazy>=1.0",
-    "scikit-learn>=1.3",
-    "joblib>=1.3",
-    "emcee>=3.1",
-    "corner>=2.2",
-    "arviz>=0.15",
-    "astroquery>=0.4",
-    "pytest>=7.0",
-    "pytest-cov>=4.0",
-    "ruff>=0.1",
-    "mypy>=1.0",
-]
-
-# All dependencies (complete installation including deeplearning)
-all = [
-    "photutils>=1.8",
-    "sep>=1.2",
-    "statmorph>=0.5",
-    "petrofit>=0.4",
-    "eazy>=1.0",
-    "scikit-learn>=1.3",
-    "joblib>=1.3",
-    "emcee>=3.1",
-    "corner>=2.2",
-    "arviz>=0.15",
-    "zoobot>=1.0",
-    "torch>=2.0",
-    "astroquery>=0.4",
     "pytest>=7.0",
     "pytest-cov>=4.0",
     "ruff>=0.1",
@@ -154,7 +85,7 @@ ignore = [
 "__init__.py" = ["F401"]  # Allow unused imports in __init__
 
 [tool.ruff.lint.isort]
-known-first-party = ["classify", "scientific", "validation", "benchmark", "morphology", "cosmology", "download", "calibration"]
+known-first-party = ["classify", "detection", "morphology", "scientific"]
 
 [tool.ruff.format]
 quote-style = "double"

@@ -1,42 +1,52 @@
-"""Detection module with optional deep learning support.
+"""Source detection module.
 
-This module provides source detection methods for astronomical images.
+Provides source detection backends:
+- SEP (Source Extractor as Python library) - fast SExtractor-compatible detection
+- photutils - Astropy-affiliated photometry library (used in run_analysis.py)
 
-Available methods:
-- Traditional: photutils/SEP based detection
-- Deep learning: CNN-enhanced detection with star/galaxy/artifact classification
-
-Usage:
-    # Traditional detection (default)
-    from detection import detect_sources_professional
-
-    # Deep learning enhanced detection (optional)
-    from detection.deep_detection import DeepSourceDetector, detect_sources_deep
-
-References:
-- photutils: https://photutils.readthedocs.io/
-- SEP: https://sep.readthedocs.io/
-- Burke et al. 2019, MNRAS, 490, 3952 (Deep source detection)
+Usage
+-----
+>>> from detection import detect_and_measure, SEP_AVAILABLE
+>>> if SEP_AVAILABLE:
+...     catalog, background, segmap = detect_and_measure(image_data, gain=7.0)
 """
 
-# Re-export deep detection components for convenience
-try:
-    from .deep_detection import (
-        DeepSourceDetector,
-        DetectedSource,
-        SourceClassifierCNN,
-        detect_sources_deep,
-        train_source_classifier,
-    )
-    DEEP_DETECTION_AVAILABLE = True
-except ImportError:
-    DEEP_DETECTION_AVAILABLE = False
+from detection.sep_detection import (
+    SEP_AVAILABLE,
+    STATMORPH_AVAILABLE,
+    SEPBackground,
+    SEPDetectionResult,
+    check_sep_available,
+    circular_aperture_photometry,
+    compute_flux_radii,
+    compute_half_light_radius,
+    compute_statmorph,
+    convert_to_photutils_format,
+    detect_and_measure,
+    detect_sources_sep,
+    estimate_background,
+    kron_photometry,
+)
 
 __all__ = [
-    'DeepSourceDetector',
-    'DetectedSource',
-    'SourceClassifierCNN',
-    'detect_sources_deep',
-    'train_source_classifier',
-    'DEEP_DETECTION_AVAILABLE',
+    # Availability check
+    "SEP_AVAILABLE",
+    "STATMORPH_AVAILABLE",
+    "check_sep_available",
+    # Data classes
+    "SEPBackground",
+    "SEPDetectionResult",
+    # Core functions
+    "estimate_background",
+    "detect_sources_sep",
+    "detect_and_measure",
+    # Photometry
+    "kron_photometry",
+    "circular_aperture_photometry",
+    "compute_flux_radii",
+    "compute_half_light_radius",
+    # Morphology
+    "compute_statmorph",
+    # Utilities
+    "convert_to_photutils_format",
 ]
