@@ -662,7 +662,7 @@ def classify_galaxy_with_pdf(
     z_min: float = 0.0,
     z_max: float = 6.0,
     z_step: float = 0.01,
-    systematic_error_floor: float = 0.02,
+    systematic_error_floor: float = 0.10,
     apply_igm: bool = True,
     igm_model: str = "inoue14",
     apply_prior: bool = False,
@@ -684,7 +684,9 @@ def classify_galaxy_with_pdf(
     z_step : float
         Redshift grid step size
     systematic_error_floor : float
-        Systematic error floor as fraction of flux
+        Systematic error floor as fraction of flux (default 0.10 = 10%).
+        Accounts for photometric calibration uncertainties. Added in
+        quadrature to measurement errors.
     apply_igm : bool
         Apply IGM absorption for high-z sources
     igm_model : str
@@ -851,7 +853,16 @@ def classify_galaxy_with_pdf(
     # Quality flags
     n_bands = 4
     reduced_chi2 = chi_sq_min / max(1, n_bands - 1)
-    chi2_flag = 0 if reduced_chi2 < 5 else (1 if reduced_chi2 < 10 else 2)
+    # Flag both high chi2 (bad fit) AND suspiciously low chi2 (errors too large)
+    # Reduced chi2 << 1 indicates errors are overestimated and fit is unconstrained
+    if reduced_chi2 < 0.1:
+        chi2_flag = 1  # Suspicious: errors likely too large, fit unconstrained
+    elif reduced_chi2 < 5:
+        chi2_flag = 0  # Good fit
+    elif reduced_chi2 < 10:
+        chi2_flag = 1  # Marginal fit
+    else:
+        chi2_flag = 2  # Bad fit
     odds_flag = 0 if odds >= 0.9 else (1 if odds >= 0.6 else 2)
 
     return PhotoZResult(
@@ -942,7 +953,7 @@ def _find_secondary_peak(
 def classify_galaxy_batch_with_pdf(
     batch_data: list[tuple[int, list, list]],
     spectra_path: str,
-    systematic_error_floor: float = 0.02,
+    systematic_error_floor: float = 0.10,
 ) -> list[tuple[int, str, float, float, float, float, float]]:
     """Classify a batch of galaxies with PDF-based uncertainties.
 

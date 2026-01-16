@@ -614,15 +614,18 @@ class HybridPhotoZEstimator:
                 results['confidence_hybrid'][idx] = confidence
                 results['method_agreement'][idx] = agreement
 
-                # For spec-z sources, use higher confidence since redshift is trusted
+                # For spec-z sources, use spectroscopic redshift as the hybrid value
+                # but preserve the photo-z confidence to track photo-z quality
                 if has_specz is not None and has_specz[idx]:
-                    # Spec-z sources should have high confidence
-                    # Use catalog redshift as the hybrid redshift
+                    # Use catalog redshift as the hybrid redshift (spec-z is trusted)
                     results['redshift_hybrid'][idx] = z_template
                     results['redshift_hybrid_err'][idx] = template_err
                     results['z_template'][idx] = z_template
-                    # Boost confidence for spec-z (multiply by factor based on spec-z trust)
-                    results['confidence_hybrid'][idx] = max(confidence, 0.9)
+                    # Keep the original photo-z confidence (no floor)
+                    # This preserves information about photo-z quality for validation
+                    # The has_specz flag already indicates the redshift is reliable
+                    # Previously: results['confidence_hybrid'][idx] = max(confidence, 0.9)
+                    # Now: keep original confidence for quality tracking
 
         return results
 

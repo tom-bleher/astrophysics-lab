@@ -595,6 +595,7 @@ def _compute_spread_model_fallback(
 
 def get_magnitude_dependent_thresholds(
     magnitudes: NDArray,
+    completeness_priority: bool = False,
 ) -> dict[str, NDArray]:
     """Get magnitude-dependent classification thresholds.
 
@@ -606,6 +607,12 @@ def get_magnitude_dependent_thresholds(
     ----------
     magnitudes : NDArray
         Source magnitudes (typically I-band)
+    completeness_priority : bool, optional
+        If True, relax thresholds to prioritize completeness over purity.
+        This extends morphology reliability to fainter magnitudes and
+        uses more permissive thresholds. Useful for deep surveys where
+        maximizing galaxy detection is more important than minimizing
+        stellar contamination. Default is False (balanced thresholds).
 
     Returns
     -------
@@ -621,37 +628,77 @@ def get_magnitude_dependent_thresholds(
     n = len(magnitudes)
     mags = np.asarray(magnitudes)
 
-    # Default thresholds (bright sources, mag < 20)
-    concentration_threshold = np.full(n, 2.8)
-    size_threshold_factor = np.full(n, 1.5)
-    spread_model_threshold = np.full(n, 0.002)
-    use_morphology = np.ones(n, dtype=bool)
-    use_ml = np.ones(n, dtype=bool)
-    use_colors = np.zeros(n, dtype=bool)
+    if completeness_priority:
+        # Relaxed thresholds for better completeness
+        # Based on DES Y3 and KiDS-1000 approaches for faint source recovery
 
-    # Intermediate (20 <= mag < 23)
-    intermediate = (mags >= 20) & (mags < 23)
-    concentration_threshold[intermediate] = 2.5
-    size_threshold_factor[intermediate] = 1.2
-    spread_model_threshold[intermediate] = 0.003
-    use_colors[intermediate] = True
+        # Default thresholds (bright sources, mag < 21)
+        concentration_threshold = np.full(n, 3.0)  # More permissive
+        size_threshold_factor = np.full(n, 1.3)    # Less strict size cut
+        spread_model_threshold = np.full(n, 0.003) # Wider tolerance
+        use_morphology = np.ones(n, dtype=bool)
+        use_ml = np.ones(n, dtype=bool)
+        use_colors = np.zeros(n, dtype=bool)
 
-    # Faint (23 <= mag < 25)
-    faint = (mags >= 23) & (mags < 25)
-    concentration_threshold[faint] = 2.2
-    size_threshold_factor[faint] = 1.1
-    spread_model_threshold[faint] = 0.005
-    use_morphology[faint] = False  # Morphology unreliable
-    use_colors[faint] = True
+        # Intermediate (21 <= mag < 24) - extended range
+        intermediate = (mags >= 21) & (mags < 24)
+        concentration_threshold[intermediate] = 2.7
+        size_threshold_factor[intermediate] = 1.15
+        spread_model_threshold[intermediate] = 0.004
+        use_colors[intermediate] = True
+        # Keep morphology enabled for intermediate sources
 
-    # Very faint (mag >= 25)
-    very_faint = mags >= 25
-    concentration_threshold[very_faint] = np.nan
-    size_threshold_factor[very_faint] = np.nan
-    spread_model_threshold[very_faint] = np.nan
-    use_morphology[very_faint] = False
-    use_ml[very_faint] = False  # ML also unreliable
-    use_colors[very_faint] = True  # Only colors/photo-z
+        # Faint (24 <= mag < 26) - extended range, morphology still used
+        faint = (mags >= 24) & (mags < 26)
+        concentration_threshold[faint] = 2.4
+        size_threshold_factor[faint] = 1.05
+        spread_model_threshold[faint] = 0.006
+        use_morphology[faint] = True  # Keep morphology, just with relaxed thresholds
+        use_colors[faint] = True
+
+        # Very faint (mag >= 26)
+        very_faint = mags >= 26
+        concentration_threshold[very_faint] = 2.0
+        size_threshold_factor[very_faint] = 1.0
+        spread_model_threshold[very_faint] = 0.008
+        use_morphology[very_faint] = False  # Too faint even for relaxed morphology
+        use_ml[very_faint] = True  # Keep ML enabled longer
+        use_colors[very_faint] = True
+
+    else:
+        # Default balanced thresholds (original behavior)
+
+        # Default thresholds (bright sources, mag < 20)
+        concentration_threshold = np.full(n, 2.8)
+        size_threshold_factor = np.full(n, 1.5)
+        spread_model_threshold = np.full(n, 0.002)
+        use_morphology = np.ones(n, dtype=bool)
+        use_ml = np.ones(n, dtype=bool)
+        use_colors = np.zeros(n, dtype=bool)
+
+        # Intermediate (20 <= mag < 23)
+        intermediate = (mags >= 20) & (mags < 23)
+        concentration_threshold[intermediate] = 2.5
+        size_threshold_factor[intermediate] = 1.2
+        spread_model_threshold[intermediate] = 0.003
+        use_colors[intermediate] = True
+
+        # Faint (23 <= mag < 25)
+        faint = (mags >= 23) & (mags < 25)
+        concentration_threshold[faint] = 2.2
+        size_threshold_factor[faint] = 1.1
+        spread_model_threshold[faint] = 0.005
+        use_morphology[faint] = False  # Morphology unreliable
+        use_colors[faint] = True
+
+        # Very faint (mag >= 25)
+        very_faint = mags >= 25
+        concentration_threshold[very_faint] = np.nan
+        size_threshold_factor[very_faint] = np.nan
+        spread_model_threshold[very_faint] = np.nan
+        use_morphology[very_faint] = False
+        use_ml[very_faint] = False  # ML also unreliable
+        use_colors[very_faint] = True  # Only colors/photo-z
 
     return {
         'concentration_threshold': concentration_threshold,
@@ -954,6 +1001,7 @@ def classify_professional(
     mag_col: str = 'mag_auto',
     flux_cols: dict | None = None,
     error_cols: dict | None = None,
+    completeness_priority: bool = False,
     verbose: bool = True,
 ) -> pd.DataFrame:
     """Professional multi-tier star-galaxy classification.
@@ -991,6 +1039,11 @@ def classify_professional(
         Mapping of band name to flux column
     error_cols : dict, optional
         Mapping of band name to error column
+    completeness_priority : bool, optional
+        If True, use relaxed thresholds that prioritize completeness over
+        purity. Extends morphology reliability to fainter magnitudes and
+        uses more permissive thresholds. Useful for deep surveys where
+        maximizing galaxy detection is more important. Default is False.
     verbose : bool
         Print progress information
 
@@ -1039,7 +1092,9 @@ def classify_professional(
     magnitudes = catalog[mag_col].values if mag_col in catalog.columns else np.full(n_sources, 22.0)
 
     # Get magnitude-dependent thresholds
-    thresholds = get_magnitude_dependent_thresholds(magnitudes)
+    thresholds = get_magnitude_dependent_thresholds(magnitudes, completeness_priority=completeness_priority)
+    if verbose and completeness_priority:
+        print("  Using relaxed thresholds (completeness priority mode)")
 
     # =========================================================================
     # TIER 1: Gaia Cross-Match
@@ -1100,6 +1155,17 @@ def classify_professional(
         y_unc = y_coords[unclassified]
 
         sm, sm_err = compute_spread_model_batch(image, x_unc, y_unc, psf_model)
+
+        # Zero-center SPREAD_MODEL to account for systematic offset
+        # The PSF model may not perfectly match the actual image PSF,
+        # causing a systematic offset in SPREAD_MODEL values.
+        # Subtracting the median centers point sources around 0.
+        sm_valid = sm[np.isfinite(sm)]
+        if len(sm_valid) > 10:
+            sm_offset = np.median(sm_valid)
+            sm = sm - sm_offset
+            if verbose:
+                print(f"  SPREAD_MODEL zero-centered (offset={sm_offset:.4f})")
 
         results.loc[unclassified, 'spread_model'] = sm
         results.loc[unclassified, 'spread_model_err'] = sm_err

@@ -456,73 +456,6 @@ def generate_binning_plot(data_dir, output_path, dataset_name):
     plt.close()
 
 
-def generate_overlay_plot(data_dir, output_path, dataset_name):
-    """Generate binning overlay plot (all strategies on one plot)."""
-    print(f"\n  Generating overlay plot for: {dataset_name}")
-
-    # Load catalog
-    catalog_path = f"{data_dir}/galaxy_catalog.csv"
-    sed_catalog = pd.read_csv(catalog_path)
-    sed_catalog = sed_catalog.dropna(subset=["redshift", "r_half_arcsec", "r_half_arcsec_error"])
-    sed_catalog = sed_catalog[np.isfinite(sed_catalog["r_half_arcsec_error"])]
-
-    if len(sed_catalog) < 10:
-        print("    Too few galaxies. Skipping.")
-        return
-
-    # Binning strategies (1x3 layout: Equal Width, Percentile, Bayesian Blocks)
-    binning_strategies = {
-        "Equal Width": bin_equal_width,
-        "Percentile": bin_percentile,
-        "Bayesian Blocks": bin_bayesian_blocks,
-    }
-
-    binned_results = {}
-    for name, bin_func in binning_strategies.items():
-        with contextlib.suppress(builtins.BaseException):
-            binned_results[name] = bin_func(sed_catalog)
-
-    # Use percentile for model fitting
-    binned = binned_results.get("Percentile", bin_equal_width(sed_catalog))
-    R_lcdm = get_radius(binned.z_mid.values, binned.theta_med.values, binned.theta_err.values, model="lcdm")
-    R_static = get_radius(binned.z_mid.values, binned.theta_med.values, binned.theta_err.values, model="static")
-
-    z_model = np.linspace(max(0.05, sed_catalog.redshift.min()), sed_catalog.redshift.max(), 200)
-    theta_lcdm_model = theta_lcdm(z_model, R_lcdm, 0.3, 0.7) * RAD_TO_ARCSEC
-    theta_static_model = theta_static(z_model, R_static) * RAD_TO_ARCSEC
-
-    # Axis limits
-    z_lim = (max(0, sed_catalog.redshift.min() * 0.9), sed_catalog.redshift.max() * 1.05)
-    theta_lim = (max(0, sed_catalog.r_half_arcsec.min() * 0.9), sed_catalog.r_half_arcsec.max() * 1.1)
-
-    colors = {"Equal Width": "green", "Percentile": "blue", "Bayesian Blocks": "purple"}
-    markers = {"Equal Width": "o", "Percentile": "o", "Bayesian Blocks": "o"}
-
-    # Create plot
-    _fig, ax = plt.subplots(figsize=(12, 8))
-    ax.scatter(sed_catalog["redshift"], sed_catalog["r_half_arcsec"], c="lightgray", alpha=0.3, s=15,
-               label="Individual galaxies", zorder=1)
-    for name, binned_data in binned_results.items():
-        ax.errorbar(binned_data["z_mid"], binned_data["theta_med"], yerr=binned_data["theta_err"],
-                    fmt=f"{markers[name]}-", capsize=2, capthick=0.6, markersize=5, markeredgewidth=0.6,
-                    elinewidth=0.6, linewidth=1.0, color=colors[name],
-                    label=f"{name} ({len(binned_data)} bins)", alpha=0.8, zorder=2)
-    ax.plot(z_model, theta_lcdm_model, "-", color="black", linewidth=2, label=r"$\Lambda$CDM model", zorder=3)
-    ax.plot(z_model, theta_static_model, "--", color="black", linewidth=2, label=r"Static model", zorder=3)
-
-    ax.set_xlabel(r"Redshift $z$", fontsize=12)
-    ax.set_ylabel(r"Angular size $\theta$ (arcsec)", fontsize=12)
-    ax.set_title(f"All Dynamic Binning Strategies - {dataset_name}", fontsize=14)
-    ax.legend(fontsize=9, loc="upper right")
-    ax.grid(True, alpha=0.3)
-    ax.set_xlim(z_lim)
-    ax.set_ylim(theta_lim)
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=300, bbox_inches="tight")
-    print(f"    Saved: {output_path}")
-    plt.close()
-
-
 def get_types_with_enough_statistics(sed_catalog, min_count=MIN_GALAXIES_PER_TYPE):
     """Get galaxy types that have enough sources for statistical analysis."""
     if 'galaxy_type' not in sed_catalog.columns:
@@ -1842,11 +1775,6 @@ if __name__ == "__main__":
         # Binning comparison plots (all types)
         generate_binning_plot(data_dir=data_dir,
             output_path=f"{data_dir}/binning_comparison.pdf",
-            dataset_name=dataset)
-
-        # Overlay plots (all types)
-        generate_overlay_plot(data_dir=data_dir,
-            output_path=f"{data_dir}/binning_overlay.pdf",
             dataset_name=dataset)
 
         # Redshift distribution histograms

@@ -1,9 +1,13 @@
-"""ML-based star-galaxy classification using Random Forest.
+"""ML-based star-galaxy classification using Random Forest and XGBoost.
 
-This module implements a Random Forest classifier for separating stars from
+This module implements machine learning classifiers for separating stars from
 galaxies using combined photometric and morphological features. Following
 the miniJPAS approach (Baqui et al. 2021), measurement errors are included
 as features to improve classification accuracy.
+
+Classifiers available:
+- MLStarGalaxyClassifier: Random Forest (default, robust)
+- XGBoostStarGalaxyClassifier: XGBoost (often higher accuracy, faster)
 
 Features used (18 total):
 - Photometric: 4-band fluxes (U, B, V, I), colors, magnitude
@@ -14,6 +18,7 @@ Target AUC: >0.98
 
 References:
 - Baqui et al. 2021, A&A, 645, A87 (miniJPAS star-galaxy)
+- Aguilar-Argüello et al. 2025, arXiv:2501.06340 (XGBoost for morphology)
 - Fadely et al. 2012, ApJ, 760, 15 (photometric star-galaxy)
 - Abraham et al. 1994, ApJ, 432, 75 (concentration index)
 """
@@ -715,5 +720,365 @@ def extract_features_from_photometry(
     }, index=catalog.index)
 
     return features_df
+
+
+# =============================================================================
+# XGBoost Classifier (Alternative to Random Forest)
+# =============================================================================
+
+
+class XGBoostStarGalaxyClassifier:
+    """XGBoost classifier for star-galaxy separation.
+
+    XGBoost often outperforms Random Forest for morphological classification
+    (Aguilar-Argüello et al. 2025). It provides:
+    - Faster training and inference
+    - Better handling of feature interactions
+    - Built-in regularization to prevent overfitting
+
+    Attributes
+    ----------
+    model : XGBClassifier
+        The trained XGBoost model
+    scaler : StandardScaler
+        Feature scaler for normalization
+    feature_names : list
+        Names of features in order
+    is_fitted : bool
+        Whether the model has been trained
+    metrics : ClassifierMetrics
+        Performance metrics from training
+
+    Examples
+    --------
+    >>> clf = XGBoostStarGalaxyClassifier()
+    >>> metrics = clf.fit(features_df, labels)
+    >>> print(f"AUC: {metrics.auc_roc:.3f}")
+    >>> results = clf.predict(new_features)
+    """
+
+    # Same feature set as Random Forest
+    DEFAULT_FEATURES: ClassVar[list[str]] = MLStarGalaxyClassifier.DEFAULT_FEATURES
+
+    def __init__(
+        self,
+        n_estimators: int = 200,
+        max_depth: int = 6,
+        learning_rate: float = 0.1,
+        subsample: float = 0.8,
+        colsample_bytree: float = 0.8,
+        reg_alpha: float = 0.1,
+        reg_lambda: float = 1.0,
+        random_state: int = 42,
+        n_jobs: int = -1,
+        use_gpu: bool = False,
+    ):
+        """Initialize the XGBoost classifier.
+
+        Parameters
+        ----------
+        n_estimators : int
+            Number of boosting rounds (default: 200)
+        max_depth : int
+            Maximum tree depth (default: 6, lower than RF to prevent overfitting)
+        learning_rate : float
+            Boosting learning rate (default: 0.1)
+        subsample : float
+            Subsample ratio of training instances (default: 0.8)
+        colsample_bytree : float
+            Subsample ratio of columns when constructing each tree (default: 0.8)
+        reg_alpha : float
+            L1 regularization term (default: 0.1)
+        reg_lambda : float
+            L2 regularization term (default: 1.0)
+        random_state : int
+            Random seed for reproducibility (default: 42)
+        n_jobs : int
+            Number of parallel jobs, -1 for all cores (default: -1)
+        use_gpu : bool
+            Use GPU acceleration if available (default: False)
+        """
+        try:
+            from xgboost import XGBClassifier
+        except ImportError:
+            raise ImportError(
+                "XGBoost is required for XGBoostStarGalaxyClassifier. "
+                "Install with: pip install xgboost"
+            ) from None
+
+        # Configure tree method based on GPU availability
+        tree_method = "hist"  # Default CPU method (fast)
+        if use_gpu:
+            try:
+                import xgboost as xgb
+                # Check if GPU is available
+                if xgb.build_info().get("USE_CUDA", False):
+                    tree_method = "gpu_hist"
+            except Exception:
+                pass
+
+        self.model = XGBClassifier(
+            n_estimators=n_estimators,
+            max_depth=max_depth,
+            learning_rate=learning_rate,
+            subsample=subsample,
+            colsample_bytree=colsample_bytree,
+            reg_alpha=reg_alpha,
+            reg_lambda=reg_lambda,
+            random_state=random_state,
+            n_jobs=n_jobs,
+            tree_method=tree_method,
+            objective="binary:logistic",
+            eval_metric="auc",
+        )
+        self.scaler = StandardScaler()
+        self.feature_names = self.DEFAULT_FEATURES.copy()
+        self.is_fitted = False
+        self.metrics: ClassifierMetrics | None = None
+        self._use_gpu = use_gpu
+
+    def fit(
+        self,
+        features: pd.DataFrame,
+        labels: NDArray,
+        test_size: float = 0.2,
+        early_stopping_rounds: int | None = 20,
+        cv_folds: int = 5,
+        verbose: bool = False,
+    ) -> ClassifierMetrics:
+        """Train the XGBoost classifier.
+
+        Parameters
+        ----------
+        features : pd.DataFrame
+            Feature matrix with columns matching feature_names
+        labels : NDArray
+            Binary labels (1 = galaxy, 0 = star)
+        test_size : float
+            Fraction of data for testing (default: 0.2)
+        early_stopping_rounds : int, optional
+            Stop training if validation AUC doesn't improve for this many rounds.
+            Set to None to disable (default: 20)
+        cv_folds : int
+            Number of cross-validation folds (default: 5)
+        verbose : bool
+            Print training progress (default: False)
+
+        Returns
+        -------
+        ClassifierMetrics
+            Training and validation metrics
+        """
+        # Validate features
+        missing = set(self.feature_names) - set(features.columns)
+        if missing:
+            raise ValueError(f"Missing features: {missing}")
+
+        X = features[self.feature_names].values
+        y = np.asarray(labels).astype(int)
+
+        # Handle missing values
+        X = np.nan_to_num(X, nan=0, posinf=0, neginf=0)
+
+        # Handle class imbalance by computing scale_pos_weight
+        n_neg = np.sum(y == 0)
+        n_pos = np.sum(y == 1)
+        scale_pos_weight = n_neg / n_pos if n_pos > 0 else 1.0
+        self.model.set_params(scale_pos_weight=scale_pos_weight)
+
+        # Split data
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=test_size, stratify=y, random_state=42
+        )
+
+        # Scale features
+        X_train_scaled = self.scaler.fit_transform(X_train)
+        X_test_scaled = self.scaler.transform(X_test)
+
+        # Train model with early stopping
+        if early_stopping_rounds:
+            self.model.fit(
+                X_train_scaled, y_train,
+                eval_set=[(X_test_scaled, y_test)],
+                verbose=verbose,
+            )
+        else:
+            self.model.fit(X_train_scaled, y_train)
+
+        # Cross-validation
+        cv = StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=42)
+        cv_scores = cross_val_score(
+            self.model, X_train_scaled, y_train, cv=cv, scoring="roc_auc"
+        )
+
+        # Evaluate
+        y_pred = self.model.predict(X_test_scaled)
+        y_prob = self.model.predict_proba(X_test_scaled)[:, 1]
+
+        # Compute metrics
+        auc = roc_auc_score(y_test, y_prob)
+        accuracy = (y_pred == y_test).mean()
+
+        cm = confusion_matrix(y_test, y_pred)
+
+        # Per-class metrics
+        report = classification_report(y_test, y_pred, output_dict=True)
+
+        # Feature importances
+        importances = dict(zip(self.feature_names, self.model.feature_importances_, strict=False))
+
+        self.metrics = ClassifierMetrics(
+            auc_roc=auc,
+            accuracy=accuracy,
+            precision_galaxy=report["1"]["precision"],
+            recall_galaxy=report["1"]["recall"],
+            precision_star=report["0"]["precision"],
+            recall_star=report["0"]["recall"],
+            n_train=len(X_train),
+            n_test=len(X_test),
+            feature_importances=importances,
+            confusion_matrix=cm,
+            cross_val_scores=cv_scores,
+        )
+
+        self.is_fitted = True
+        return self.metrics
+
+    def predict(
+        self,
+        features: pd.DataFrame,
+    ) -> list[ClassificationResult]:
+        """Classify sources as stars or galaxies."""
+        if not self.is_fitted:
+            raise RuntimeError("Model not fitted. Call fit() first.")
+
+        X = features[self.feature_names].values
+        X = np.nan_to_num(X, nan=0, posinf=0, neginf=0)
+        X_scaled = self.scaler.transform(X)
+
+        probabilities = self.model.predict_proba(X_scaled)[:, 1]
+        predictions = probabilities > 0.5
+
+        results = []
+        for is_gal, prob in zip(predictions, probabilities, strict=False):
+            results.append(
+                ClassificationResult(
+                    is_galaxy=bool(is_gal),
+                    probability_galaxy=float(prob),
+                    probability_star=float(1 - prob),
+                    confidence=float(abs(prob - 0.5) * 2),
+                    features_used=self.feature_names,
+                )
+            )
+
+        return results
+
+    def predict_proba(self, features: pd.DataFrame) -> NDArray:
+        """Get probability of being a galaxy for each source."""
+        if not self.is_fitted:
+            raise RuntimeError("Model not fitted. Call fit() first.")
+
+        X = features[self.feature_names].values
+        X = np.nan_to_num(X, nan=0, posinf=0, neginf=0)
+        X_scaled = self.scaler.transform(X)
+
+        return self.model.predict_proba(X_scaled)[:, 1]
+
+    def save(self, path: Path | str) -> None:
+        """Save the trained model to disk."""
+        if not self.is_fitted:
+            raise RuntimeError("Model not fitted. Call fit() first.")
+
+        path = Path(path)
+        joblib.dump(
+            {
+                "model": self.model,
+                "scaler": self.scaler,
+                "feature_names": self.feature_names,
+                "metrics": self.metrics,
+                "classifier_type": "xgboost",
+            },
+            path,
+        )
+
+    @classmethod
+    def load(cls, path: Path | str) -> "XGBoostStarGalaxyClassifier":
+        """Load a trained model from disk."""
+        path = Path(path)
+        data = joblib.load(path)
+
+        instance = cls.__new__(cls)
+        instance.model = data["model"]
+        instance.scaler = data["scaler"]
+        instance.feature_names = data["feature_names"]
+        instance.metrics = data["metrics"]
+        instance.is_fitted = True
+        instance._use_gpu = False
+
+        return instance
+
+    def print_metrics(self) -> None:
+        """Print formatted classification metrics."""
+        if self.metrics is None:
+            print("No metrics available. Train the model first.")
+            return
+
+        m = self.metrics
+        print("\n" + "=" * 50)
+        print("XGBoost Star-Galaxy Classifier Performance")
+        print("=" * 50)
+        print(f"Training samples:    {m.n_train}")
+        print(f"Test samples:        {m.n_test}")
+        print(f"AUC-ROC:             {m.auc_roc:.4f}")
+        print(f"Accuracy:            {m.accuracy:.4f}")
+        print(f"Cross-val AUC:       {m.cross_val_scores.mean():.4f} +/- {m.cross_val_scores.std():.4f}")
+        print()
+        print("Per-class metrics:")
+        print(f"  Galaxy precision:  {m.precision_galaxy:.4f}")
+        print(f"  Galaxy recall:     {m.recall_galaxy:.4f}")
+        print(f"  Star precision:    {m.precision_star:.4f}")
+        print(f"  Star recall:       {m.recall_star:.4f}")
+        print()
+        print("Top 5 feature importances:")
+        sorted_imp = sorted(
+            m.feature_importances.items(), key=lambda x: x[1], reverse=True
+        )
+        for name, imp in sorted_imp[:5]:
+            print(f"  {name:20s}: {imp:.4f}")
+        print("=" * 50)
+
+
+def create_classifier(
+    classifier_type: str = "random_forest",
+    **kwargs,
+) -> MLStarGalaxyClassifier | XGBoostStarGalaxyClassifier:
+    """Factory function to create a star-galaxy classifier.
+
+    Parameters
+    ----------
+    classifier_type : str
+        Type of classifier: 'random_forest' or 'xgboost'
+    **kwargs
+        Additional arguments passed to the classifier constructor
+
+    Returns
+    -------
+    classifier
+        Classifier instance (MLStarGalaxyClassifier or XGBoostStarGalaxyClassifier)
+
+    Examples
+    --------
+    >>> clf = create_classifier('xgboost', n_estimators=300, max_depth=8)
+    >>> metrics = clf.fit(features, labels)
+    """
+    if classifier_type.lower() in ("random_forest", "rf"):
+        return MLStarGalaxyClassifier(**kwargs)
+    elif classifier_type.lower() in ("xgboost", "xgb"):
+        return XGBoostStarGalaxyClassifier(**kwargs)
+    else:
+        raise ValueError(
+            f"Unknown classifier type: {classifier_type}. "
+            "Choose 'random_forest' or 'xgboost'."
+        )
 
 

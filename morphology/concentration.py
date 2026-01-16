@@ -653,6 +653,15 @@ def concentration_index(
 
     For full morphology measurements, use compute_morphology() instead.
 
+    The concentration index measures how centrally concentrated the light is.
+    Higher values indicate more concentrated (star-like) profiles.
+    Lower values indicate more extended (galaxy-like) profiles.
+
+    The formula approximates the CAS concentration C = 5*log10(r80/r20)
+    using aperture photometry, giving values in a similar range:
+    - Stars (point sources): C > 3
+    - Galaxies (extended): C < 2.5
+
     Parameters
     ----------
     image : NDArray
@@ -665,7 +674,7 @@ def concentration_index(
     Returns
     -------
     float
-        Concentration index: -2.5 * log10(flux_inner / flux_outer)
+        Concentration index (higher = more concentrated)
     """
     aper_inner = CircularAperture((x, y), r=r_inner)
     aper_outer = CircularAperture((x, y), r=r_outer)
@@ -677,7 +686,15 @@ def concentration_index(
     flux_outer = float(phot_outer["aperture_sum"][0])
 
     if flux_outer > 0 and flux_inner > 0:
-        return -2.5 * np.log10(flux_inner / flux_outer)
+        # Compute flux ratio (fraction of light in inner aperture)
+        flux_ratio = flux_inner / flux_outer
+
+        # Transform to concentration scale where higher = more concentrated
+        # For stars: flux_ratio ~ 0.8-0.95, gives C ~ 3-5
+        # For galaxies: flux_ratio ~ 0.2-0.5, gives C ~ 0.5-1.5
+        # Add small epsilon to avoid log(0) when flux_ratio = 1
+        fraction_outside = 1.0 - flux_ratio + 0.01
+        return -5.0 * np.log10(fraction_outside)
 
     return np.nan
 

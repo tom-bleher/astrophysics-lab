@@ -430,6 +430,7 @@ def classify_professional(
     flux_cols: dict | None = None,
     error_cols: dict | None = None,
     pixel_scale: float = 0.04,
+    completeness_priority: bool = False,
     verbose: bool = True,
 ) -> pd.DataFrame:
     """Professional multi-tier star-galaxy classification.
@@ -467,6 +468,10 @@ def classify_professional(
         Mapping of band name to error column
     pixel_scale : float
         Pixel scale in arcsec/pixel
+    completeness_priority : bool, optional
+        If True, use relaxed thresholds that prioritize completeness over
+        purity. Useful for deep surveys where maximizing galaxy detection
+        is more important than minimizing stellar contamination. Default False.
     verbose : bool
         Print progress information
 
@@ -520,6 +525,7 @@ def classify_professional(
         flux_cols=flux_cols,
         error_cols=error_cols,
         pixel_scale=pixel_scale,
+        completeness_priority=completeness_priority,
         verbose=verbose,
     )
 

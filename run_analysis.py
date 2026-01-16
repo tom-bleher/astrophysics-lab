@@ -26,6 +26,7 @@ _N_THREADS = str(_RESOURCE_CONFIG.n_threads)
 
 import argparse
 from dataclasses import dataclass
+from pathlib import Path
 
 import matplotlib
 
@@ -72,7 +73,6 @@ from generate_filtered_binning import (
     generate_angular_size_plot,
     generate_binning_plot,
     generate_galaxy_type_histogram,
-    generate_overlay_plot,
     generate_per_type_binning_comparison,
     generate_per_type_fit_plot,
     generate_redshift_histogram,
@@ -106,11 +106,31 @@ from validation.external_crossmatch import apply_spectroscopic_redshifts, crossm
 USE_HYBRID_PHOTOZ = True  # ML-enhanced photo-z enabled
 
 # Zoobot Morphology Validation: Cross-validate SED types with deep learning morphology
-USE_ZOOBOT_VALIDATION = False  # Disabled - useful for validation runs only
+USE_ZOOBOT_VALIDATION = True  # Enabled - validates galaxy morphologies with deep learning
 
 # Deep Learning Detection: Use CNN-enhanced source detection with artifact rejection
 # Provides star/galaxy/artifact classification at detection stage
 USE_DEEP_DETECTION = False  # Disabled - needs pre-trained weights to be useful
+
+# Hybrid Star-Galaxy Classification: Combine multiple methods (SPREAD_MODEL, ML, colors)
+# for more robust star-galaxy separation
+USE_HYBRID_CLASSIFICATION = True  # Enabled - combines multiple classification methods
+
+# Completeness Priority Mode: Use relaxed thresholds to prioritize galaxy completeness
+# over purity. Less harsh on faint sources - better for deep surveys.
+USE_COMPLETENESS_PRIORITY = True  # Enabled - less harsh, catches more faint galaxies
+
+# XGBoost ML Classifier: Use XGBoost instead of Random Forest for ML classification
+# XGBoost often outperforms RF for star-galaxy separation (Aguilar-Argüello et al. 2025)
+USE_XGBOOST_CLASSIFIER = True  # Enabled - better performance than Random Forest
+
+# Deep Learning Cosmic Ray Removal: Use deepCR neural network for CR detection
+# Superior to LACosmic for faint sources and single exposures (Zhang & Bloom 2020)
+USE_DEEPCR = False  # Disabled - requires CUDA GPU (enable if GPU available)
+
+# Morpheus Pixel-Level Segmentation: Per-pixel star/galaxy/artifact classification
+# Excellent for crowded fields and identifying merger components (Hausen & Robertson 2020)
+USE_MORPHEUS = True  # Enabled - pixel-level morphological classification
 
 # Import modules when enabled
 if USE_HYBRID_PHOTOZ:
@@ -126,6 +146,51 @@ if USE_ZOOBOT_VALIDATION:
 
 if USE_DEEP_DETECTION:
     from detection import DeepSourceDetector, detect_sources_deep
+
+if USE_HYBRID_CLASSIFICATION:
+    from morphology.hybrid_classifier import (
+        HybridStarGalaxyClassifier,
+        HybridClassifierConfig,
+        create_hybrid_classifier,
+    )
+
+if USE_XGBOOST_CLASSIFIER:
+    from morphology.ml_classifier import create_classifier, XGBoostStarGalaxyClassifier
+
+# Import Zoobot star-galaxy classifier for hybrid classification (optional)
+try:
+    from morphology.deep_learning_classifier import (
+        ZoobotStarGalaxyClassifier,
+        check_zoobot_availability,
+    )
+    ZOOBOT_AVAILABLE = check_zoobot_availability()
+except ImportError:
+    ZOOBOT_AVAILABLE = False
+
+# Import preprocessing modules (deepCR, Morpheus)
+if USE_DEEPCR:
+    try:
+        from preprocessing.cosmic_ray_removal import (
+            clean_cosmic_rays,
+            check_deepcr_availability,
+        )
+        DEEPCR_AVAILABLE = check_deepcr_availability()
+    except ImportError:
+        DEEPCR_AVAILABLE = False
+else:
+    DEEPCR_AVAILABLE = False
+
+if USE_MORPHEUS:
+    try:
+        from preprocessing.morpheus_segmentation import (
+            segment_image,
+            check_morpheus_availability,
+        )
+        MORPHEUS_AVAILABLE = check_morpheus_availability()
+    except ImportError:
+        MORPHEUS_AVAILABLE = False
+else:
+    MORPHEUS_AVAILABLE = False
 
 # Professional star-galaxy classification (research-standard)
 USE_PROFESSIONAL_CLASSIFICATION = True  # Set to False to use basic classification only
@@ -231,6 +296,8 @@ FLAG_BAD_PHOTOZ = 32    # Photo-z ODDS < 0.6 (unreliable redshift)
 FLAG_PSF_LIKE = 64      # Source is PSF-like (possible star)
 FLAG_MASKED = 128       # Partially overlaps with masked region
 FLAG_UNRELIABLE_Z = 256 # Redshift error exceeds redshift (σ_z > z)
+FLAG_VERY_LOW_SNR = 512 # Very low SNR (median < 0.5) - unreliable photometry
+FLAG_HIGH_Z_UNRELIABLE = 1024  # High redshift (z > 2) with large uncertainty
 
 # Human-readable flag descriptions
 FLAG_DESCRIPTIONS = {
@@ -243,6 +310,8 @@ FLAG_DESCRIPTIONS = {
     FLAG_PSF_LIKE: "psf_like",
     FLAG_MASKED: "masked",
     FLAG_UNRELIABLE_Z: "unreliable_z",
+    FLAG_VERY_LOW_SNR: "very_low_snr",
+    FLAG_HIGH_Z_UNRELIABLE: "high_z_unreliable",
 }
 
 
@@ -595,8 +664,8 @@ def adjust_data(data):
     return data
 
 
-def read_fits(file_path, weight_path=None):
-    """Read FITS file with optional weight map.
+def read_fits(file_path, weight_path=None, clean_cosmic_rays_flag=None, instrument='WFPC2'):
+    """Read FITS file with optional weight map and cosmic ray removal.
 
     Parameters
     ----------
@@ -604,11 +673,15 @@ def read_fits(file_path, weight_path=None):
         Path to science FITS file
     weight_path : str, optional
         Path to weight (inverse variance) FITS file
+    clean_cosmic_rays_flag : bool, optional
+        Whether to clean cosmic rays. If None, uses USE_DEEPCR setting.
+    instrument : str, optional
+        HST instrument for deepCR threshold optimization. Default 'WFPC2'.
 
     Returns
     -------
     data : np.ndarray
-        Science image data
+        Science image data (cleaned if CR removal enabled)
     header : fits.Header
         FITS header
     weight : np.ndarray or None
@@ -642,6 +715,19 @@ def read_fits(file_path, weight_path=None):
         except FileNotFoundError:
             print(f"  Warning: Weight file not found: {weight_path}")
             weight = None
+
+    # Clean cosmic rays if enabled
+    do_cr_cleaning = clean_cosmic_rays_flag if clean_cosmic_rays_flag is not None else USE_DEEPCR
+    if do_cr_cleaning and DEEPCR_AVAILABLE:
+        print(f"  Cleaning cosmic rays from {Path(file_path).name}...")
+        data, cr_mask = clean_cosmic_rays(
+            data,
+            instrument=instrument,
+            verbose=True,
+        )
+        # Update weight map to downweight CR-affected pixels
+        if weight is not None:
+            weight[cr_mask] *= 0.1  # Reduce weight of inpainted pixels
 
     return data, header, weight
 
@@ -842,9 +928,9 @@ def analyze_and_plot_catalog(
     plt.close()
     print(f"    Saved: {output_dir}/individual_galaxies.pdf")
 
-    # Plot 3: Binning strategy comparison (2x2 grid with residuals) - matches full version exactly
-    fig = plt.figure(figsize=(14, 16), constrained_layout=True)
-    gs = fig.add_gridspec(4, 2, height_ratios=[3, 1, 3, 1], hspace=0.08, wspace=0.15)
+    # Plot 3: Binning strategy comparison (1x3 grid with residuals)
+    fig = plt.figure(figsize=(18, 10), constrained_layout=True)
+    gs = fig.add_gridspec(3, 3, height_ratios=[3, 1, 1], hspace=0.08, wspace=0.15)
 
     colors = {
         "Equal Width": "green",
@@ -857,12 +943,11 @@ def analyze_and_plot_catalog(
 
     for idx, name in enumerate(strategy_names):
         binned_data = binned_results[name]
-        # Grid position: first two strategies in rows 0-1, last two in rows 2-3
-        row_base = (idx // 2) * 2  # 0 or 2 for main plots
-        col = idx % 2
+        col = idx  # 1x3 layout: each strategy in its own column
 
-        ax_main = fig.add_subplot(gs[row_base, col])
-        ax_resid = fig.add_subplot(gs[row_base + 1, col], sharex=ax_main)
+        ax_main = fig.add_subplot(gs[0, col])
+        ax_resid_lcdm = fig.add_subplot(gs[1, col], sharex=ax_main)
+        ax_resid_static = fig.add_subplot(gs[2, col], sharex=ax_main)
 
         # Fit models for this binning
         R_static_i = get_radius(
@@ -949,13 +1034,15 @@ def analyze_and_plot_catalog(
         ax_main.set_ylim(theta_lim)
         plt.setp(ax_main.get_xticklabels(), visible=False)
 
-        # Calculate residuals: (data - LCDM model) in arcsec
+        # Calculate residuals
         theta_lcdm_at_data = theta_lcdm_flat(binned_data["z_mid"].values, R_lcdm_i, Omega_m_i) * RAD_TO_ARCSEC
+        theta_static_at_data = theta_static(binned_data["z_mid"].values, R_static_i) * RAD_TO_ARCSEC
         residuals_lcdm = binned_data["theta_med"].values - theta_lcdm_at_data
+        residuals_static = binned_data["theta_med"].values - theta_static_at_data
 
-        # Residual plot
-        ax_resid.axhline(0, color="darkblue", linestyle="-", linewidth=1.5, alpha=0.7)
-        ax_resid.errorbar(
+        # ΛCDM residual plot
+        ax_resid_lcdm.axhline(0, color="darkblue", linestyle="-", linewidth=1.5, alpha=0.7)
+        ax_resid_lcdm.errorbar(
             binned_data["z_mid"],
             residuals_lcdm,
             yerr=binned_data["theta_err"],
@@ -968,12 +1055,34 @@ def analyze_and_plot_catalog(
             color=colors[name],
             zorder=3,
         )
-        ax_resid.set_xlabel(r"Redshift $z$", fontsize=11)
-        ax_resid.set_ylabel(r"$\theta - \theta_{\Lambda\mathrm{CDM}}$", fontsize=9)
-        ax_resid.grid(True, alpha=0.3)
-        ax_resid.set_xlim(z_lim)
-        max_resid = max(0.05, np.max(np.abs(residuals_lcdm) + binned_data["theta_err"].values) * 1.2)
-        ax_resid.set_ylim(-max_resid, max_resid)
+        ax_resid_lcdm.set_ylabel(r"$\theta - \theta_{\Lambda\mathrm{CDM}}$", fontsize=9)
+        ax_resid_lcdm.grid(True, alpha=0.3)
+        ax_resid_lcdm.set_xlim(z_lim)
+        max_resid_lcdm = max(0.05, np.max(np.abs(residuals_lcdm) + binned_data["theta_err"].values) * 1.2)
+        ax_resid_lcdm.set_ylim(-max_resid_lcdm, max_resid_lcdm)
+        plt.setp(ax_resid_lcdm.get_xticklabels(), visible=False)
+
+        # Static residual plot
+        ax_resid_static.axhline(0, color="gray", linestyle="--", linewidth=1.5, alpha=0.7)
+        ax_resid_static.errorbar(
+            binned_data["z_mid"],
+            residuals_static,
+            yerr=binned_data["theta_err"],
+            fmt=markers[name],
+            capsize=2,
+            capthick=0.6,
+            markersize=5,
+            markeredgewidth=0.6,
+            elinewidth=0.6,
+            color=colors[name],
+            zorder=3,
+        )
+        ax_resid_static.set_xlabel(r"Redshift $z$", fontsize=11)
+        ax_resid_static.set_ylabel(r"$\theta - \theta_{\mathrm{Static}}$", fontsize=9)
+        ax_resid_static.grid(True, alpha=0.3)
+        ax_resid_static.set_xlim(z_lim)
+        max_resid_static = max(0.05, np.max(np.abs(residuals_static) + binned_data["theta_err"].values) * 1.2)
+        ax_resid_static.set_ylim(-max_resid_static, max_resid_static)
 
     fig.suptitle(r"Binning Strategies: $\Lambda$CDM vs Static" + title_suffix, fontsize=14, fontweight="bold")
     plt.savefig(f"{output_dir}/binning_comparison.pdf", dpi=300, bbox_inches="tight")
@@ -1001,9 +1110,9 @@ def analyze_and_plot_catalog(
         if len(type_binned_results) < 2:
             continue  # Need at least 2 strategies to make a comparison plot
 
-        # Create the same 2x2 grid with residuals plot
-        fig_type = plt.figure(figsize=(14, 16), constrained_layout=True)
-        gs_type = fig_type.add_gridspec(4, 2, height_ratios=[3, 1, 3, 1], hspace=0.08, wspace=0.15)
+        # Create 1x3 grid with residuals plot
+        fig_type = plt.figure(figsize=(18, 10), constrained_layout=True)
+        gs_type = fig_type.add_gridspec(3, 3, height_ratios=[3, 1, 1], hspace=0.08, wspace=0.15)
 
         # Dynamic axis limits for this type
         z_min_type = type_catalog["redshift"].min()
@@ -1018,13 +1127,13 @@ def analyze_and_plot_catalog(
 
         strategy_names_type = list(type_binned_results.keys())
 
-        for idx, name in enumerate(strategy_names_type[:4]):  # Max 4 strategies
+        for idx, name in enumerate(strategy_names_type[:3]):  # Max 3 strategies for 1x3
             binned_data = type_binned_results[name]
-            row_base = (idx // 2) * 2
-            col = idx % 2
+            col = idx  # 1x3 layout: each strategy in its own column
 
-            ax_main = fig_type.add_subplot(gs_type[row_base, col])
-            ax_resid = fig_type.add_subplot(gs_type[row_base + 1, col], sharex=ax_main)
+            ax_main = fig_type.add_subplot(gs_type[0, col])
+            ax_resid_lcdm = fig_type.add_subplot(gs_type[1, col], sharex=ax_main)
+            ax_resid_static = fig_type.add_subplot(gs_type[2, col], sharex=ax_main)
 
             # Fit models for this binning
             R_static_type = get_radius(
@@ -1111,11 +1220,13 @@ def analyze_and_plot_catalog(
 
             # Calculate residuals
             theta_lcdm_at_data_type = theta_lcdm_flat(binned_data["z_mid"].values, R_lcdm_type, Omega_m_type) * RAD_TO_ARCSEC
+            theta_static_at_data_type = theta_static(binned_data["z_mid"].values, R_static_type) * RAD_TO_ARCSEC
             residuals_lcdm_type = binned_data["theta_med"].values - theta_lcdm_at_data_type
+            residuals_static_type = binned_data["theta_med"].values - theta_static_at_data_type
 
-            # Residual plot
-            ax_resid.axhline(0, color="darkblue", linestyle="-", linewidth=1.5, alpha=0.7)
-            ax_resid.errorbar(
+            # ΛCDM residual plot
+            ax_resid_lcdm.axhline(0, color="darkblue", linestyle="-", linewidth=1.5, alpha=0.7)
+            ax_resid_lcdm.errorbar(
                 binned_data["z_mid"],
                 residuals_lcdm_type,
                 yerr=binned_data["theta_err"],
@@ -1128,12 +1239,34 @@ def analyze_and_plot_catalog(
                 color=colors[name],
                 zorder=3,
             )
-            ax_resid.set_xlabel(r"Redshift $z$", fontsize=11)
-            ax_resid.set_ylabel(r"$\theta - \theta_{\Lambda\mathrm{CDM}}$", fontsize=9)
-            ax_resid.grid(True, alpha=0.3)
-            ax_resid.set_xlim(z_lim_type)
-            max_resid_type = max(0.05, np.max(np.abs(residuals_lcdm_type) + binned_data["theta_err"].values) * 1.2)
-            ax_resid.set_ylim(-max_resid_type, max_resid_type)
+            ax_resid_lcdm.set_ylabel(r"$\theta - \theta_{\Lambda\mathrm{CDM}}$", fontsize=9)
+            ax_resid_lcdm.grid(True, alpha=0.3)
+            ax_resid_lcdm.set_xlim(z_lim_type)
+            max_resid_lcdm_type = max(0.05, np.max(np.abs(residuals_lcdm_type) + binned_data["theta_err"].values) * 1.2)
+            ax_resid_lcdm.set_ylim(-max_resid_lcdm_type, max_resid_lcdm_type)
+            plt.setp(ax_resid_lcdm.get_xticklabels(), visible=False)
+
+            # Static residual plot
+            ax_resid_static.axhline(0, color="gray", linestyle="--", linewidth=1.5, alpha=0.7)
+            ax_resid_static.errorbar(
+                binned_data["z_mid"],
+                residuals_static_type,
+                yerr=binned_data["theta_err"],
+                fmt=markers[name],
+                capsize=2,
+                capthick=0.6,
+                markersize=5,
+                markeredgewidth=0.6,
+                elinewidth=0.6,
+                color=colors[name],
+                zorder=3,
+            )
+            ax_resid_static.set_xlabel(r"Redshift $z$", fontsize=11)
+            ax_resid_static.set_ylabel(r"$\theta - \theta_{\mathrm{Static}}$", fontsize=9)
+            ax_resid_static.grid(True, alpha=0.3)
+            ax_resid_static.set_xlim(z_lim_type)
+            max_resid_static_type = max(0.05, np.max(np.abs(residuals_static_type) + binned_data["theta_err"].values) * 1.2)
+            ax_resid_static.set_ylim(-max_resid_static_type, max_resid_static_type)
 
         # Create safe filename from galaxy type
         safe_gtype = gtype.replace(" ", "_").replace("/", "-").lower()
@@ -1141,65 +1274,6 @@ def analyze_and_plot_catalog(
         plt.savefig(f"{output_dir}/binning_comparison_{safe_gtype}.pdf", dpi=300, bbox_inches="tight")
         plt.close()
         print(f"    Saved: {output_dir}/binning_comparison_{safe_gtype}.pdf")
-
-    # Plot 4: All binning strategies overlaid
-    _fig, ax = plt.subplots(figsize=(12, 8))
-
-    # Background scatter
-    ax.scatter(
-        sed_catalog_analysis["redshift"],
-        sed_catalog_analysis["r_half_arcsec"],
-        c="lightgray",
-        alpha=0.3,
-        s=15,
-        label="Individual galaxies",
-        zorder=1,
-    )
-
-    for name, binned_data in binned_results.items():
-        ax.errorbar(
-            binned_data["z_mid"],
-            binned_data["theta_med"],
-            yerr=binned_data["theta_err"],
-            fmt=f"{markers[name]}-",
-            capsize=2,
-            capthick=0.6,
-            markersize=5,
-            markeredgewidth=0.6,
-            elinewidth=0.6,
-            linewidth=1.0,
-            color=colors[name],
-            label=f"{name}",
-            alpha=0.8,
-            zorder=2,
-        )
-
-    # Add LCDM model curve (using percentile fit)
-    ax.plot(
-        z_model, theta_lcdm_model, "-", color="black", linewidth=2, label=r"$\Lambda$CDM model", zorder=3
-    )
-    ax.plot(
-        z_model,
-        theta_static_model,
-        "--",
-        color="black",
-        linewidth=2,
-        label=r"Static model",
-        zorder=3,
-    )
-
-    ax.set_xlabel(r"Redshift $z$", fontsize=12)
-    ax.set_ylabel(r"Angular size $\theta$ (arcsec)", fontsize=12)
-    ax.set_title(r"All Binning Strategies Compared" + title_suffix, fontsize=14)
-    ax.legend(fontsize=10, loc="upper right")
-    ax.grid(True, alpha=0.3)
-    ax.set_xlim(z_lim)
-    ax.set_ylim(theta_lim)
-
-    plt.tight_layout()
-    plt.savefig(f"{output_dir}/binning_overlay.pdf", dpi=300, bbox_inches="tight")
-    plt.close()
-    print(f"    Saved: {output_dir}/binning_overlay.pdf")
 
     # Plot 5: Redshift histogram with dynamic limits
     _fig, ax = plt.subplots(figsize=(10, 6))
@@ -2162,6 +2236,11 @@ def main(mode: str = "full", output_subdir: str | None = None):
             if matches["snr_min"] < 5.0:
                 flag |= FLAG_LOW_SNR
 
+            # Check for very low SNR (median < 0.5) - unreliable photometry
+            # Sources with SNR < 0.5 have 50% catastrophic photo-z rate
+            if matches["snr_median"] < 0.5:
+                flag |= FLAG_VERY_LOW_SNR
+
             # Check for edge proximity (within 50 pixels of edge)
             edge_margin = 50
             if (ref_x < edge_margin or ref_x > image_shape[1] - edge_margin or
@@ -2396,6 +2475,9 @@ def main(mode: str = "full", output_subdir: str | None = None):
         )
         print(f"  Flagged {n_unreliable_z} sources with unreliable redshifts (σ_z > z)")
 
+    # NOTE: High-z flag (FLAG_HIGH_Z_UNRELIABLE) is set later after hybrid classifier
+    # runs, since it requires z_ml and confidence_hybrid columns
+
     # Add color-based stellar contamination check
     # Stars have flat SEDs (small color scatter), galaxies have strong colors
     # Using vectorized computation (100-700x faster than iterrows)
@@ -2422,9 +2504,17 @@ def main(mode: str = "full", output_subdir: str | None = None):
     # =========================================================================
     # PROFESSIONAL STAR-GALAXY CLASSIFICATION (Research Standard)
     # Uses multi-tier approach: Gaia → SPREAD_MODEL → ML → Color-color
+    # With optional hybrid classification combining multiple methods
     # =========================================================================
     if USE_PROFESSIONAL_CLASSIFICATION:
         print("\n  Running professional star-galaxy classification...")
+        if USE_COMPLETENESS_PRIORITY:
+            print("    Mode: COMPLETENESS PRIORITY (relaxed thresholds for faint sources)")
+        if USE_HYBRID_CLASSIFICATION:
+            print("    Mode: HYBRID CLASSIFICATION (combining multiple methods)")
+        if USE_XGBOOST_CLASSIFIER:
+            print("    ML Backend: XGBoost")
+
         try:
             # Query Gaia DR3 for foreground stars
             HDF_CENTER_RA = 189.228621
@@ -2451,18 +2541,85 @@ def main(mode: str = "full", output_subdir: str | None = None):
             if ref_image is None:
                 ref_image = images[0].data
 
-            # Run professional classification
+            # Initialize ML classifier if enabled
+            ml_classifier = None
+            if USE_XGBOOST_CLASSIFIER:
+                try:
+                    ml_classifier = create_classifier('xgboost')
+                    print("    Initialized XGBoost classifier")
+                except Exception as e:
+                    print(f"    Warning: Could not initialize XGBoost: {e}")
+                    # Fall back to no ML classifier
+
+            # Run professional classification with all enabled features
             classification_results = classify_professional(
                 catalog=sed_catalog,
                 image=ref_image,
                 wcs=reference_wcs,
                 gaia_catalog=gaia_catalog,
+                ml_classifier=ml_classifier,
                 x_col="xcentroid",
                 y_col="ycentroid",
                 ra_col="ra",
                 dec_col="dec",
+                completeness_priority=USE_COMPLETENESS_PRIORITY,
                 verbose=True,
             )
+
+            # If hybrid classification is enabled, run additional ensemble voting
+            if USE_HYBRID_CLASSIFICATION and 'spread_model' in classification_results.columns:
+                print("    Running hybrid ensemble classification...")
+                try:
+                    # Initialize deep learning classifier if available
+                    dl_classifier = None
+                    if ZOOBOT_AVAILABLE:
+                        try:
+                            dl_classifier = ZoobotStarGalaxyClassifier()
+                            dl_classifier.load_pretrained()
+                            print("    Deep learning: Zoobot loaded")
+                        except Exception as e:
+                            print(f"    Deep learning: Zoobot not available ({e})")
+                            dl_classifier = None
+
+                    hybrid_config = HybridClassifierConfig(
+                        use_bayesian=False,  # Weighted voting
+                        min_confidence=0.3,
+                        min_agreeing_methods=2,
+                    )
+                    hybrid_clf = HybridStarGalaxyClassifier(
+                        config=hybrid_config,
+                        ml_classifier=ml_classifier,
+                        deep_learning_classifier=dl_classifier,
+                    )
+
+                    # Run hybrid classification
+                    hybrid_results = hybrid_clf.classify(
+                        catalog=sed_catalog,
+                        spread_model=classification_results['spread_model'].values,
+                        spread_model_err=classification_results.get('spread_model_err', pd.Series(np.full(len(sed_catalog), 0.003))).values,
+                        concentration=classification_results.get('concentration_c', pd.Series()).values if 'concentration_c' in classification_results.columns else None,
+                        magnitudes=sed_catalog['mag_auto'].values if 'mag_auto' in sed_catalog.columns else None,
+                        gaia_stars=classification_results['gaia_confirmed_star'].values if 'gaia_confirmed_star' in classification_results.columns else None,
+                    )
+
+                    # Merge hybrid results (prefix with 'hybrid_')
+                    for col in hybrid_results.columns:
+                        classification_results[f'hybrid_{col}'] = hybrid_results[col].values
+
+                    # Use hybrid classification as primary if confidence is high
+                    hybrid_conf = hybrid_results['confidence'].values
+                    use_hybrid = hybrid_conf > 0.5
+                    if use_hybrid.any():
+                        classification_results.loc[use_hybrid, 'is_galaxy'] = hybrid_results.loc[use_hybrid, 'is_galaxy'].values
+                        classification_results.loc[use_hybrid, 'is_star'] = hybrid_results.loc[use_hybrid, 'is_star'].values
+                        classification_results.loc[use_hybrid, 'probability_galaxy'] = hybrid_results.loc[use_hybrid, 'probability_galaxy'].values
+                        classification_results.loc[use_hybrid, 'confidence'] = hybrid_conf[use_hybrid]
+
+                    n_hybrid = use_hybrid.sum()
+                    print(f"    Hybrid classification applied to {n_hybrid} sources")
+
+                except Exception as e:
+                    print(f"    Warning: Hybrid classification failed: {e}")
 
             # Merge professional classification results
             pro_cols = ['is_galaxy', 'is_star', 'probability_galaxy', 'confidence',
@@ -2527,6 +2684,9 @@ def main(mode: str = "full", output_subdir: str | None = None):
                 # Update pro_is_star column if it exists
                 if 'pro_is_star' in sed_catalog.columns:
                     sed_catalog.loc[sed_catalog['star_3dhst'], 'pro_is_star'] = True
+                    # Also update pro_is_galaxy to maintain consistency
+                    if 'pro_is_galaxy' in sed_catalog.columns:
+                        sed_catalog.loc[sed_catalog['star_3dhst'], 'pro_is_galaxy'] = False
 
         # Apply spectroscopic redshifts from 3D-HST where available
         # This fixes catastrophic photo-z failures
@@ -2627,6 +2787,27 @@ def main(mode: str = "full", output_subdir: str | None = None):
                 for key, values in hybrid_results.items():
                     sed_catalog[key] = values
 
+                # Flag high-z sources (z > 2) as potentially unreliable
+                # These have higher catastrophic photo-z rates due to:
+                # - Lyman/Balmer break degeneracy
+                # - Limited template coverage at high-z
+                # - IGM absorption uncertainties
+                if 'z_ml' in sed_catalog.columns and 'z_template' in sed_catalog.columns:
+                    high_z_mask = (
+                        (sed_catalog["redshift"] > 2.0) &
+                        # Also require some uncertainty indicator (ml disagreement or low confidence)
+                        (
+                            (np.abs(sed_catalog["z_ml"] - sed_catalog["z_template"]) > 0.3) |
+                            (sed_catalog["confidence_hybrid"] < 0.92)
+                        )
+                    )
+                    n_high_z = high_z_mask.sum()
+                    if n_high_z > 0:
+                        sed_catalog.loc[high_z_mask, "quality_flag"] = (
+                            sed_catalog.loc[high_z_mask, "quality_flag"].astype(int) | FLAG_HIGH_Z_UNRELIABLE
+                        )
+                        print(f"    Flagged {n_high_z} high-z sources (z > 2) with uncertain redshifts")
+
                 print(f"    Hybrid photo-z improvement: {100*hybrid_metrics.get('improvement_nmad', 0):.1f}% NMAD reduction")
             else:
                 print("    Skipping hybrid photo-z: insufficient spectroscopic training data")
@@ -2685,6 +2866,49 @@ def main(mode: str = "full", output_subdir: str | None = None):
 
         except Exception as e:
             print(f"    Warning: Zoobot validation failed: {e}")
+
+    # ==========================================================================
+    # OPTIONAL: Morpheus Pixel-Level Segmentation
+    # ==========================================================================
+    if USE_MORPHEUS and MORPHEUS_AVAILABLE:
+        print("\n  Running Morpheus pixel-level segmentation...")
+        try:
+            # Get multi-band images for better segmentation
+            band_images = {}
+            for img in images:
+                if img.band == 'f814':
+                    band_images['H'] = img.data  # Use I-band as H proxy
+                elif img.band == 'f606':
+                    band_images['J'] = img.data  # Use V-band as J proxy
+
+            if len(band_images) == 0:
+                band_images['H'] = images[0].data
+
+            # Run Morpheus segmentation
+            morpheus_result = segment_image(band_images, verbose=True)
+
+            # Use Morpheus point source detection to refine star classification
+            morpheus_stars = morpheus_result.point_source > 0.7
+            n_morpheus_stars = 0
+            for idx, row in sed_catalog.iterrows():
+                x, y = int(row['xcentroid']), int(row['ycentroid'])
+                if 0 <= x < morpheus_stars.shape[1] and 0 <= y < morpheus_stars.shape[0]:
+                    # Check if source centroid is in point source region
+                    if morpheus_stars[y, x]:
+                        sed_catalog.loc[idx, 'morpheus_point_source'] = True
+                        n_morpheus_stars += 1
+                    else:
+                        sed_catalog.loc[idx, 'morpheus_point_source'] = False
+
+            print(f"    Morpheus identified {n_morpheus_stars} likely point sources")
+
+            # Save segmentation map
+            seg_path = Path(output_dir) / 'morpheus_segmentation.npy'
+            np.save(seg_path, morpheus_result.classification_map)
+            print(f"    Saved segmentation map to {seg_path}")
+
+        except Exception as e:
+            print(f"    Warning: Morpheus segmentation failed: {e}")
 
     # Report photo-z quality statistics
     odds_good = (sed_catalog["photo_z_odds"] >= 0.9).sum()
@@ -2750,7 +2974,9 @@ def main(mode: str = "full", output_subdir: str | None = None):
         STRICT_EXCLUDE_FLAGS = (
             FLAG_BLENDED | FLAG_EDGE | FLAG_SATURATED | FLAG_LOW_SNR |
             FLAG_CROWDED | FLAG_BAD_PHOTOZ | FLAG_PSF_LIKE | FLAG_MASKED |
-            FLAG_UNRELIABLE_Z  # Exclude sources where σ_z > z
+            FLAG_UNRELIABLE_Z |  # Exclude sources where σ_z > z
+            FLAG_VERY_LOW_SNR |  # Exclude sources with SNR < 0.5 (50% catastrophic rate)
+            FLAG_HIGH_Z_UNRELIABLE  # Exclude uncertain high-z sources
         )
 
         # Apply all quality cuts
@@ -3043,9 +3269,9 @@ def main(mode: str = "full", output_subdir: str | None = None):
     plt.close()
     print(f"  Saved: {output_dir}/individual_galaxies.pdf")
 
-    # Plot 3: Binning strategy comparison (2x2 grid with residuals)
-    fig = plt.figure(figsize=(14, 16), constrained_layout=True)
-    gs = fig.add_gridspec(4, 2, height_ratios=[3, 1, 3, 1], hspace=0.08, wspace=0.15)
+    # Plot 3: Binning strategy comparison (1x3 grid with residuals)
+    fig = plt.figure(figsize=(18, 10), constrained_layout=True)
+    gs = fig.add_gridspec(3, 3, height_ratios=[3, 1, 1], hspace=0.08, wspace=0.15)
 
     colors = {
         "Equal Width": "green",
@@ -3058,12 +3284,11 @@ def main(mode: str = "full", output_subdir: str | None = None):
 
     for idx, name in enumerate(strategy_names):
         binned_data = binned_results[name]
-        # Grid position: first two strategies in rows 0-1, last two in rows 2-3
-        row_base = (idx // 2) * 2  # 0 or 2 for main plots
-        col = idx % 2
+        col = idx  # 1x3 layout: each strategy in its own column
 
-        ax_main = fig.add_subplot(gs[row_base, col])
-        ax_resid = fig.add_subplot(gs[row_base + 1, col], sharex=ax_main)
+        ax_main = fig.add_subplot(gs[0, col])
+        ax_resid_lcdm = fig.add_subplot(gs[1, col], sharex=ax_main)
+        ax_resid_static = fig.add_subplot(gs[2, col], sharex=ax_main)
 
         # Fit models for this binning
         R_static_i = get_radius(
@@ -3150,13 +3375,15 @@ def main(mode: str = "full", output_subdir: str | None = None):
         ax_main.set_ylim(theta_lim)
         plt.setp(ax_main.get_xticklabels(), visible=False)
 
-        # Calculate residuals: (data - ΛCDM model) in arcsec
+        # Calculate residuals
         theta_lcdm_at_data = theta_lcdm_flat(binned_data["z_mid"].values, R_lcdm_i, Omega_m_i) * RAD_TO_ARCSEC
+        theta_static_at_data = theta_static(binned_data["z_mid"].values, R_static_i) * RAD_TO_ARCSEC
         residuals_lcdm = binned_data["theta_med"].values - theta_lcdm_at_data
+        residuals_static = binned_data["theta_med"].values - theta_static_at_data
 
-        # Residual plot
-        ax_resid.axhline(0, color="darkblue", linestyle="-", linewidth=1.5, alpha=0.7)
-        ax_resid.errorbar(
+        # ΛCDM residual plot
+        ax_resid_lcdm.axhline(0, color="darkblue", linestyle="-", linewidth=1.5, alpha=0.7)
+        ax_resid_lcdm.errorbar(
             binned_data["z_mid"],
             residuals_lcdm,
             yerr=binned_data["theta_err"],
@@ -3169,12 +3396,34 @@ def main(mode: str = "full", output_subdir: str | None = None):
             color=colors[name],
             zorder=3,
         )
-        ax_resid.set_xlabel(r"Redshift $z$", fontsize=11)
-        ax_resid.set_ylabel(r"$\theta - \theta_{\Lambda\mathrm{CDM}}$", fontsize=9)
-        ax_resid.grid(True, alpha=0.3)
-        ax_resid.set_xlim(z_lim)
-        max_resid = max(0.05, np.max(np.abs(residuals_lcdm) + binned_data["theta_err"].values) * 1.2)
-        ax_resid.set_ylim(-max_resid, max_resid)
+        ax_resid_lcdm.set_ylabel(r"$\theta - \theta_{\Lambda\mathrm{CDM}}$", fontsize=9)
+        ax_resid_lcdm.grid(True, alpha=0.3)
+        ax_resid_lcdm.set_xlim(z_lim)
+        max_resid_lcdm = max(0.05, np.max(np.abs(residuals_lcdm) + binned_data["theta_err"].values) * 1.2)
+        ax_resid_lcdm.set_ylim(-max_resid_lcdm, max_resid_lcdm)
+        plt.setp(ax_resid_lcdm.get_xticklabels(), visible=False)
+
+        # Static residual plot
+        ax_resid_static.axhline(0, color="gray", linestyle="--", linewidth=1.5, alpha=0.7)
+        ax_resid_static.errorbar(
+            binned_data["z_mid"],
+            residuals_static,
+            yerr=binned_data["theta_err"],
+            fmt=markers[name],
+            capsize=2,
+            capthick=0.6,
+            markersize=5,
+            markeredgewidth=0.6,
+            elinewidth=0.6,
+            color=colors[name],
+            zorder=3,
+        )
+        ax_resid_static.set_xlabel(r"Redshift $z$", fontsize=11)
+        ax_resid_static.set_ylabel(r"$\theta - \theta_{\mathrm{Static}}$", fontsize=9)
+        ax_resid_static.grid(True, alpha=0.3)
+        ax_resid_static.set_xlim(z_lim)
+        max_resid_static = max(0.05, np.max(np.abs(residuals_static) + binned_data["theta_err"].values) * 1.2)
+        ax_resid_static.set_ylim(-max_resid_static, max_resid_static)
 
     fig.suptitle(r"Binning Strategies: $\Lambda$CDM vs Static", fontsize=14, fontweight="bold")
     plt.savefig(f"{output_dir}/binning_comparison.pdf", dpi=300, bbox_inches="tight")
@@ -3203,9 +3452,9 @@ def main(mode: str = "full", output_subdir: str | None = None):
         if len(type_binned_results) < 2:
             continue  # Need at least 2 strategies to make a comparison plot
 
-        # Create the same 2x2 grid with residuals plot
-        fig_type = plt.figure(figsize=(14, 16), constrained_layout=True)
-        gs_type = fig_type.add_gridspec(4, 2, height_ratios=[3, 1, 3, 1], hspace=0.08, wspace=0.15)
+        # Create 1x3 grid with residuals plot
+        fig_type = plt.figure(figsize=(18, 10), constrained_layout=True)
+        gs_type = fig_type.add_gridspec(3, 3, height_ratios=[3, 1, 1], hspace=0.08, wspace=0.15)
 
         # Dynamic axis limits for this type
         z_min_type = type_catalog["redshift"].min()
@@ -3220,13 +3469,13 @@ def main(mode: str = "full", output_subdir: str | None = None):
 
         strategy_names_type = list(type_binned_results.keys())
 
-        for idx, name in enumerate(strategy_names_type[:4]):  # Max 4 strategies
+        for idx, name in enumerate(strategy_names_type[:3]):  # Max 3 strategies for 1x3
             binned_data = type_binned_results[name]
-            row_base = (idx // 2) * 2
-            col = idx % 2
+            col = idx  # 1x3 layout: each strategy in its own column
 
-            ax_main = fig_type.add_subplot(gs_type[row_base, col])
-            ax_resid = fig_type.add_subplot(gs_type[row_base + 1, col], sharex=ax_main)
+            ax_main = fig_type.add_subplot(gs_type[0, col])
+            ax_resid_lcdm = fig_type.add_subplot(gs_type[1, col], sharex=ax_main)
+            ax_resid_static = fig_type.add_subplot(gs_type[2, col], sharex=ax_main)
 
             # Fit models for this binning
             R_static_type = get_radius(
@@ -3313,11 +3562,13 @@ def main(mode: str = "full", output_subdir: str | None = None):
 
             # Calculate residuals
             theta_lcdm_at_data_type = theta_lcdm_flat(binned_data["z_mid"].values, R_lcdm_type, Omega_m_type) * RAD_TO_ARCSEC
+            theta_static_at_data_type = theta_static(binned_data["z_mid"].values, R_static_type) * RAD_TO_ARCSEC
             residuals_lcdm_type = binned_data["theta_med"].values - theta_lcdm_at_data_type
+            residuals_static_type = binned_data["theta_med"].values - theta_static_at_data_type
 
-            # Residual plot
-            ax_resid.axhline(0, color="darkblue", linestyle="-", linewidth=1.5, alpha=0.7)
-            ax_resid.errorbar(
+            # ΛCDM residual plot
+            ax_resid_lcdm.axhline(0, color="darkblue", linestyle="-", linewidth=1.5, alpha=0.7)
+            ax_resid_lcdm.errorbar(
                 binned_data["z_mid"],
                 residuals_lcdm_type,
                 yerr=binned_data["theta_err"],
@@ -3330,12 +3581,34 @@ def main(mode: str = "full", output_subdir: str | None = None):
                 color=colors[name],
                 zorder=3,
             )
-            ax_resid.set_xlabel(r"Redshift $z$", fontsize=11)
-            ax_resid.set_ylabel(r"$\theta - \theta_{\Lambda\mathrm{CDM}}$", fontsize=9)
-            ax_resid.grid(True, alpha=0.3)
-            ax_resid.set_xlim(z_lim_type)
-            max_resid_type = max(0.05, np.max(np.abs(residuals_lcdm_type) + binned_data["theta_err"].values) * 1.2)
-            ax_resid.set_ylim(-max_resid_type, max_resid_type)
+            ax_resid_lcdm.set_ylabel(r"$\theta - \theta_{\Lambda\mathrm{CDM}}$", fontsize=9)
+            ax_resid_lcdm.grid(True, alpha=0.3)
+            ax_resid_lcdm.set_xlim(z_lim_type)
+            max_resid_lcdm_type = max(0.05, np.max(np.abs(residuals_lcdm_type) + binned_data["theta_err"].values) * 1.2)
+            ax_resid_lcdm.set_ylim(-max_resid_lcdm_type, max_resid_lcdm_type)
+            plt.setp(ax_resid_lcdm.get_xticklabels(), visible=False)
+
+            # Static residual plot
+            ax_resid_static.axhline(0, color="gray", linestyle="--", linewidth=1.5, alpha=0.7)
+            ax_resid_static.errorbar(
+                binned_data["z_mid"],
+                residuals_static_type,
+                yerr=binned_data["theta_err"],
+                fmt=markers[name],
+                capsize=2,
+                capthick=0.6,
+                markersize=5,
+                markeredgewidth=0.6,
+                elinewidth=0.6,
+                color=colors[name],
+                zorder=3,
+            )
+            ax_resid_static.set_xlabel(r"Redshift $z$", fontsize=11)
+            ax_resid_static.set_ylabel(r"$\theta - \theta_{\mathrm{Static}}$", fontsize=9)
+            ax_resid_static.grid(True, alpha=0.3)
+            ax_resid_static.set_xlim(z_lim_type)
+            max_resid_static_type = max(0.05, np.max(np.abs(residuals_static_type) + binned_data["theta_err"].values) * 1.2)
+            ax_resid_static.set_ylim(-max_resid_static_type, max_resid_static_type)
 
         # Create safe filename from galaxy type
         safe_gtype = gtype.replace(" ", "_").replace("/", "-").lower()
@@ -3343,65 +3616,6 @@ def main(mode: str = "full", output_subdir: str | None = None):
         plt.savefig(f"{output_dir}/binning_comparison_{safe_gtype}.pdf", dpi=300, bbox_inches="tight")
         plt.close()
         print(f"  Saved: {output_dir}/binning_comparison_{safe_gtype}.pdf")
-
-    # Plot 4: All binning strategies overlaid
-    _fig, ax = plt.subplots(figsize=(12, 8))
-
-    # Background scatter
-    ax.scatter(
-        sed_catalog_analysis["redshift"],
-        sed_catalog_analysis["r_half_arcsec"],
-        c="lightgray",
-        alpha=0.3,
-        s=15,
-        label="Individual galaxies",
-        zorder=1,
-    )
-
-    for name, binned_data in binned_results.items():
-        ax.errorbar(
-            binned_data["z_mid"],
-            binned_data["theta_med"],
-            yerr=binned_data["theta_err"],
-            fmt=f"{markers[name]}-",
-            capsize=2,
-            capthick=0.6,
-            markersize=5,
-            markeredgewidth=0.6,
-            elinewidth=0.6,
-            linewidth=1.0,
-            color=colors[name],
-            label=f"{name}",
-            alpha=0.8,
-            zorder=2,
-        )
-
-    # Add ΛCDM model curve (using percentile fit)
-    ax.plot(
-        z_model, theta_lcdm_model, "-", color="black", linewidth=2, label=r"$\Lambda$CDM model", zorder=3
-    )
-    ax.plot(
-        z_model,
-        theta_static_model,
-        "--",
-        color="black",
-        linewidth=2,
-        label=r"Static model",
-        zorder=3,
-    )
-
-    ax.set_xlabel(r"Redshift $z$", fontsize=12)
-    ax.set_ylabel(r"Angular size $\theta$ (arcsec)", fontsize=12)
-    ax.set_title(r"All Binning Strategies Compared", fontsize=14)
-    ax.legend(fontsize=10, loc="upper right")
-    ax.grid(True, alpha=0.3)
-    ax.set_xlim(z_lim)
-    ax.set_ylim(theta_lim)
-
-    plt.tight_layout()
-    plt.savefig(f"{output_dir}/binning_overlay.pdf", dpi=300, bbox_inches="tight")
-    plt.close()
-    print(f"  Saved: {output_dir}/binning_overlay.pdf")
 
     # Plot 5: Redshift histogram with dynamic y-axis
     _fig, ax = plt.subplots(figsize=(8, 5))
@@ -3737,9 +3951,6 @@ Resource Profiles:
             generate_binning_plot(data_dir=output_dir,
                 output_path=f"{output_dir}/binning_comparison.pdf",
                 dataset_name=mode_name)
-            generate_overlay_plot(data_dir=output_dir,
-                output_path=f"{output_dir}/binning_overlay.pdf",
-                dataset_name=mode_name)
 
             # Angular size vs redshift (main science plot)
             generate_angular_size_plot(data_dir=output_dir,
@@ -3796,11 +4007,6 @@ Resource Profiles:
         # Binning comparison (all types)
         generate_binning_plot(data_dir=output_dir,
             output_path=f"{output_dir}/binning_comparison.pdf",
-            dataset_name=dataset_name)
-
-        # Overlay (all types)
-        generate_overlay_plot(data_dir=output_dir,
-            output_path=f"{output_dir}/binning_overlay.pdf",
             dataset_name=dataset_name)
 
         # Angular size vs redshift (main science plot)
