@@ -8,6 +8,8 @@ The embeddings capture visual morphological features learned from millions
 of Galaxy Zoo classifications, enabling transfer learning for morphology.
 """
 
+import os
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import NamedTuple
 import numpy as np
@@ -33,38 +35,100 @@ class MorphologyResult(NamedTuple):
     class_probabilities: dict[str, float]
 
 
+def _save_single_cutout(args: tuple) -> tuple | None:
+    """Worker function to save a single cutout (for parallel processing)."""
+    idx, cutout, output_path = args
+    try:
+        # Normalize to 0-255
+        cutout_norm = ((cutout - np.nanmin(cutout)) / (np.nanmax(cutout) - np.nanmin(cutout) + 1e-10) * 255).astype(np.uint8)
+        Image.fromarray(cutout_norm, mode='L').save(output_path)
+        return (idx, str(output_path))
+    except Exception:
+        return None
+
+
 def extract_cutouts(
     image: NDArray,
     catalog: pd.DataFrame,
     output_dir: str | Path,
     size: int = 128,
+    n_workers: int | None = None,
 ) -> list[str]:
-    """Extract and save cutouts as PNGs. Returns list of saved paths."""
+    """Extract and save cutouts as PNGs. Returns list of saved paths.
+
+    Uses parallel processing for I/O-bound PNG saving.
+    """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    half, paths = size // 2, []
+    half = size // 2
     ny, nx = image.shape
 
-    for idx, row in catalog.iterrows():
-        x, y = int(row["xcentroid"]), int(row["ycentroid"])
-        if x < half or x >= nx - half or y < half or y >= ny - half:
-            continue
+    # Pre-extract all valid cutouts (vectorized boundary check)
+    x_coords = catalog["xcentroid"].values.astype(int)
+    y_coords = catalog["ycentroid"].values.astype(int)
+    indices = catalog.index.values
 
-        cutout = image[y - half : y + half, x - half : x + half]
-        cutout = ((cutout - np.nanmin(cutout)) / (np.nanmax(cutout) - np.nanmin(cutout) + 1e-10) * 255).astype(np.uint8)
+    # Vectorized boundary check
+    valid_mask = (
+        (x_coords >= half) & (x_coords < nx - half) &
+        (y_coords >= half) & (y_coords < ny - half)
+    )
 
-        path = output_dir / f"{idx}.png"
-        Image.fromarray(cutout, mode='L').save(path)
-        paths.append((idx, str(path)))
+    # Prepare tasks for parallel processing
+    tasks = []
+    for i in np.where(valid_mask)[0]:
+        idx = indices[i]
+        x, y = x_coords[i], y_coords[i]
+        cutout = image[y - half : y + half, x - half : x + half].copy()
+        output_path = output_dir / f"{idx}.png"
+        tasks.append((idx, cutout, output_path))
+
+    if not tasks:
+        return []
+
+    # Determine number of workers
+    if n_workers is None:
+        n_workers = min(os.cpu_count() or 4, len(tasks))
+    n_workers = max(1, min(n_workers, len(tasks)))
+
+    # Process in parallel (I/O bound, so threads would also work)
+    paths = []
+    if n_workers == 1 or len(tasks) < 10:
+        # Sequential for small batches
+        for task in tasks:
+            result = _save_single_cutout(task)
+            if result:
+                paths.append(result)
+    else:
+        with ProcessPoolExecutor(max_workers=n_workers) as executor:
+            results = executor.map(_save_single_cutout, tasks)
+            paths = [r for r in results if r is not None]
 
     return paths
 
 
-def classify_morphology(catalog: pd.DataFrame, cutout_paths: list[tuple]) -> pd.DataFrame:
-    """Run Zoobot inference on cutouts."""
+def classify_morphology(
+    catalog: pd.DataFrame,
+    cutout_paths: list[tuple],
+    batch_size: int = 32,
+) -> pd.DataFrame:
+    """Run Zoobot inference on cutouts with batched processing.
+
+    Parameters
+    ----------
+    catalog : pd.DataFrame
+        Source catalog
+    cutout_paths : list[tuple]
+        List of (idx, path) tuples from extract_cutouts
+    batch_size : int
+        Batch size for GPU inference (default: 32)
+    """
     if not ZOOBOT_AVAILABLE:
         print("  Zoobot not installed. Run: pip install zoobot[pytorch]")
+        return catalog
+
+    if not cutout_paths:
         return catalog
 
     # Try the new Zoobot API (v2.0+) first, fall back to legacy API
@@ -123,14 +187,47 @@ def classify_morphology(catalog: pd.DataFrame, cutout_paths: list[tuple]) -> pd.
     ])
 
     result = catalog.copy()
-    with torch.no_grad():
-        for idx, path in cutout_paths:
-            img = transform(Image.open(path)).unsqueeze(0).to(device)
-            emb = encoder(img).cpu().numpy().flatten()
-            for j in range(min(8, len(emb))):
-                result.loc[idx, f"zoobot_emb_{j}"] = emb[j]
 
-    print(f"  Zoobot: classified {len(cutout_paths)} galaxies")
+    # Pre-initialize embedding columns
+    for j in range(8):
+        if f"zoobot_emb_{j}" not in result.columns:
+            result[f"zoobot_emb_{j}"] = np.nan
+
+    # Process in batches for efficient GPU utilization
+    n_total = len(cutout_paths)
+    n_batches = (n_total + batch_size - 1) // batch_size
+
+    with torch.no_grad():
+        for batch_idx in range(n_batches):
+            start = batch_idx * batch_size
+            end = min(start + batch_size, n_total)
+            batch_paths = cutout_paths[start:end]
+
+            # Load and transform batch
+            batch_indices = []
+            batch_tensors = []
+            for idx, path in batch_paths:
+                try:
+                    img_tensor = transform(Image.open(path))
+                    batch_tensors.append(img_tensor)
+                    batch_indices.append(idx)
+                except Exception:
+                    continue
+
+            if not batch_tensors:
+                continue
+
+            # Stack into batch tensor and run inference
+            batch_input = torch.stack(batch_tensors).to(device)
+            batch_embeddings = encoder(batch_input).cpu().numpy()
+
+            # Store embeddings in result
+            for i, idx in enumerate(batch_indices):
+                emb = batch_embeddings[i].flatten()
+                for j in range(min(8, len(emb))):
+                    result.loc[idx, f"zoobot_emb_{j}"] = emb[j]
+
+    print(f"  Zoobot: classified {len(cutout_paths)} galaxies (batch_size={batch_size})")
     return result
 
 

@@ -111,24 +111,38 @@ def load_specz_catalogs(data_dir: str = "./data/external") -> dict[str, pd.DataF
             # Filter to sources with valid spec-z
             df = df[df["z_spec"].notna() & (df["z_spec"] > 0)]
 
-            # Convert sexagesimal to decimal degrees
-            ra_dec_list = []
-            for _, row in df.iterrows():
-                try:
-                    ra_deg, dec_deg = _sexagesimal_to_decimal(
-                        row["RAJ2000"], row["DEJ2000"]
-                    )
-                    ra_dec_list.append({
-                        "ra": ra_deg,
-                        "dec": dec_deg,
-                        "z_spec": row["z_spec"],
-                    })
-                except (ValueError, IndexError):
-                    continue
-
-            if ra_dec_list:
-                catalogs["Fernandez-Soto1999"] = pd.DataFrame(ra_dec_list)
+            # Convert sexagesimal to decimal degrees using astropy (vectorized)
+            try:
+                # Use astropy's SkyCoord for efficient batch parsing
+                coords = SkyCoord(
+                    df["RAJ2000"].values,
+                    df["DEJ2000"].values,
+                    unit=(u.hourangle, u.deg),
+                )
+                catalogs["Fernandez-Soto1999"] = pd.DataFrame({
+                    "ra": coords.ra.deg,
+                    "dec": coords.dec.deg,
+                    "z_spec": df["z_spec"].values,
+                })
                 print(f"  Loaded Fernandez-Soto1999: {len(catalogs['Fernandez-Soto1999'])} sources with spec-z")
+            except Exception:
+                # Fallback to row-by-row conversion if batch fails
+                ra_dec_list = []
+                for _, row in df.iterrows():
+                    try:
+                        ra_deg, dec_deg = _sexagesimal_to_decimal(
+                            row["RAJ2000"], row["DEJ2000"]
+                        )
+                        ra_dec_list.append({
+                            "ra": ra_deg,
+                            "dec": dec_deg,
+                            "z_spec": row["z_spec"],
+                        })
+                    except (ValueError, IndexError):
+                        continue
+                if ra_dec_list:
+                    catalogs["Fernandez-Soto1999"] = pd.DataFrame(ra_dec_list)
+                    print(f"  Loaded Fernandez-Soto1999: {len(catalogs['Fernandez-Soto1999'])} sources with spec-z")
     except Exception as e:
         print(f"  Warning: Could not load Fernandez-Soto1999 catalog: {e}")
 

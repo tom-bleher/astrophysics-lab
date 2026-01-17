@@ -36,6 +36,11 @@ try:
 except ImportError:
     STATMORPH_AVAILABLE = False
 
+# Suppress RuntimeWarning from Sersic fitting in statmorph/astropy
+# Must be at module level to apply to multiprocessing workers
+import warnings
+warnings.filterwarnings('ignore', category=RuntimeWarning,
+                       message='overflow encountered in power')
 
 # SExtractor-compatible flag definitions
 FLAG_NONE = 0
@@ -640,6 +645,32 @@ def compute_half_light_radius(
     return result
 
 
+def _process_single_source(args: tuple) -> tuple | None:
+    """Process a single source with statmorph (worker function for parallel processing).
+
+    Returns tuple of (idx, gini, m20, sersic_n, asymmetry, smoothness, flag) or None if failed.
+    """
+    import warnings
+    idx, cutout, segmap_clean, gain, psf = args
+
+    try:
+        with warnings.catch_warnings():
+            warnings.filterwarnings('ignore', category=UserWarning)
+            warnings.filterwarnings('ignore', category=RuntimeWarning,
+                                   message='overflow encountered in power')
+            source_morphs = statmorph.source_morphology(
+                cutout, segmap_clean, gain=gain, psf=psf
+            )
+
+        if len(source_morphs) > 0:
+            m = source_morphs[0]
+            return (idx, m.gini, m.m20, m.sersic_n, m.asymmetry, m.smoothness, m.flag)
+    except Exception:
+        pass
+
+    return None
+
+
 def compute_statmorph(
     data: NDArray,
     segmap: NDArray,
@@ -648,6 +679,7 @@ def compute_statmorph(
     psf_fwhm: float = 2.25,
     cutout_size: int = 64,
     min_snr: float = 3.0,
+    n_workers: int | None = None,
 ) -> pd.DataFrame:
     """Compute statmorph morphological parameters for detected sources.
 
@@ -656,6 +688,7 @@ def compute_statmorph(
 
     This version processes sources individually with proper cutouts to avoid
     the "Full Gini segmap" issue that occurs when processing the full image.
+    Sources are processed in parallel using multiprocessing.
 
     Parameters
     ----------
@@ -673,6 +706,8 @@ def compute_statmorph(
         Size of cutouts for individual source processing (default: 64)
     min_snr : float
         Minimum SNR for processing (default: 3.0)
+    n_workers : int, optional
+        Number of parallel workers. Default: number of CPU cores
 
     Returns
     -------
@@ -685,7 +720,8 @@ def compute_statmorph(
         - smoothness: Smoothness/clumpiness index
         - statmorph_flag: Quality flag (0 = good)
     """
-    import warnings
+    import os
+    from concurrent.futures import ProcessPoolExecutor, as_completed
 
     if not STATMORPH_AVAILABLE:
         print("  Statmorph not available, skipping morphology computation")
@@ -714,16 +750,14 @@ def compute_statmorph(
 
     ny, nx = data.shape
     half = cutout_size // 2
-    n_processed = 0
-    n_good = 0
 
-    # Process each source individually with a cutout
-    # This avoids the "Full Gini segmap" issue from large segmentation regions
+    # Pre-filter sources and prepare cutouts for parallel processing
+    tasks = []
     for i, row in catalog.iterrows():
         x_pos = int(row.get('x', row.get('xcentroid', 0)))
         y_pos = int(row.get('y', row.get('ycentroid', 0)))
 
-        # Skip sources near edges (need full cutout with background)
+        # Skip sources near edges
         if x_pos < half or x_pos >= nx - half or y_pos < half or y_pos >= ny - half:
             continue
 
@@ -732,19 +766,18 @@ def compute_statmorph(
         if snr < min_snr:
             continue
 
-        # Extract cutout
-        y_lo, y_hi = y_pos - half, y_pos + half
-        x_lo, x_hi = x_pos - half, x_pos + half
-        cutout = data[y_lo:y_hi, x_lo:x_hi].copy()
-        segmap_cutout = segmap[y_lo:y_hi, x_lo:x_hi].copy()
-
         # Find the label at the source position
         label = segmap[y_pos, x_pos]
         if label == 0:
             continue
 
+        # Extract cutout
+        y_lo, y_hi = y_pos - half, y_pos + half
+        x_lo, x_hi = x_pos - half, x_pos + half
+        cutout = data[y_lo:y_hi, x_lo:x_hi].copy()
+        segmap_cutout = segmap[y_lo:y_hi, x_lo:x_hi]
+
         # Create a clean segmap with only this source (label=1)
-        # and background (label=0)
         segmap_clean = np.zeros_like(segmap_cutout, dtype=np.int32)
         segmap_clean[segmap_cutout == label] = 1
 
@@ -753,30 +786,47 @@ def compute_statmorph(
         if seg_pixels < 10 or seg_pixels > cutout_size * cutout_size * 0.5:
             continue
 
-        # Run statmorph on this single source
-        try:
-            with warnings.catch_warnings():
-                warnings.filterwarnings('ignore', category=UserWarning)
-                source_morphs = statmorph.source_morphology(
-                    cutout, segmap_clean, gain=gain, psf=psf
-                )
+        # Get the catalog index for this source
+        idx = catalog.index.get_loc(i) if i in catalog.index else i
+        tasks.append((idx, cutout, segmap_clean.copy(), gain, psf))
 
-            if len(source_morphs) > 0:
-                m = source_morphs[0]
-                idx = catalog.index.get_loc(i) if i in catalog.index else i
-                gini[idx] = m.gini
-                m20[idx] = m.m20
-                sersic_n[idx] = m.sersic_n
-                asymmetry[idx] = m.asymmetry
-                smoothness[idx] = m.smoothness
-                flags[idx] = m.flag
+    if not tasks:
+        print(f"  Statmorph: no valid sources to process")
+        result['gini'] = gini
+        result['m20'] = m20
+        result['sersic_n'] = sersic_n
+        result['asymmetry'] = asymmetry
+        result['smoothness'] = smoothness
+        result['statmorph_flag'] = flags
+        return result
+
+    # Determine number of workers
+    if n_workers is None:
+        n_workers = min(os.cpu_count() or 4, len(tasks))
+    n_workers = max(1, min(n_workers, len(tasks)))
+
+    print(f"  Statmorph: processing {len(tasks)} sources with {n_workers} workers...")
+
+    # Process in parallel
+    n_processed = 0
+    n_good = 0
+
+    with ProcessPoolExecutor(max_workers=n_workers) as executor:
+        futures = {executor.submit(_process_single_source, task): task[0] for task in tasks}
+
+        for future in as_completed(futures):
+            result_data = future.result()
+            if result_data is not None:
+                idx, g, m, s, a, sm, flag = result_data
+                gini[idx] = g
+                m20[idx] = m
+                sersic_n[idx] = s
+                asymmetry[idx] = a
+                smoothness[idx] = sm
+                flags[idx] = flag
                 n_processed += 1
-                if m.flag == 0:
+                if flag == 0:
                     n_good += 1
-
-        except Exception:
-            # Silently skip sources that fail
-            continue
 
     print(f"  Statmorph: computed morphology for {n_processed}/{n_sources} sources ({n_good} good)")
 
